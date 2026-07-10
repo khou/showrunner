@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "showrunner": {
+      "url": "https://spireash.fly.dev/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:SHOWRUNNER_TOKEN}"
+      }
+    }
+  }
+}

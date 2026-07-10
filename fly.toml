@@ -1,0 +1,24 @@
+app = "showrunner"
+primary_region = "sjc" # change to whatever `fly launch` suggests as closest to you
+
+[build]
+
+[env]
+  DATA_DIR = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off" # autostop + long-poll is exactly the wrong pair (DESIGN.md)
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/healthz"
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[mounts]]
+  source = "showrunner_data"
+  destination = "/data"

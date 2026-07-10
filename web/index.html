@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>showrunner — callboard</title>
+  <link rel="stylesheet" href="/callboard.css" />
+</head>
+<body>
+  <header id="topbar">
+    <h1>showrunner</h1>
+    <select id="show-select"><option value="">(no shows yet)</option></select>
+    <span id="show-empty-hint" class="hint" hidden>register an agent to create a show</span>
+    <div id="token-box">
+      <input id="token-input" type="password" placeholder="bearer token" autocomplete="off" />
+      <button id="token-save">save</button>
+      <span id="token-status" class="hint"></span>
+    </div>
+    <span id="last-poll" class="hint"></span>
+  </header>
+
+  <div id="banner" class="banner" hidden></div>
+
+  <main>
+    <section id="director-card" class="card">
+      <h2>director</h2>
+      <div id="director-body">no show selected</div>
+    </section>
+
+    <section id="members-card" class="card">
+      <h2>members</h2>
+      <ul id="members-list"><li class="hint">no show selected</li></ul>
+    </section>
+
+    <section id="tasks-card" class="card wide">
+      <h2>tasks</h2>
+      <div id="task-columns">
+        <div class="column">
+          <h3>queued</h3>
+          <ul class="task-list" data-col="queued"></ul>
+        </div>
+        <div class="column">
+          <h3>in-flight</h3>
+          <ul class="task-list" data-col="inflight"></ul>
+        </div>
+        <div class="column">
+          <h3>needs input</h3>
+          <ul class="task-list" data-col="needsinput"></ul>
+        </div>
+        <div class="column">
+          <h3>done / failed</h3>
+          <ul class="task-list" data-col="done"></ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="activity-card" class="card wide">
+      <h2>activity</h2>
+      <ul id="activity-list"><li class="hint">no show selected</li></ul>
+    </section>
+
+    <section id="admin-card" class="card wide">
+      <h2>admin</h2>
+      <form id="message-form" class="admin-form">
+        <label>message</label>
+        <select id="message-to">
+          <option value="director">director</option>
+          <option value="all">all</option>
+          <option value="human">human</option>
+        </select>
+        <input id="message-body" type="text" placeholder="body" required />
+        <button type="submit">send</button>
+      </form>
+
+      <form id="task-form" class="admin-form">
+        <label>create task</label>
+        <input id="task-title" type="text" placeholder="title" required />
+        <input id="task-brief" type="text" placeholder="brief (pointer, e.g. see docs/x.md)" required />
+        <input id="task-context" type="text" placeholder="context id (optional)" />
+        <input id="task-files" type="text" placeholder="files_hint globs, comma-separated (optional)" />
+        <input id="task-priority" type="number" placeholder="priority" value="0" />
+        <input id="task-assignee" type="text" placeholder="assignee id (optional)" />
+        <button type="submit">create</button>
+      </form>
+
+      <form id="direction-form" class="admin-form">
+        <label>direction</label>
+        <button type="submit" class="danger">clear direction (demote director)</button>
+      </form>
+    </section>
+  </main>
+
+  <script src="/callboard.js" defer></script>
+</body>
+</html>

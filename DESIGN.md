@@ -130,9 +130,16 @@ queued ──▶ assigned ──▶ working ──▶ completed
 
 | Lease | TTL (env) | Renewed by | On expiry |
 |---|---|---|---|
-| worker | 90s | any tool call by that member (polling is the heartbeat) | member shown stale on callboard; its `assigned/working` tasks requeue |
+| worker | 90s | any tool call by that member (polling is the heartbeat) | member shown stale on callboard; an `input-required` task assigned to it requeues (it's supposed to still be polling while blocked) |
 | task | 15 min | `update_task` (status/note/heartbeat) by assignee | task requeues, `attempt`+1, journal preserved |
 | direction | 10 min | any tool call by the director | show runs headless: workers keep draining the queue; callboard shows "no director"; nothing self-promotes |
+
+A worker's `assigned`/`working` task is reaped **only** by the task lease, never by the
+worker lease alone: a worker heads-down executing may not touch any tool for long stretches
+well inside the 90s worker-lease window (it only has to heartbeat every ~10min), so treating a
+stale worker lease as task abandonment would requeue -- and duplicate -- work that's still in
+progress. `input-required` is the exception: the worker is meant to be idle and polling while
+blocked, so a stale worker lease there really does mean it went dark.
 
 No auto-promotion of workers to director, deliberately: every field report
 says unattended swarms drift; a dead director costs nothing (state is in the

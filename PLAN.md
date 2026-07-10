@@ -64,11 +64,15 @@ Notification hook: `store.events` is an `EventEmitter` emitting
 event, all inside one place:
 
 1. `drainInbox` non-empty → `{status:"messages", messages}`
-2. caller is director and something needs review (`completed`/`failed` since
-   its last poll, or `input-required` exists) → `{status:"review", items}`
+2. caller is director and something needs review (`completed`/`failed`/
+   `rejected`/`input-required` since its last poll) → `{status:"review",
+   items}`. Gating `input-required` through the same per-director cursor as
+   the others (not "any exists") matters: without it, an unanswered blocker
+   makes every poll return immediately forever, degenerating the long-poll
+   into a busy loop.
 3. `claimNextTask` returns a task (workers only) → `{status:"task", task}`
-4. after `min(wait_seconds ?? 25, POLL_HOLD_SECONDS)` + 0–2s jitter →
-   `{status:"nothing", hint: "re-poll immediately"}`
+4. after `min(wait_seconds ?? POLL_HOLD_SECONDS, POLL_HOLD_SECONDS)` + 0–2s
+   jitter → `{status:"nothing", hint: "re-poll immediately"}`
 
 Every `await_work` calls `touchMember` first. A member whose id is unknown
 gets a structured error telling it to `register` again.
