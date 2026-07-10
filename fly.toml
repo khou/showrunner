@@ -1,4 +1,4 @@
-app = "showrunner"
+app = "showrunner-kh"
 primary_region = "sjc" # change to whatever `fly launch` suggests as closest to you
 
 [build]
@@ -11,6 +11,13 @@ primary_region = "sjc" # change to whatever `fly launch` suggests as closest to 
   force_https = true
   auto_stop_machines = "off" # autostop + long-poll is exactly the wrong pair (DESIGN.md)
   min_machines_running = 1
+
+  # Force HTTP/1.1 at the edge: some client fetch stacks (e.g. Node 26 default
+  # fetch over h2) stall a second request behind a parked SSE long-poll on the
+  # same origin. h1 gives each request its own connection; h2 buys nothing at
+  # this concurrency.
+  [http_service.tls_options]
+    alpn = ["http/1.1"]
 
   [[http_service.checks]]
     method = "GET"

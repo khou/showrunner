@@ -173,6 +173,19 @@ showrunner snippets [--url <url>]
 This is a human convenience over `/api`, not something agents call. Agents
 talk MCP.
 
+## Verifying a deployment
+
+`scripts/live-verify.mts` drives the full lifecycle against a real deployment
+with the real MCP SDK client: register, claim direction, create task, worker
+claims and completes, director reviews, mid-poll wake latency, takeover and
+stale-epoch fencing, callboard, auth rejection.
+
+```bash
+SR_URL=https://<your-app>.fly.dev SR_TOKEN=<token> npx tsx scripts/live-verify.mts
+```
+
+It creates a throwaway `verify-*` show; safe to run against a server in use.
+
 ## FAQ
 
 **The director's session dies mid-run. What happens?**
