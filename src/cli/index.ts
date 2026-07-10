@@ -2,7 +2,7 @@
 // showrunner CLI: a human convenience wrapper around GET/POST /api/* (never /mcp, that's
 // the agent surface). Reads SHOWRUNNER_URL / SHOWRUNNER_TOKEN from env, overridable by flags.
 import { parseArgs } from "node:util";
-import type { BoardState, CreateTaskInput, Message, MessageTarget, OverlapWarning, Task } from "../types.js";
+import type { BoardState, CreateTaskInput, DirectionState, Message, MessageTarget, OverlapWarning, Task } from "../types.js";
 import { INSTRUCTIONS } from "../server/instructions.js";
 
 class UsageError extends Error {}
@@ -193,6 +193,31 @@ async function cmdTaskAdd(argv: string[]): Promise<void> {
   }
 }
 
+// --- task cancel ---
+
+async function cmdTaskCancel(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      show: { type: "string" },
+      id: { type: "string" },
+      url: { type: "string" },
+      token: { type: "string" },
+    },
+    allowPositionals: false,
+  });
+  const cfg = requireConfig(values);
+  if (!values.show) throw new UsageError("task cancel requires --show");
+  if (!values.id) throw new UsageError("task cancel requires --id");
+
+  const result = await apiRequest<{ task: Task }>(
+    cfg,
+    "POST",
+    `/api/shows/${encodeURIComponent(values.show)}/tasks/${encodeURIComponent(values.id)}/cancel`,
+  );
+  process.stdout.write(`canceled task ${result.task.id}: "${result.task.title}" (status: ${result.task.status})\n`);
+}
+
 // --- message ---
 
 async function cmdMessage(argv: string[]): Promise<void> {
@@ -215,6 +240,25 @@ async function cmdMessage(argv: string[]): Promise<void> {
   const payload: { to: MessageTarget; body: string } = { to: values.to as MessageTarget, body: values.body };
   const result = await apiRequest<{ message: Message }>(cfg, "POST", `/api/shows/${encodeURIComponent(values.show)}/message`, payload);
   process.stdout.write(`sent message ${result.message.id} to ${result.message.toId}\n`);
+}
+
+// --- direction clear ---
+
+async function cmdDirectionClear(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      show: { type: "string" },
+      url: { type: "string" },
+      token: { type: "string" },
+    },
+    allowPositionals: false,
+  });
+  const cfg = requireConfig(values);
+  if (!values.show) throw new UsageError("direction clear requires --show");
+
+  await apiRequest<{ direction: DirectionState }>(cfg, "POST", `/api/shows/${encodeURIComponent(values.show)}/direction/clear`);
+  process.stdout.write(`cleared direction for ${values.show}; show is headless until a new claim_direction\n`);
 }
 
 // --- instructions ---
@@ -300,8 +344,10 @@ Usage:
   showrunner task add --show <name> --title <t> --brief <b>
                        [--context-id <id>] [--depends-on <id,id>] [--files-hint <glob,glob>]
                        [--priority <n>] [--assignee <id>] [--url <url>] [--token <token>]
+  showrunner task cancel --show <name> --id <task-id> [--url <url>] [--token <token>]
   showrunner message --show <name> --to <member-id|director|all|human> --body <text>
                       [--url <url>] [--token <token>]
+  showrunner direction clear --show <name> [--url <url>] [--token <token>]
   showrunner instructions
   showrunner snippets [--url <url>]
 
@@ -319,11 +365,16 @@ async function main(): Promise<void> {
         await cmdStatus(rest);
         break;
       case "task":
-        if (rest[0] !== "add") throw new UsageError(`unknown "task" subcommand: ${rest[0] ?? "(none)"} (expected: task add)`);
-        await cmdTaskAdd(rest.slice(1));
+        if (rest[0] === "add") await cmdTaskAdd(rest.slice(1));
+        else if (rest[0] === "cancel") await cmdTaskCancel(rest.slice(1));
+        else throw new UsageError(`unknown "task" subcommand: ${rest[0] ?? "(none)"} (expected: task add|cancel)`);
         break;
       case "message":
         await cmdMessage(rest);
+        break;
+      case "direction":
+        if (rest[0] !== "clear") throw new UsageError(`unknown "direction" subcommand: ${rest[0] ?? "(none)"} (expected: direction clear)`);
+        await cmdDirectionClear(rest.slice(1));
         break;
       case "instructions":
         cmdInstructions();

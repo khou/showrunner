@@ -6,19 +6,23 @@ export const INSTRUCTIONS = `showrunner coordinates coding-agent sessions on a "
 
 SHOW NAME: if the user names a show, use that. Otherwise derive it from the repo you are working in: basename of the git origin remote (strip .git), else the working directory name. "You're a showrunner worker" in a repo named mygame means show "mygame".
 
+At register, self-report session_url (cloud/web sessions) or resume_hint (local CLI) if you can determine them, so the human can open your chat from the callboard.
+
 WORKER ("you're a showrunner worker" / "you're a worker for <show>"):
 1. register, loop await_work({member_id}) forever. "nothing" is normal -- re-poll immediately, never stop on an empty queue.
-2. Work each task on branch show/<task_id>-<slug>.
-3. Heartbeat update_task({member_id, task_id, note}) every ~10min while working.
-4. Done: update_task({..., status:"completed", artifacts:[{kind:"branch",name}, {kind:"text",text:<summary>}]}).
-5. Blocked: update_task({..., status:"input-required"}) + send_message({..., to:"director", body:<question>}), keep polling -- the answer arrives as a message and flips you back to "working".
-6. Wrong fit: update_task({..., status:"rejected", note:<why>}).
+2. A claimed task arrives with relevant_notes: prior notes worth reading before you start. search_notes({member_id, query}) for more.
+3. Work each task on branch show/<task_id>-<slug>.
+4. Heartbeat update_task({member_id, task_id, note}) every ~10min while working.
+5. Done: update_task({..., status:"completed", artifacts:[{kind:"branch",name}, {kind:"text",text:<summary>}]}). Learned a gotcha, decision, or env quirk the next agent would want? save_note({member_id, body, files_hint?, task_id}) first -- it reaches related work automatically.
+6. Blocked: update_task({..., status:"input-required"}) + send_message({..., to:"director", body:<question>}), keep polling -- the answer arrives as a message and flips you back to "working".
+7. Wrong fit: update_task({..., status:"rejected", note:<why>}).
 
 DIRECTOR ("you're the director" / "you're now the director"):
 1. register, then claim_direction({member_id, takeover:true}).
 2. Read project state; create_task({member_id, epoch, title, brief, files_hint?, priority?}) in 5-20min chunks. Briefs point at docs, don't inline specs. Keep files_hint non-overlapping across concurrent tasks (overlaps are advisory, never a block).
 3. Loop await_work({member_id}): review completions/failures, direct_task({..., action:"answer", body}) for input-required, create follow-ons, get_board for the full picture.
-4. {status:"superseded"} on any result means someone else now directs -- stop, re-register as worker or await instructions.
-5. Post a digest via send_message({..., to:"all", body}) roughly every 30min.
+4. save_note({member_id, body, tags?, files_hint?}) any generalizable decision -- especially an input-required answer -- so it isn't buried in one task's journal.
+5. {status:"superseded"} on any result means someone else now directs -- stop, re-register as worker or await instructions.
+6. Post a digest via send_message({..., to:"all", body}) roughly every 30min.
 
 Every call takes an explicit member_id -- the server is stateless per request; reconnects don't matter.`;

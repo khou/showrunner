@@ -1,5 +1,5 @@
 // MCP tool surface for showrunner (DESIGN.md "MCP tool surface", PLAN.md "MCP tools"
-// + "Long-poll semantics"). Exactly the 8 pinned tools plus the "join" prompt.
+// + "Long-poll semantics"). The 10 pinned tools plus the "join" prompt.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -12,6 +12,8 @@ import {
   type DirectTaskAction,
   type Member,
   type Message,
+  type Note,
+  type NoteHit,
   type Task,
 } from "../types.js";
 
@@ -32,6 +34,34 @@ const ARTIFACT_SCHEMA = z.discriminatedUnion("kind", [
 const UPDATE_STATUS = z.enum(["working", "input-required", "completed", "failed", "rejected"]);
 
 const DIRECT_ACTION = z.enum(["cancel", "requeue", "assign", "answer", "approve"]);
+
+// register's self-reported chat link (DESIGN.md "session_url/resume_hint are how a human opens
+// this session's chat"): only the session itself knows this, so it's optional and validated at
+// the boundary rather than trusted verbatim.
+const SESSION_URL = z
+  .string()
+  .max(500)
+  .refine(
+    (v) => {
+      try {
+        const u = new URL(v);
+        return u.protocol === "http:" || u.protocol === "https:";
+      } catch {
+        return false;
+      }
+    },
+    { message: "session_url must be an http(s) URL" },
+  )
+  .describe("URL a human can open to chat with this session, e.g. your claude.ai/code or cursor.com agent session URL")
+  .optional();
+
+const RESUME_HINT = z
+  .string()
+  .max(200)
+  .describe(
+    "for local CLI sessions: the command a human runs to open this session, e.g. claude --resume <session-id>",
+  )
+  .optional();
 
 function jsonResult(data: unknown, isError = false): CallToolResult {
   return { content: [{ type: "text", text: JSON.stringify(data) }], isError };
@@ -58,8 +88,27 @@ export type AwaitWorkResult =
   | { status: "unknown_member"; member_id: string; hint: string }
   | { status: "messages"; messages: Message[] }
   | { status: "review"; items: BoardTaskView[] }
-  | { status: "task"; task: Task }
+  | { status: "task"; task: Task; relevant_notes: NoteHit[] }
   | { status: "nothing"; hint: string };
+
+// DESIGN.md "Recall at claim time": bodies trimmed to ~300 chars in the claim-time payload
+// (search_notes hits, by contrast, return the full body -- that's an explicit pull, not a cap
+// meant to bound an unprompted push).
+const RELEVANT_NOTE_BODY_CHARS = 300;
+
+function toRelevantNoteHit(note: Note): NoteHit {
+  const truncated = note.body.length > RELEVANT_NOTE_BODY_CHARS;
+  return {
+    id: note.id,
+    author: note.author,
+    tags: note.tags,
+    // Marked when cut so the reader can tell this isn't the whole note (there's no fetch-by-id
+    // path -- notes_fts doesn't index id -- recovery is search_notes on distinctive words from
+    // the visible prefix).
+    body: truncated ? `${note.body.slice(0, RELEVANT_NOTE_BODY_CHARS)}…` : note.body,
+    createdAt: note.createdAt,
+  };
+}
 
 const REVIEW_STATUSES = new Set(["completed", "failed", "rejected", "input-required"]);
 
@@ -125,7 +174,7 @@ function checkOnce(store: Store, member: Member): AwaitWorkResult | null {
     if (items) return { status: "review", items };
   } else {
     const task = store.claimNextTask(member.id);
-    if (task) return { status: "task", task };
+    if (task) return { status: "task", task, relevant_notes: store.notesForTask(task).map(toRelevantNoteHit) };
   }
   return null;
 }
@@ -219,10 +268,19 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         kind: MEMBER_KIND,
         display_name: z.string().optional(),
         capabilities: z.array(z.string()).optional(),
+        session_url: SESSION_URL,
+        resume_hint: RESUME_HINT,
       },
     },
     async (args) => {
-      const member = store.register(args.show, args.kind, args.display_name, args.capabilities);
+      const member = store.register(
+        args.show,
+        args.kind,
+        args.display_name,
+        args.capabilities,
+        args.session_url,
+        args.resume_hint,
+      );
       const board_summary = store.getBoard(member.show);
       const director = store.directionState(member.show).directorId ?? null;
       return jsonResult({ member_id: member.id, show: member.show, director, board_summary, protocol: INSTRUCTIONS });
@@ -262,7 +320,11 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
           note: args.note,
           artifacts: args.artifacts,
         });
-        return jsonResult({ task });
+        // DESIGN.md "The result carries any unread messages, so a heads-down worker hears about
+        // notes and answers on its ~10min heartbeat instead of only at its next await_work."
+        // Same drainInbox as await_work; omit the key rather than ship an empty array.
+        const messages = store.drainInbox(resolved.member.id);
+        return jsonResult(messages.length > 0 ? { task, messages } : { task });
       } catch (err) {
         return jsonResult({ status: "error", message: (err as Error).message }, true);
       }
@@ -305,6 +367,54 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       const resolved = resolveMember(store, args.member_id);
       if ("result" in resolved) return resolved.result;
       return jsonResult(store.getBoard(resolved.member.show, args.verbose));
+    },
+  );
+
+  server.registerTool(
+    "save_note",
+    {
+      description:
+        "Save a note to shared memory: pushes to members whose current task overlaps (same task/context or files_hint glob), and it's recalled by search_notes and future claims.",
+      inputSchema: {
+        member_id: z.string().min(1),
+        body: z.string().min(1),
+        tags: z.array(z.string()).optional(),
+        files_hint: z.array(z.string()).optional(),
+        task_id: z.string().optional(),
+      },
+    },
+    async (args) => {
+      const resolved = resolveMember(store, args.member_id);
+      if ("result" in resolved) return resolved.result;
+      try {
+        const { note, deliveredTo } = store.saveNote(resolved.member.id, {
+          body: args.body,
+          tags: args.tags,
+          filesHint: args.files_hint,
+          taskId: args.task_id,
+        });
+        return jsonResult({ note_id: note.id, delivered_to: deliveredTo });
+      } catch (err) {
+        return jsonResult({ status: "error", message: (err as Error).message }, true);
+      }
+    },
+  );
+
+  server.registerTool(
+    "search_notes",
+    {
+      description: "BM25-ranked search over this member's show's shared notes.",
+      inputSchema: {
+        member_id: z.string().min(1),
+        query: z.string().min(1),
+        limit: z.number().int().positive().optional(),
+      },
+    },
+    async (args) => {
+      const resolved = resolveMember(store, args.member_id);
+      if ("result" in resolved) return resolved.result;
+      const notes = store.searchNotes(resolved.member.show, args.query, args.limit);
+      return jsonResult({ notes });
     },
   );
 

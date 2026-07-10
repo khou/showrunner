@@ -28,7 +28,7 @@ prior system ships.
 
 Deliberately **not**: a runner UI, a worktree manager, an A2A node, a product.
 State is one SQLite file; the dashboard is one static page; the tool surface
-is 8 tools.
+is 10 tools.
 
 ## Constraints that shaped the design (research findings)
 
@@ -98,8 +98,11 @@ tasks      { id PK, show, context_id, title, brief, files_hint_json,
              depends_on_json, priority, status, assignee, attempt,
              created_by, lease_expires_at, artifacts_json, created_at, updated_at }
 task_notes { id PK, task_id, author, body, created_at }         -- append-only journal
-messages   { id PK, show, from_id, to_id, task_id, body, created_at }
+messages   { id PK, show, from_id, to_id, task_id, body, kind, created_at }
 message_reads { message_id, member_id }                         -- unread-only delivery
+notes      { id PK, show, author, body, tags_json, files_hint_json,
+             task_id, context_id, created_at }                  -- append-only shared memory
+notes_fts  ( FTS5 over body + tags, bm25-ranked )
 ```
 
 - `kind`: `claude-local | claude-cloud | cursor-local | cursor-cloud | other`
@@ -166,7 +169,48 @@ One row per show: `{director_id, epoch, lease_expires_at}`.
   protocol needed. The server is the sole arbiter, so fencing is one integer
   compare.
 
-## MCP tool surface (8 tools)
+## Shared notes: realtime memory
+
+Agents working in parallel learn things the others need *now*, not on their
+next manual search. Notes are append-only records (gotchas, decisions, env
+quirks) in the same SQLite file, FTS5-indexed, and they reach other agents
+through the machinery that already exists:
+
+- **Push on save.** `save_note` finds non-author members whose *current,
+  still-in-flight task* is related: `files_hint` glob overlap, same
+  `task_id`, or same `context_id`. Each gets a `kind:"note"` message in its
+  inbox regardless of whether its member lease is fresh -- a worker heads-down
+  executing renews that lease only every ~10min, well inside the 90s window,
+  and is exactly who a note about its task needs to reach. An unexpired lease
+  additionally gets an immediate wake, so a parked `await_work` resolves
+  within seconds; a stale one picks the note up on its next poll instead.
+  Push criteria are structural on purpose (globs/task/context, never fuzzy
+  text match): pushes must not be noisy, or agents learn to ignore them.
+- **Recall at claim time.** When `await_work` hands out a task, the server
+  attaches `relevant_notes`: files_hint glob-overlap hits first (the
+  structural signal, privileged over fuzzy text), then BM25 over the task's
+  title+brief fills the rest of the `NOTES_PER_TASK=4` budget. Bodies are
+  trimmed to ~300 chars with a truncation marker when cut; there's no
+  fetch-by-id (note ids aren't indexed for search) -- recover the full body
+  with `search_notes` on distinctive words from the visible prefix. Knowledge
+  from worker A reaches worker B exactly when B starts related work,
+  unprompted.
+- **Explicit search.** `search_notes({query})` -- BM25-ranked hits, compact
+  shape (id/author/tags/body/timestamp, not the full Note row), untrimmed
+  bodies, result count capped server-side regardless of the requested limit.
+
+Caps keep the token discipline: bodies max `NOTE_MAX_CHARS=2000`, claim-time
+attachment max 4 trimmed notes, search results capped server-side. Notes are
+never edited or deleted (corrections are new notes, same as the rest of the
+system). No vector search in v1; the FTS5 module is isolated so sqlite-vec
+can slot in later if semantic recall earns its keep.
+
+The protocol tells workers: read `relevant_notes` before starting a task;
+after finishing one, save a note if you learned something the next agent
+would want (with `files_hint` of the affected globs). Directors record
+generalizable decisions (especially answers to `input-required`) as notes.
+
+## MCP tool surface (10 tools)
 
 Everything takes/returns compact JSON. `member_id` is explicit in every call
 (the server is stateless per-request; reconnects and session restarts don't
@@ -174,11 +218,14 @@ matter).
 
 **Shared:**
 
-1. `register({show, kind, display_name?, capabilities?})`
-   → `{member_id, show, director, board_summary, protocol}` — creates the
-   show if new; `protocol` is the full worker/director loop contract in
-   ~600 tokens, so even a client that ignored the server instructions knows
-   what to do next.
+1. `register({show, kind, display_name?, capabilities?, session_url?,
+   resume_hint?})` → `{member_id, show, director, board_summary, protocol}`
+   — creates the show if new; `protocol` is the full worker/director loop
+   contract in ~600 tokens, so even a client that ignored the server
+   instructions knows what to do next. `session_url`/`resume_hint` are how
+   a human opens this session's chat: only the session knows this, so it
+   self-reports (cloud sessions their URL, local CLI sessions a resume
+   command); the callboard renders it.
 2. `await_work({member_id, wait_seconds?})` — **the long-poll.** Holds up to
    `min(wait_seconds, POLL_HOLD_SECONDS=25)`. Returns first-available of:
    a newly claimed task (worker), unread messages, direction-change or
@@ -189,24 +236,30 @@ matter).
    heartbeats the task lease; appends to the journal; sets status
    (`working|input-required|completed|failed|rejected`). Artifacts are typed
    parts: `{kind: branch|files|text|data, ...}` — e.g. the branch the worker
-   pushed, files touched, a 3-line summary.
+   pushed, files touched, a 3-line summary. The result carries any unread
+   `messages`, so a heads-down worker hears about notes and answers on its
+   ~10min heartbeat instead of only at its next `await_work`.
 4. `send_message({member_id, to, body, task_id?})` — to a member id,
    `director`, `all`, or `human`. Delivered via the recipient's next
    `await_work`; `human` lands on the callboard banner.
 5. `get_board({member_id, verbose?})` — director card, member list with
    staleness, task counts by status, in-flight task titles, escalations.
    Summary by default (~300 tokens); `verbose` adds journals.
+6. `save_note({member_id, body, tags?, files_hint?, task_id?})` →
+   `{note_id, delivered_to}` — see Shared notes above.
+7. `search_notes({member_id, query, limit?})` → BM25-ranked hits, compact
+   shape and untrimmed bodies; `limit` is capped server-side.
 
 **Director-only (epoch-fenced):**
 
-6. `claim_direction({member_id, takeover?})` → `{epoch, board_summary}`.
-7. `create_task({member_id, epoch, title, brief, context_id?, depends_on?,
+8. `claim_direction({member_id, takeover?})` → `{epoch, board_summary}`.
+9. `create_task({member_id, epoch, title, brief, context_id?, depends_on?,
    files_hint?, priority?, assignee?})` → `{task_id}` — brief should be
    pointers ("see docs/combat.md §3; branch off main"), not inlined specs.
    `files_hint` globs power advisory overlap warnings: creating a task whose
    globs intersect an in-flight task's returns a warning (never a block) —
    partition, don't lock.
-8. `direct_task({member_id, epoch, task_id, action, ...})` — `cancel`,
+10. `direct_task({member_id, epoch, task_id, action, ...})` — `cancel`,
    `requeue`, `assign {assignee}`, `answer {body}` (for `input-required` →
    flips back to `working` and delivers the answer), `approve` (optional
    review gate, see config).
@@ -246,16 +299,25 @@ non-issue; Cursor sessions may need manual recycling.)
 Single static HTML page served at `/`, polling `GET /api/shows/:show/state`
 every 2s. No build step, no framework — one file, fetch + DOM.
 
-- Director card: who, epoch, lease freshness, last digest note.
-- Members: kind badge, role, current task, last-seen freshness dot.
+- Director card: who, epoch, lease freshness, last digest note, and **the
+  chat link**: `session_url` renders as an "open chat ↗" link,
+  `resume_hint` as click-to-copy code, neither as a dim hint that the
+  session didn't report one.
+- Members: kind badge, role, current task, last-seen freshness dot, ↗ when
+  a session_url was reported.
 - Task columns: queued / in-flight (assigned+working) / needs-input /
   done+failed. Click a task → journal + artifacts.
+- Notes panel: recent shared notes (author, tags, trimmed body, age).
 - Activity feed: last 50 journal notes + messages.
 - **Red escalation banner**: `input-required` tasks and messages addressed to
   `human`.
-- Admin strip (same bearer token, entered once, kept in localStorage):
-  post a message to `director`/`all`, create a task by hand, cancel a task,
-  clear direction (demote a runaway director).
+
+The callboard is deliberately a **window, not a control panel**: no task
+forms, no message box, no admin actions. The human steers by talking to
+the director agent in its own chat (that is what the chat link opens); the
+director translates intent into tasks. Manual escape hatches live in the
+CLI (`showrunner task add`, `message`, and the rest), which drives the
+same `/api` endpoints the callboard reads.
 
 Auth: `Authorization: Bearer` (or `?token=` once → cookie). One token, env
 `SHOWRUNNER_TOKEN`, gates /mcp and /api alike. v1 keeps a single token
@@ -271,7 +333,7 @@ the Fly secret).
   `/data` for SQLite. `fly launch && fly secrets set SHOWRUNNER_TOKEN=...`.
 - **Env knobs:** `SHOWRUNNER_TOKEN` (required), `PORT`, `DATA_DIR`,
   `POLL_HOLD_SECONDS=25`, `WORKER_LEASE_S=90`, `TASK_LEASE_S=900`,
-  `DIRECTION_LEASE_S=600`.
+  `DIRECTION_LEASE_S=600`, `NOTE_MAX_CHARS=2000`, `NOTES_PER_TASK=4`.
 - **Reclaim sweep:** one `setInterval` (5s) expires leases, requeues tasks,
   wakes relevant waiters. Restart-safe because all state is in SQLite.
 

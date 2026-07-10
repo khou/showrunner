@@ -122,6 +122,81 @@ describe("await_work resolution order (PLAN.md pinned order)", () => {
   });
 });
 
+describe("await_work attaches relevant_notes to a claimed task (DESIGN.md 'Recall at claim time')", () => {
+  it("trims a note body over ~300 chars in the delivered payload", async () => {
+    const { store } = newStore();
+    const author = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+
+    const longBody = `combat balance ${"y".repeat(500)}`;
+    store.saveNote(author.id, { body: longBody });
+    store.createTask({ show: "myshow", title: "combat balance", brief: "tune the numbers", createdBy: director.id });
+
+    const result = await resolveAwaitWork(store, worker.id, undefined, 0.05);
+    expect(result.status).toBe("task");
+    if (result.status !== "task") return;
+    expect(result.relevant_notes).toHaveLength(1);
+    expect(result.relevant_notes[0]!.body).toHaveLength(301); // 300 chars + truncation marker
+    expect(result.relevant_notes[0]!.body).toBe(`${longBody.slice(0, 300)}…`);
+  });
+
+  it("caps relevant_notes at NOTES_PER_TASK even when more notes match", async () => {
+    const { store } = newStore();
+    const author = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+
+    for (let i = 0; i < 6; i++) {
+      store.saveNote(author.id, { body: `note ${i}`, filesHint: ["src/server/**"] });
+    }
+    store.createTask({ show: "myshow", title: "server work", brief: "b", createdBy: director.id, filesHint: ["src/server/store.ts"] });
+
+    const result = await resolveAwaitWork(store, worker.id, undefined, 0.05);
+    expect(result.status).toBe("task");
+    if (result.status === "task") expect(result.relevant_notes).toHaveLength(4); // default NOTES_PER_TASK
+  });
+
+  it("attaches an empty relevant_notes array when nothing matches", async () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "unrelated task", brief: "no notes exist yet", createdBy: director.id });
+
+    const result = await resolveAwaitWork(store, worker.id, undefined, 0.05);
+    expect(result.status).toBe("task");
+    if (result.status === "task") expect(result.relevant_notes).toEqual([]);
+  });
+});
+
+describe("await_work surfaces message kind so agents can distinguish notes", () => {
+  it("a pushed note arrives with kind:'note'; an ordinary send_message arrives with kind:'message'", async () => {
+    const { store } = newStore();
+    const author = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    store.createTask({
+      show: "myshow",
+      title: "t",
+      brief: "b",
+      createdBy: director.id,
+      assignee: worker.id,
+      filesHint: ["src/server/**"],
+    });
+    store.claimNextTask(worker.id);
+
+    store.saveNote(author.id, { body: "note body", filesHint: ["src/server/store.ts"] });
+    const noteResult = await resolveAwaitWork(store, worker.id, undefined, 0.05);
+    expect(noteResult.status).toBe("messages");
+    if (noteResult.status === "messages") expect(noteResult.messages[0]!.kind).toBe("note");
+
+    store.sendMessage(director.id, worker.id, "plain message");
+    const messageResult = await resolveAwaitWork(store, worker.id, undefined, 0.05);
+    expect(messageResult.status).toBe("messages");
+    if (messageResult.status === "messages") expect(messageResult.messages[0]!.kind).toBe("message");
+  });
+});
+
 describe("review does not busy-loop on an unanswered input-required task", () => {
   it("surfaces an input-required task once, then holds the full poll on the next call", async () => {
     const { store, clock } = newStore();
@@ -278,6 +353,63 @@ describe("epoch fencing surfaces as a tool result", () => {
   });
 });
 
+describe("save_note / search_notes tools", () => {
+  it("save_note pushes to a live overlapping member, and search_notes finds it back", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const author = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    store.createTask({
+      show: "myshow",
+      title: "t",
+      brief: "b",
+      createdBy: director.id,
+      assignee: worker.id,
+      filesHint: ["src/server/**"],
+    });
+    store.claimNextTask(worker.id);
+
+    const saved = await callTool(client, "save_note", {
+      member_id: author.id,
+      body: "gotcha: fox dens are load-bearing",
+      files_hint: ["src/server/store.ts"],
+    });
+    expect(saved.isError).toBe(false);
+    const { note_id, delivered_to } = saved.data as { note_id: string; delivered_to: string[] };
+    expect(note_id).toBeTruthy();
+    expect(delivered_to).toEqual([worker.id]);
+
+    const searched = await callTool(client, "search_notes", { member_id: author.id, query: "fox dens" });
+    expect(searched.isError).toBe(false);
+    const { notes } = searched.data as { notes: { id: string; body: string }[] };
+    expect(notes.map((n) => n.id)).toContain(note_id);
+  });
+
+  it("save_note reports a body-too-long error as a tool result, not a protocol error", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const author = store.register("myshow", "claude-local");
+
+    const result = await callTool(client, "save_note", { member_id: author.id, body: "x".repeat(2001) });
+    expect(result.isError).toBe(true);
+    expect(result.data).toMatchObject({ status: "error" });
+  });
+
+  it("save_note and search_notes report unknown_member the same way as the rest", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+
+    const saveResult = await callTool(client, "save_note", { member_id: "ghost", body: "x" });
+    expect(saveResult.isError).toBe(false);
+    expect(saveResult.data).toMatchObject({ status: "unknown_member", member_id: "ghost" });
+
+    const searchResult = await callTool(client, "search_notes", { member_id: "ghost", query: "x" });
+    expect(searchResult.isError).toBe(false);
+    expect(searchResult.data).toMatchObject({ status: "unknown_member", member_id: "ghost" });
+  });
+});
+
 describe("register and the join prompt", () => {
   it("register returns the protocol text and a fresh member id", async () => {
     const { store } = newStore();
@@ -293,5 +425,81 @@ describe("register and the join prompt", () => {
     const prompt = await client.getPrompt({ name: "join" });
     const content = prompt.messages[0]?.content as { type: string; text?: string };
     expect(content.text).toBe(INSTRUCTIONS);
+  });
+});
+
+describe("register: self-reported session_url / resume_hint", () => {
+  it("accepts a valid http(s) session_url and a resume_hint, and persists both", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const result = await callTool(client, "register", {
+      show: "myshow",
+      kind: "claude-local",
+      session_url: "https://claude.ai/code/session_abc",
+    });
+    expect(result.isError).toBe(false);
+    const memberId = (result.data as { member_id: string }).member_id;
+    const member = store.getBoard("myshow").members.find((m) => m.id === memberId);
+    expect(member?.sessionUrl).toBe("https://claude.ai/code/session_abc");
+
+    const result2 = await callTool(client, "register", {
+      show: "myshow",
+      kind: "claude-local",
+      resume_hint: "claude --resume 7f3a9c",
+    });
+    expect(result2.isError).toBe(false);
+    const memberId2 = (result2.data as { member_id: string }).member_id;
+    const member2 = store.getBoard("myshow").members.find((m) => m.id === memberId2);
+    expect(member2?.resumeHint).toBe("claude --resume 7f3a9c");
+  });
+
+  it("rejects a session_url that isn't a valid http(s) URL", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    await expect(
+      callTool(client, "register", { show: "myshow", kind: "claude-local", session_url: "not-a-url" }),
+    ).rejects.toThrow();
+    await expect(
+      callTool(client, "register", { show: "myshow", kind: "claude-local", session_url: "ftp://example.com/x" }),
+    ).rejects.toThrow();
+  });
+
+  it("rejects a resume_hint over the ~200 char cap", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    await expect(
+      callTool(client, "register", { show: "myshow", kind: "claude-local", resume_hint: "x".repeat(201) }),
+    ).rejects.toThrow();
+  });
+
+  it("rejects a session_url over the 500 char cap", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    await expect(
+      callTool(client, "register", { show: "myshow", kind: "claude-local", session_url: `https://x/${"a".repeat(500)}` }),
+    ).rejects.toThrow();
+  });
+});
+
+describe("update_task drains unread messages (heartbeat delivery)", () => {
+  it("returns unread messages once, then omits the key on the next call", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: worker.id });
+    store.claimNextTask(worker.id);
+    store.sendMessage(director.id, worker.id, "how's it going?");
+
+    const first = await callTool(client, "update_task", { member_id: worker.id, task_id: task.id, note: "still working" });
+    expect(first.isError).toBe(false);
+    const firstData = first.data as { task: unknown; messages?: { body: string }[] };
+    expect(firstData.messages).toHaveLength(1);
+    expect(firstData.messages?.[0]?.body).toBe("how's it going?");
+
+    const second = await callTool(client, "update_task", { member_id: worker.id, task_id: task.id, note: "still working" });
+    expect(second.isError).toBe(false);
+    const secondData = second.data as { task: unknown; messages?: unknown[] };
+    expect(secondData.messages).toBeUndefined();
   });
 });

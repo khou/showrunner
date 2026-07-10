@@ -8,10 +8,10 @@ mkdirSync(dataDir, { recursive: true })
 const store = new Store(`${dataDir}/showrunner.db`)
 const SHOW = 'mygame'
 
-const director = store.register(SHOW, 'claude-local', 'planning session')
+const director = store.register(SHOW, 'claude-local', 'planning session', undefined, 'https://claude.ai/code/session_demo123')
 const w1 = store.register(SHOW, 'claude-cloud', 'cloud worker')
 const w2 = store.register(SHOW, 'cursor-local', 'cursor session')
-const w3 = store.register(SHOW, 'claude-local', 'laptop worker')
+const w3 = store.register(SHOW, 'claude-local', 'laptop worker', undefined, undefined, 'claude --resume 7f3a9c')
 store.claimDirection(director.id, true)
 
 const t = (title: string, brief: string, extra: Record<string, unknown> = {}) =>
@@ -29,6 +29,12 @@ store.updateTask(w3.id, done1.id, {
 const wk1 = t('Chunk-save batching for world server', 'Persist dirty chunks in batches of 64; see server/src/persist.rs.', { filesHint: ['apps/server/src/persist/**'], priority: 4 })
 store.claimNextTask(w1.id)
 store.updateTask(w1.id, wk1.id, { status: 'working', note: 'batch writer in place, tuning flush interval' })
+store.saveNote(w1.id, {
+  body: 'Gotcha: the dirty-set must flush before the double-buffer swap, not after -- swap-then-flush drops up to 64 chunks if the process dies mid-tick. Cost us a corrupted save in staging.',
+  tags: ['gotcha', 'persist'],
+  filesHint: ['apps/server/src/persist/**'],
+  taskId: wk1.id,
+})
 const wk2 = t('Day/night lighting pass', 'Interpolate ambient light by world clock; docs/lighting.md has curves.', { filesHint: ['apps/web/src/render/**'] })
 store.claimNextTask(w2.id)
 store.updateTask(w2.id, wk2.id, { status: 'working', note: 'dawn/dusk gradient landed, testing torch falloff' })
@@ -38,6 +44,11 @@ store.claimNextTask(w3.id)
 store.updateTask(w3.id, blocked.id, { status: 'input-required', note: 'Should expired links show a renew flow or a plain 410?' })
 store.sendMessage(w3.id, 'director', 'Invite expiry UX: renew flow or plain 410? Brief does not say.', blocked.id)
 store.sendMessage(w3.id, 'human', 'Design call needed on invite expiry UX before I can finish t-invites.', blocked.id)
+store.saveNote(director.id, {
+  body: 'Decision: expired invite links show "this link expired, ask for a new one" instead of a bare 410. Keeps the funnel from dead-ending. Applies to any future expiring-link flow, not just invites.',
+  tags: ['decision'],
+  taskId: blocked.id,
+})
 // queued
 t('Mob pathfinding on slopes', 'A* cost tweak; vendor/voxelize notes in docs/pathing.md.', { priority: 2 })
 t('Spire floor 3 loot table', 'Balance pass per docs/economy.md section 4.', { dependsOn: [wk1.id] })

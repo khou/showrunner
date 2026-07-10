@@ -15,6 +15,10 @@ export interface Member {
   lastSeenAt: number;
   leaseExpiresAt: number;
   currentTaskId: string | null;
+  // Self-reported chat link (DESIGN.md "register... session_url/resume_hint"): only the session
+  // itself knows this, so it's optional and omitted (not null) when not reported.
+  sessionUrl?: string;
+  resumeHint?: string;
 }
 
 export interface Show {
@@ -98,12 +102,50 @@ export type DirectTaskAction =
 // `to` may be a member id, or one of these role/broadcast addresses (DESIGN.md).
 export type MessageTarget = string | "director" | "all" | "human";
 
+// 'note' marks a message delivered by save_note's realtime push (DESIGN.md "Shared notes: push
+// on save"), so a recipient's await_work can tell a note from an ordinary message without
+// parsing the body.
+export type MessageKind = "message" | "note";
+
 export interface Message {
   id: string;
   show: string;
   fromId: string;
   toId: MessageTarget;
   taskId: string | null;
+  body: string;
+  kind: MessageKind;
+  createdAt: number;
+}
+
+// Append-only shared memory (DESIGN.md "Shared notes: realtime memory"). Distinct from
+// TaskNote (task_notes, one task's journal): a Note is show-wide, FTS5-indexed, and reaches
+// other live members through the push-on-save + claim-time-recall machinery.
+export interface Note {
+  id: string;
+  show: string;
+  author: string;
+  body: string;
+  tags: string[];
+  filesHint: string[];
+  taskId: string | null;
+  contextId: string | null;
+  createdAt: number;
+}
+
+export interface SaveNoteInput {
+  body: string;
+  tags?: string[];
+  filesHint?: string[];
+  taskId?: string;
+}
+
+// Compact shape shared by search_notes results and the relevant_notes attached at claim time
+// (the latter additionally trims `body`; see mcp.ts).
+export interface NoteHit {
+  id: string;
+  author: string;
+  tags: string[];
   body: string;
   createdAt: number;
 }
@@ -132,6 +174,8 @@ export interface BoardMemberView {
   leaseExpiresAt: number;
   stale: boolean;
   currentTaskId: string | null;
+  sessionUrl?: string;
+  resumeHint?: string;
 }
 
 export interface BoardTaskView {
@@ -148,7 +192,9 @@ export interface BoardTaskView {
 
 export interface BoardState {
   show: string;
-  director: { memberId: string; epoch: number; leaseExpiresAt: number; stale: boolean } | null;
+  director:
+    | { memberId: string; epoch: number; leaseExpiresAt: number; stale: boolean; sessionUrl?: string; resumeHint?: string }
+    | null;
   members: BoardMemberView[];
   taskCounts: Record<TaskStatus, number>;
   tasks: BoardTaskView[];
@@ -188,7 +234,12 @@ export interface LeaseConfig {
   directionLeaseS: number;
 }
 
-export interface EnvConfig extends LeaseConfig {
+export interface NoteConfig {
+  noteMaxChars: number;
+  notesPerTask: number;
+}
+
+export interface EnvConfig extends LeaseConfig, NoteConfig {
   token: string;
   port: number;
   dataDir: string;
@@ -197,6 +248,7 @@ export interface EnvConfig extends LeaseConfig {
 }
 
 const DEFAULT_LEASES: LeaseConfig = { workerLeaseS: 90, taskLeaseS: 900, directionLeaseS: 600 };
+const DEFAULT_NOTES: NoteConfig = { noteMaxChars: 2000, notesPerTask: 4 };
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
   if (raw === undefined || raw === "") return fallback;
@@ -213,6 +265,14 @@ export function readLeaseConfig(env: NodeJS.ProcessEnv = process.env): LeaseConf
   };
 }
 
+/** Note-related knobs only; same no-required-vars contract as readLeaseConfig. */
+export function readNoteConfig(env: NodeJS.ProcessEnv = process.env): NoteConfig {
+  return {
+    noteMaxChars: parsePositiveInt(env.NOTE_MAX_CHARS, DEFAULT_NOTES.noteMaxChars),
+    notesPerTask: parsePositiveInt(env.NOTES_PER_TASK, DEFAULT_NOTES.notesPerTask),
+  };
+}
+
 /** Full server config. Throws if SHOWRUNNER_TOKEN is unset, so the server refuses to start. */
 export function readEnvConfig(env: NodeJS.ProcessEnv = process.env): EnvConfig {
   const token = env.SHOWRUNNER_TOKEN;
@@ -226,5 +286,6 @@ export function readEnvConfig(env: NodeJS.ProcessEnv = process.env): EnvConfig {
     pollHoldSeconds: parsePositiveInt(env.POLL_HOLD_SECONDS, 25),
     sweepIntervalS: parsePositiveInt(env.SWEEP_INTERVAL_S, 5),
     ...readLeaseConfig(env),
+    ...readNoteConfig(env),
   };
 }

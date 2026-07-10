@@ -54,7 +54,15 @@ export function createApiRoutes(store: Store, dbPath: string): Hono {
 
   api.get("/shows", (c) => c.json({ shows: listShows(dbPath) }));
 
-  api.get("/shows/:show/state", (c) => c.json(store.getBoard(c.req.param("show"), true)));
+  api.get("/shows/:show/state", (c) => {
+    const show = c.req.param("show");
+    const board = store.getBoard(show, true);
+    // Store.recentNotes returns newest-last (chronological, matching getRecentMessages'
+    // convention for feeds that get re-merged/sorted elsewhere); the callboard's NOTES panel
+    // renders this list as-is, so flip it to newest-first here.
+    const recentNotes = store.recentNotes(show, 10).reverse();
+    return c.json({ ...board, recentNotes });
+  });
 
   api.post("/shows/:show/message", async (c) => {
     const parsed = messageSchema.safeParse(await c.req.json().catch(() => null));

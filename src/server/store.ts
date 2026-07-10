@@ -12,14 +12,19 @@ import {
   type MemberKind,
   type MemberRole,
   type Message,
+  type MessageKind,
   type MessageTarget,
+  type Note,
+  type NoteHit,
   type OverlapWarning,
+  type SaveNoteInput,
   type SweepResult,
   type Task,
   type TaskArtifact,
   type TaskNote,
   type TaskStatus,
   readLeaseConfig,
+  readNoteConfig,
   SupersededError,
 } from "../types.js";
 
@@ -40,7 +45,9 @@ CREATE TABLE IF NOT EXISTS members (
   last_seen_at INTEGER NOT NULL,
   lease_expires_at INTEGER NOT NULL,
   current_task_id TEXT,
-  review_cursor INTEGER NOT NULL DEFAULT 0
+  review_cursor INTEGER NOT NULL DEFAULT 0,
+  session_url TEXT,
+  resume_hint TEXT
 );
 CREATE INDEX IF NOT EXISTS members_show_idx ON members(show);
 
@@ -87,6 +94,7 @@ CREATE TABLE IF NOT EXISTS messages (
   to_id TEXT NOT NULL,
   task_id TEXT,
   body TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'message',
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_show_idx ON messages(show, to_id);
@@ -96,6 +104,21 @@ CREATE TABLE IF NOT EXISTS message_reads (
   member_id TEXT NOT NULL,
   PRIMARY KEY (message_id, member_id)
 );
+
+CREATE TABLE IF NOT EXISTS notes (
+  id TEXT PRIMARY KEY,
+  show TEXT NOT NULL REFERENCES shows(name),
+  author TEXT NOT NULL,
+  body TEXT NOT NULL,
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  files_hint_json TEXT NOT NULL DEFAULT '[]',
+  task_id TEXT,
+  context_id TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS notes_show_idx ON notes(show, created_at);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(id UNINDEXED, show UNINDEXED, body, tags);
 `;
 
 const TERMINAL_STATUSES = new Set<TaskStatus>(["completed", "failed", "rejected", "canceled"]);
@@ -105,6 +128,21 @@ const IN_FLIGHT_STATUSES: TaskStatus[] = ["queued", "assigned", "working", "inpu
 // of finished-task/human-message history is kept; everything still in flight is unbounded.
 const NON_VERBOSE_TASK_LIMIT = 20;
 const NON_VERBOSE_MESSAGE_LIMIT = 20;
+
+// search_notes token discipline (DESIGN.md "search results compact"): caller-supplied limit is
+// clamped here so it can't return the whole notes table with full bodies regardless of caller.
+const MAX_SEARCH_NOTES_LIMIT = 25;
+
+// notesForTask's glob-overlap branch can't push the overlap check into SQL (files_hint_json is
+// arbitrary globs, not a column filter), so it scans notes newest-first; bounded here so an
+// unbounded, ever-growing notes table can't turn every claim into a full table scan.
+const NOTES_GLOB_SCAN_LIMIT = 500;
+
+// save_note tag caps: not an env knob (DESIGN.md's Env knobs table pins the note-related knobs
+// to NOTE_MAX_CHARS/NOTES_PER_TASK only) -- tags are metadata, not the payload NOTE_MAX_CHARS
+// bounds, but left fully unbounded they'd blow the same claim-time/search token budget.
+const NOTE_MAX_TAGS = 8;
+const NOTE_TAG_MAX_CHARS = 32;
 
 const ADJECTIVES = [
   "amber", "brave", "calm", "dusty", "eager", "faded", "gentle", "honest", "ivory", "jolly",
@@ -136,6 +174,35 @@ function globsOverlap(a: string, b: string): boolean {
   return pa.startsWith(pb) || pb.startsWith(pa);
 }
 
+/** True if any glob in `a` overlaps any glob in `b` (notes push/recall, DESIGN.md "files_hint
+ * glob overlap"). */
+function anyGlobOverlap(a: string[], b: string[]): boolean {
+  for (const x of a) {
+    for (const y of b) {
+      if (globsOverlap(x, y)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Builds a safe FTS5 MATCH expression from a free-text query: each whitespace-separated token
+ * is wrapped as a quoted FTS5 string literal (internal `"` doubled per FTS5 escaping rules), so
+ * operators/column-filters/syntax in a hostile query (`NEAR(`, `col:`, stray quotes, `--`) are
+ * never interpreted -- they become literal tokens to match, and MATCH never throws. Tokens are
+ * OR'd together so bm25 can rank partial matches instead of requiring every token to hit.
+ */
+function buildFtsMatchQuery(query: string): string | null {
+  const tokens = query
+    .replace(/\0/g, "") // FTS5's query scanner treats NUL as an unterminated-string error even
+    // inside a doubled-quote literal, so it must go before quoting or "MATCH never throws" is a lie.
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length > 0);
+  if (tokens.length === 0) return null;
+  return tokens.map((t) => `"${t.replace(/"/g, '""')}"`).join(" OR ");
+}
+
 interface MemberRow {
   id: string;
   show: string;
@@ -147,6 +214,8 @@ interface MemberRow {
   lease_expires_at: number;
   current_task_id: string | null;
   review_cursor: number;
+  session_url: string | null;
+  resume_hint: string | null;
 }
 
 interface TaskRow {
@@ -175,6 +244,7 @@ interface MessageRow {
   to_id: string;
   task_id: string | null;
   body: string;
+  kind: string;
   created_at: number;
 }
 
@@ -185,11 +255,25 @@ interface DirectionRow {
   lease_expires_at: number;
 }
 
-interface NoteRow {
+// task_notes: a task's append-only journal (TaskNote). Not to be confused with NoteRow below,
+// which is the notes table (show-wide shared memory, Note).
+interface TaskNoteRow {
   id: string;
   task_id: string;
   author: string;
   body: string;
+  created_at: number;
+}
+
+interface NoteRow {
+  id: string;
+  show: string;
+  author: string;
+  body: string;
+  tags_json: string;
+  files_hint_json: string;
+  task_id: string | null;
+  context_id: string | null;
   created_at: number;
 }
 
@@ -204,6 +288,8 @@ function mapMember(r: MemberRow): Member {
     lastSeenAt: r.last_seen_at,
     leaseExpiresAt: r.lease_expires_at,
     currentTaskId: r.current_task_id,
+    ...(r.session_url ? { sessionUrl: r.session_url } : {}),
+    ...(r.resume_hint ? { resumeHint: r.resume_hint } : {}),
   };
 }
 
@@ -236,12 +322,31 @@ function mapMessage(r: MessageRow): Message {
     toId: r.to_id as MessageTarget,
     taskId: r.task_id,
     body: r.body,
+    kind: r.kind as MessageKind,
     createdAt: r.created_at,
   };
 }
 
-function mapNote(r: NoteRow): TaskNote {
+function mapTaskNote(r: TaskNoteRow): TaskNote {
   return { id: r.id, taskId: r.task_id, author: r.author, body: r.body, createdAt: r.created_at };
+}
+
+function mapNote(r: NoteRow): Note {
+  return {
+    id: r.id,
+    show: r.show,
+    author: r.author,
+    body: r.body,
+    tags: JSON.parse(r.tags_json) as string[],
+    filesHint: JSON.parse(r.files_hint_json) as string[],
+    taskId: r.task_id,
+    contextId: r.context_id,
+    createdAt: r.created_at,
+  };
+}
+
+function mapNoteHit(r: NoteRow): NoteHit {
+  return { id: r.id, author: r.author, tags: JSON.parse(r.tags_json) as string[], body: r.body, createdAt: r.created_at };
 }
 
 export class Store {
@@ -249,19 +354,48 @@ export class Store {
   private readonly db: Database.Database;
   private readonly now: () => number;
   private readonly leases: ReturnType<typeof readLeaseConfig>;
+  private readonly noteConfig: ReturnType<typeof readNoteConfig>;
 
   constructor(dbPath: string, now: () => number = Date.now) {
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.db.exec(SCHEMA_SQL);
+    this.migrateMessagesKindColumn();
+    this.migrateMemberSessionColumns();
     this.now = now;
     this.leases = readLeaseConfig();
+    this.noteConfig = readNoteConfig();
     // Every parked await_work adds a wake:* listener; a healthy show can easily have more
     // than the EventEmitter default of 10 concurrent pollers. Listener count is bounded by
     // concurrent polls and provably cleaned up (see mcp.test.ts), so unbound this rather
     // than spam MaxListenersExceededWarning in production logs.
     this.events.setMaxListeners(0);
+  }
+
+  /** Guarded upgrade-in-place (DESIGN.md data model): messages predates `kind`; a deployed DB
+   * gets the column added with its default backfilled, instead of needing a destructive
+   * recreate. No-op on a fresh DB, where SCHEMA_SQL already declares the column. */
+  private migrateMessagesKindColumn(): void {
+    const cols = this.db.pragma("table_info(messages)") as { name: string }[];
+    if (!cols.some((c) => c.name === "kind")) {
+      this.db.exec("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'message'");
+    }
+  }
+
+  /** Guarded upgrade-in-place: members predates session_url/resume_hint (the self-reported chat
+   * link, DESIGN.md "register... session_url/resume_hint"); a deployed DB gets both columns
+   * added -- nullable, no default, unlike messages.kind there's no meaningful backfill value --
+   * instead of needing a destructive recreate. No-op on a fresh DB, where SCHEMA_SQL already
+   * declares them. */
+  private migrateMemberSessionColumns(): void {
+    const cols = this.db.pragma("table_info(members)") as { name: string }[];
+    if (!cols.some((c) => c.name === "session_url")) {
+      this.db.exec("ALTER TABLE members ADD COLUMN session_url TEXT");
+    }
+    if (!cols.some((c) => c.name === "resume_hint")) {
+      this.db.exec("ALTER TABLE members ADD COLUMN resume_hint TEXT");
+    }
   }
 
   private txn<T>(fn: () => T): T {
@@ -286,11 +420,15 @@ export class Store {
     return this.db.prepare("SELECT * FROM messages WHERE id = ?").get(id) as MessageRow | undefined;
   }
 
+  private getNoteRowRaw(id: string): NoteRow | undefined {
+    return this.db.prepare("SELECT * FROM notes WHERE id = ?").get(id) as NoteRow | undefined;
+  }
+
   private getNotes(taskId: string): TaskNote[] {
     const rows = this.db
       .prepare("SELECT * FROM task_notes WHERE task_id = ? ORDER BY created_at ASC")
-      .all(taskId) as NoteRow[];
-    return rows.map(mapNote);
+      .all(taskId) as TaskNoteRow[];
+    return rows.map(mapTaskNote);
   }
 
   /** Most recent messages of any kind (not just human-addressed) for the callboard activity feed. */
@@ -315,12 +453,13 @@ export class Store {
     taskId: string | null,
     body: string,
     at: number,
+    kind: MessageKind = "message",
   ): void {
     this.db
       .prepare(
-        "INSERT INTO messages (id, show, from_id, to_id, task_id, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO messages (id, show, from_id, to_id, task_id, body, created_at, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(id, show, fromId, toId, taskId, body, at);
+      .run(id, show, fromId, toId, taskId, body, at, kind);
   }
 
   // --- id generation ---
@@ -349,9 +488,24 @@ export class Store {
     throw new Error("failed to generate a unique message id");
   }
 
+  private generateNoteId(): string {
+    for (let i = 0; i < 10; i++) {
+      const candidate = `note-${randomHex(5)}`;
+      if (!this.getNoteRowRaw(candidate)) return candidate;
+    }
+    throw new Error("failed to generate a unique note id");
+  }
+
   // --- members / shows ---
 
-  register(show: string, kind: MemberKind, displayName?: string, _capabilities?: string[]): Member {
+  register(
+    show: string,
+    kind: MemberKind,
+    displayName?: string,
+    _capabilities?: string[],
+    sessionUrl?: string,
+    resumeHint?: string,
+  ): Member {
     return this.txn(() => {
       const at = this.now();
       this.db
@@ -365,10 +519,10 @@ export class Store {
       const leaseExpiresAt = at + this.leases.workerLeaseS * 1000;
       this.db
         .prepare(
-          `INSERT INTO members (id, show, kind, display_name, role, registered_at, last_seen_at, lease_expires_at, current_task_id)
-           VALUES (?, ?, ?, ?, 'worker', ?, ?, ?, NULL)`,
+          `INSERT INTO members (id, show, kind, display_name, role, registered_at, last_seen_at, lease_expires_at, current_task_id, session_url, resume_hint)
+           VALUES (?, ?, ?, ?, 'worker', ?, ?, ?, NULL, ?, ?)`,
         )
-        .run(id, show, kind, displayName ?? null, at, at, leaseExpiresAt);
+        .run(id, show, kind, displayName ?? null, at, at, leaseExpiresAt, sessionUrl ?? null, resumeHint ?? null);
       return mapMember(this.getMemberRowRaw(id)!);
     });
   }
@@ -389,9 +543,17 @@ export class Store {
   getBoard(show: string, verbose = false): BoardState {
     const now = this.now();
     const dir = this.getDirectionRow(show);
+    const directorMemberRow = dir?.director_id ? this.getMemberRowRaw(dir.director_id) : undefined;
     const director =
       dir && dir.director_id
-        ? { memberId: dir.director_id, epoch: dir.epoch, leaseExpiresAt: dir.lease_expires_at, stale: dir.lease_expires_at < now }
+        ? {
+            memberId: dir.director_id,
+            epoch: dir.epoch,
+            leaseExpiresAt: dir.lease_expires_at,
+            stale: dir.lease_expires_at < now,
+            ...(directorMemberRow?.session_url ? { sessionUrl: directorMemberRow.session_url } : {}),
+            ...(directorMemberRow?.resume_hint ? { resumeHint: directorMemberRow.resume_hint } : {}),
+          }
         : null;
 
     const memberRows = this.db
@@ -407,6 +569,8 @@ export class Store {
       leaseExpiresAt: m.lease_expires_at,
       stale: m.lease_expires_at < now,
       currentTaskId: m.current_task_id,
+      ...(m.session_url ? { sessionUrl: m.session_url } : {}),
+      ...(m.resume_hint ? { resumeHint: m.resume_hint } : {}),
     }));
 
     const taskRows = this.db.prepare("SELECT * FROM tasks WHERE show = ? ORDER BY updated_at DESC").all(show) as TaskRow[];
@@ -502,9 +666,9 @@ export class Store {
     });
   }
 
-  /** Clears direction (admin action, e.g. the callboard "demote a runaway director" strip):
-   * bumps epoch to fence the old holder like a takeover would, but actually leaves the show
-   * with no director instead of installing the human pseudo-member as one. */
+  /** Clears direction (admin action, e.g. `showrunner direction clear` demoting a runaway
+   * director): bumps epoch to fence the old holder like a takeover would, but actually leaves
+   * the show with no director instead of installing the human pseudo-member as one. */
   clearDirection(show: string): void {
     this.txn(() => {
       const dir = this.getDirectionRow(show);
@@ -822,10 +986,11 @@ export class Store {
   }
 
   /**
-   * Admin/system cancel (the callboard's cancel button, authenticated by bearer token, not
-   * membership): mirrors directTask's cancel action but bypasses epoch fencing, and -- unlike
-   * routing this through updateTask -- never touches the `assignee` column, so canceling a
-   * queued (unassigned) task doesn't stamp the acting admin onto it as if they'd worked it.
+   * Admin/system cancel (the CLI's `task cancel` or a direct /api call, authenticated by bearer
+   * token, not membership): mirrors directTask's cancel action but bypasses epoch fencing, and
+   * -- unlike routing this through updateTask -- never touches the `assignee` column, so
+   * canceling a queued (unassigned) task doesn't stamp the acting admin onto it as if they'd
+   * worked it.
    */
   adminCancelTask(taskId: string, actor: string): Task {
     return this.txn(() => {
@@ -839,7 +1004,7 @@ export class Store {
           this.db.prepare("UPDATE members SET current_task_id = NULL WHERE id = ? AND current_task_id = ?").run(row.assignee, taskId);
           this.events.emit(`wake:${row.assignee}`);
         }
-        this.insertNote(taskId, actor, "canceled via callboard", at);
+        this.insertNote(taskId, actor, "canceled via admin API", at);
       }
       return mapTask(this.getTaskRowRaw(taskId)!);
     });
@@ -907,6 +1072,191 @@ export class Store {
       this.db.prepare("SELECT * FROM messages WHERE show = ? AND to_id = 'human' ORDER BY created_at ASC").all(show) as MessageRow[]
     ).map(mapMessage);
     return { inputRequired, humanMessages };
+  }
+
+  // --- notes (DESIGN.md "Shared notes: realtime memory") ---
+
+  /**
+   * Push a note to shared memory. Recipients (DESIGN.md "push on save") are non-author members
+   * whose *current* task is live (non-terminal) and structurally overlaps: same task, same
+   * context, or files_hint glob intersection -- never fuzzy text match, so pushes stay rare
+   * enough that agents don't learn to ignore them. Each recipient gets a kind:"note" message,
+   * plus an immediate wake if their member lease says they're actually polling right now (see
+   * pushNote); the author gets the note back with who it reached.
+   */
+  saveNote(memberId: string, input: SaveNoteInput): { note: Note; deliveredTo: string[] } {
+    return this.txn(() => {
+      const author = this.getMemberRowRaw(memberId);
+      if (!author) throw new Error(`unknown member: ${memberId}`);
+
+      if (input.body.length > this.noteConfig.noteMaxChars) {
+        throw new Error(
+          `note body exceeds NOTE_MAX_CHARS (${this.noteConfig.noteMaxChars} chars); got ${input.body.length} -- shorten it instead of relying on truncation`,
+        );
+      }
+      const tags = input.tags ?? [];
+      if (tags.length > NOTE_MAX_TAGS) {
+        throw new Error(`too many tags (max ${NOTE_MAX_TAGS}); got ${tags.length}`);
+      }
+      for (const tag of tags) {
+        if (tag.length > NOTE_TAG_MAX_CHARS) {
+          throw new Error(`tag exceeds ${NOTE_TAG_MAX_CHARS} chars: "${tag.slice(0, 40)}..."`);
+        }
+      }
+
+      // contextId is derived, not caller-supplied (DESIGN.md "derives contextId from taskId"):
+      // a note about a task inherits that task's thread so context-wide recall/push still find it.
+      let contextId: string | null = null;
+      if (input.taskId) {
+        const task = this.getTaskRowRaw(input.taskId);
+        if (!task) throw new Error(`unknown task: ${input.taskId}`);
+        if (task.show !== author.show) throw new Error(`task ${input.taskId} belongs to a different show`);
+        contextId = task.context_id;
+      }
+
+      const at = this.now();
+      const id = this.generateNoteId();
+      const filesHint = input.filesHint ?? [];
+
+      this.db
+        .prepare(
+          `INSERT INTO notes (id, show, author, body, tags_json, files_hint_json, task_id, context_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(id, author.show, memberId, input.body, JSON.stringify(tags), JSON.stringify(filesHint), input.taskId ?? null, contextId, at);
+      // Same txn, no triggers (append-only): the two tables are written together here instead
+      // of relying on an FTS5 content-table/trigger sync.
+      this.db.prepare("INSERT INTO notes_fts (id, show, body, tags) VALUES (?, ?, ?, ?)").run(id, author.show, input.body, tags.join(" "));
+
+      const note = mapNote(this.getNoteRowRaw(id)!);
+      const deliveredTo = this.pushNote(author.show, memberId, note);
+      return { note, deliveredTo };
+    });
+  }
+
+  private pushNote(show: string, authorId: string, note: Note): string[] {
+    const now = this.now();
+    // Delivery is gated on the recipient's *current task* being live, not the 90s member
+    // lease: a worker heads-down executing only has to heartbeat every ~10min (see the sweep()
+    // comment below), so it's routinely outside its member lease window while still genuinely
+    // working -- exactly the primary intended recipient of a note about the task it's on. The
+    // task's own lease already bounds staleness (a stale task's assignee gets reaped and
+    // current_task_id cleared), so a non-terminal current task is enough. The member lease is
+    // consulted only below, to decide whether an immediate wake is worth emitting; the message
+    // itself is inserted either way and picked up on the recipient's next drainInbox regardless.
+    const candidates = this.db
+      .prepare("SELECT * FROM members WHERE show = ? AND id <> ? AND current_task_id IS NOT NULL")
+      .all(show, authorId) as MemberRow[];
+
+    const delivered: string[] = [];
+    for (const m of candidates) {
+      const task = this.getTaskRowRaw(m.current_task_id!);
+      if (!task || TERMINAL_STATUSES.has(task.status as TaskStatus)) continue;
+
+      const sameTask = note.taskId !== null && task.id === note.taskId;
+      const sameContext = note.contextId !== null && task.context_id !== null && task.context_id === note.contextId;
+      const taskFilesHint = JSON.parse(task.files_hint_json) as string[];
+      const overlapsFiles = note.filesHint.length > 0 && anyGlobOverlap(note.filesHint, taskFilesHint);
+      if (!sameTask && !sameContext && !overlapsFiles) continue;
+
+      this.insertMessageRow(this.generateMessageId(), show, authorId, m.id, note.taskId, note.body, now, "note");
+      // Only worth waking a parked await_work if the member's lease says it's actually polling;
+      // a heads-down worker well past its lease still gets the message, just via its next
+      // drainInbox instead of an immediate wake.
+      if (m.lease_expires_at > now) this.events.emit(`wake:${m.id}`);
+      delivered.push(m.id);
+    }
+    return delivered;
+  }
+
+  /** BM25-ranked search over a show's notes. Query is tokenized and each token is quoted as an
+   * FTS5 string literal (buildFtsMatchQuery) so a hostile query string can never throw or be
+   * interpreted as FTS5 syntax. An all-whitespace/empty query matches nothing. `limit` is
+   * clamped to MAX_SEARCH_NOTES_LIMIT regardless of what the caller asks for (DESIGN.md "search
+   * results compact"). */
+  searchNotes(show: string, query: string, limit = 8): NoteHit[] {
+    const match = buildFtsMatchQuery(query);
+    if (!match) return [];
+    const cappedLimit = Math.min(limit, MAX_SEARCH_NOTES_LIMIT);
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT n.* FROM notes_fts f
+             JOIN notes n ON n.id = f.id
+            WHERE f.show = ? AND notes_fts MATCH ?
+            ORDER BY bm25(notes_fts) ASC, n.created_at DESC
+            LIMIT ?`,
+        )
+        .all(show, match, cappedLimit) as NoteRow[];
+      return rows.map(mapNoteHit);
+    } catch {
+      // Belt-and-suspenders on top of buildFtsMatchQuery's own sanitizing: MATCH must never
+      // throw (this function's contract), whatever FTS5 edge case slips past the quoting.
+      return [];
+    }
+  }
+
+  /**
+   * Notes relevant to a task at claim time (DESIGN.md "Recall at claim time"): files_hint
+   * glob-overlap hits first -- the structural signal DESIGN.md privileges over fuzzy text match
+   * -- then BM25-over-title+brief hits fill whatever budget is left, deduped, newest-first
+   * tiebreak. Returns full Notes; the caller (mcp.ts, building the delivered task payload) trims
+   * bodies to the ~300-char relevant_notes shape.
+   */
+  notesForTask(task: Pick<Task, "show" | "title" | "brief" | "filesHint">, limit = this.noteConfig.notesPerTask): Note[] {
+    const seen = new Set<string>();
+    const result: Note[] = [];
+
+    if (task.filesHint.length > 0) {
+      // notes is append-only and unbounded; bound the scan to the most recent slice instead of
+      // the whole show's history so a long-running show can't turn every claim into a full
+      // table scan (glob overlap isn't expressible as a SQL predicate over files_hint_json).
+      const rows = this.db
+        .prepare("SELECT * FROM notes WHERE show = ? ORDER BY created_at DESC LIMIT ?")
+        .all(task.show, NOTES_GLOB_SCAN_LIMIT) as NoteRow[];
+      for (const row of rows) {
+        if (result.length >= limit) break;
+        if (seen.has(row.id)) continue;
+        const noteFilesHint = JSON.parse(row.files_hint_json) as string[];
+        if (noteFilesHint.length === 0 || !anyGlobOverlap(noteFilesHint, task.filesHint)) continue;
+        seen.add(row.id);
+        result.push(mapNote(row));
+      }
+    }
+
+    if (result.length < limit) {
+      const match = buildFtsMatchQuery(`${task.title} ${task.brief}`);
+      if (match) {
+        try {
+          const rows = this.db
+            .prepare(
+              `SELECT n.* FROM notes_fts f
+                 JOIN notes n ON n.id = f.id
+                WHERE f.show = ? AND notes_fts MATCH ?
+                ORDER BY bm25(notes_fts) ASC, n.created_at DESC
+                LIMIT ?`,
+            )
+            .all(task.show, match, limit) as NoteRow[];
+          for (const row of rows) {
+            if (result.length >= limit) break;
+            if (seen.has(row.id)) continue;
+            seen.add(row.id);
+            result.push(mapNote(row));
+          }
+        } catch {
+          // A recall failure must degrade to fewer notes, never poison the claim that's
+          // handing this task out (see buildFtsMatchQuery / searchNotes for the same contract).
+        }
+      }
+    }
+
+    return result.slice(0, limit);
+  }
+
+  /** Most recent notes for a show (API layer / callboard), newest-last like getRecentMessages. */
+  recentNotes(show: string, limit = 10): Note[] {
+    const rows = this.db.prepare("SELECT * FROM notes WHERE show = ? ORDER BY created_at DESC LIMIT ?").all(show, limit) as NoteRow[];
+    return rows.map(mapNote).reverse();
   }
 
   // --- liveness ---

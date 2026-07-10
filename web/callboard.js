@@ -1,12 +1,15 @@
-// Callboard: single-file, no build step. Polls GET /api/shows/:show/state every 2s and
-// renders director/members/tasks/activity/escalations. Admin actions post through /api.
+// Callboard: single-file, no build step. Polls GET /api/shows/:show/state every 2s and renders
+// director/members/tasks/notes/activity/escalations. A window, not a control panel (DESIGN.md):
+// no task forms, no message box, no admin actions -- those live in the CLI against the same
+// /api the poll here reads. Steer the show by talking to the director agent in its own chat,
+// which the chat link below opens.
 (function () {
   "use strict";
 
   const TOKEN_KEY = "showrunner_token";
   const SHOW_KEY = "showrunner_show";
   const POLL_MS = 2000;
-  const TERMINAL = new Set(["completed", "failed", "rejected", "canceled"]);
+  const NOTE_BODY_TRIM = 140;
 
   const state = {
     token: localStorage.getItem(TOKEN_KEY) || "",
@@ -120,8 +123,25 @@
     renderDirector(board && board.director);
     renderMembers(board ? board.members : []);
     renderTasks(board ? board.tasks : []);
+    renderNotes(board);
     renderActivity(board);
     renderBanner(board && board.escalations);
+  }
+
+  // Director card / member row chat link (DESIGN.md "the chat link"): session_url renders as a
+  // prominent "open chat" anchor, resume_hint (no session_url) as click-to-copy code, neither as
+  // a dim hint the session didn't report one.
+  function chatLinkHtml(entity) {
+    if (entity.sessionUrl) {
+      return `<a class="chat-open" href="${escapeHtml(entity.sessionUrl)}" target="_blank" rel="noopener">open chat &#8599;</a>`;
+    }
+    if (entity.resumeHint) {
+      // resume_hint is self-reported by the session, not vetted by the server (DESIGN.md security
+      // posture: one shared token, no per-member trust) -- label it so a copy-paste isn't mistaken
+      // for a server-verified command.
+      return `<code class="resume-hint">${escapeHtml(entity.resumeHint)}</code> <button type="button" class="copy-hint" data-hint="${escapeHtml(entity.resumeHint)}">copy</button> <span class="hint" title="self-reported by the session, not verified by the server">self-reported</span>`;
+    }
+    return `<span class="hint">no chat link reported</span>`;
   }
 
   function renderDirector(director) {
@@ -138,6 +158,7 @@
     body.innerHTML = `
       <div><span class="dot ${dot}"></span> ${escapeHtml(director.memberId)}</div>
       <div class="hint">epoch ${director.epoch} &middot; ${director.stale ? "lease expired" : "lease active"}</div>
+      <div class="chat-link">${chatLinkHtml(director)}</div>
     `;
   }
 
@@ -155,9 +176,12 @@
       .map((m) => {
         const dot = m.stale ? "stale" : "fresh";
         const name = escapeHtml(m.displayName || m.id);
+        const chat = m.sessionUrl
+          ? ` <a class="chat-open-small" href="${escapeHtml(m.sessionUrl)}" target="_blank" rel="noopener" title="open chat">&#8599;</a>`
+          : "";
         return `<li>
           <span class="dot ${dot}"></span>
-          <span>${name}</span>
+          <span>${name}${chat}</span>
           <span class="badge">${escapeHtml(m.kind)}</span>
           <span class="badge">${escapeHtml(m.role)}</span>
           <span class="hint">${m.currentTaskId ? `on ${escapeHtml(m.currentTaskId)}` : "idle"}</span>
@@ -192,25 +216,10 @@
     }
 
     document.querySelectorAll(".task-item").forEach((node) => {
-      node.addEventListener("click", (ev) => {
-        if (ev.target.closest("button")) return;
+      node.addEventListener("click", () => {
         const id = node.dataset.id;
         state.expanded.has(id) ? state.expanded.delete(id) : state.expanded.add(id);
         fetchState();
-      });
-    });
-    document.querySelectorAll(".task-item button.cancel").forEach((btn) => {
-      btn.addEventListener("click", async (ev) => {
-        ev.stopPropagation();
-        const id = btn.closest(".task-item").dataset.id;
-        try {
-          await api(`/api/shows/${encodeURIComponent(state.show)}/tasks/${encodeURIComponent(id)}/cancel`, {
-            method: "POST",
-          });
-          fetchState();
-        } catch (err) {
-          alert(`cancel failed: ${err.message}`);
-        }
       });
     });
   }
@@ -222,7 +231,6 @@
           .map((n) => `<div>${escapeHtml(n.author)}: ${escapeHtml(n.body)} <span class="hint">(${relTime(n.createdAt)})</span></div>`)
           .join("")}</div>`
       : "";
-    const cancelBtn = TERMINAL.has(t.status) ? "" : `<button class="cancel danger">cancel</button>`;
     return `<li class="task-item" data-id="${escapeHtml(t.id)}">
       <div class="task-row">
         <span class="task-title">${escapeHtml(t.title)}</span>
@@ -230,7 +238,34 @@
       </div>
       <div class="hint">${escapeHtml(t.id)} &middot; ${t.assignee ? escapeHtml(t.assignee) : "unassigned"} &middot; attempt ${t.attempt} &middot; ${relTime(t.updatedAt)}</div>
       ${notes}
-      ${cancelBtn}
+    </li>`;
+  }
+
+  function renderNotes(board) {
+    const list = el("notes-list");
+    if (!board) {
+      list.innerHTML = `<li class="hint">no show selected</li>`;
+      return;
+    }
+    const notes = board.recentNotes || [];
+    if (!notes.length) {
+      list.innerHTML = `<li class="hint">no notes yet</li>`;
+      return;
+    }
+    // board.recentNotes arrives newest-first (api.ts); render as-is.
+    list.innerHTML = notes.map(noteItemHtml).join("");
+  }
+
+  function noteItemHtml(n) {
+    const tags = (n.tags || []).map((t) => `<span class="badge">${escapeHtml(t)}</span>`).join("");
+    const body = n.body.length > NOTE_BODY_TRIM ? `${n.body.slice(0, NOTE_BODY_TRIM)}…` : n.body;
+    return `<li>
+      <div class="note-row">
+        <span class="who">${escapeHtml(n.author)}</span>
+        ${tags}
+        <span class="when">${relTime(n.createdAt)}</span>
+      </div>
+      <div class="note-body">${escapeHtml(body)}</div>
     </li>`;
   }
 
@@ -267,66 +302,22 @@
     banner.innerHTML = `<strong>needs attention</strong><ul>${items.map((i) => `<li>${i}</li>`).join("")}</ul>`;
   }
 
-  // --- admin forms ---
+  // --- click-to-copy resume_hint (delegated: director/member rows are re-rendered every poll,
+  // this listener isn't) ---
 
-  el("message-form").addEventListener("submit", async (ev) => {
-    ev.preventDefault();
-    if (!state.show) return alert("pick a show first");
-    const to = el("message-to").value;
-    const body = el("message-body").value.trim();
-    if (!body) return;
+  document.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest(".copy-hint");
+    if (!btn) return;
+    const hint = btn.dataset.hint || "";
     try {
-      await api(`/api/shows/${encodeURIComponent(state.show)}/message`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ to, body }),
-      });
-      el("message-body").value = "";
-      fetchState();
-    } catch (err) {
-      alert(`send failed: ${err.message}`);
+      await navigator.clipboard.writeText(hint);
+      btn.textContent = "copied";
+    } catch {
+      btn.textContent = "copy failed";
     }
-  });
-
-  el("task-form").addEventListener("submit", async (ev) => {
-    ev.preventDefault();
-    if (!state.show) return alert("pick a show first");
-    const title = el("task-title").value.trim();
-    const brief = el("task-brief").value.trim();
-    if (!title || !brief) return;
-    const filesHint = el("task-files").value.split(",").map((s) => s.trim()).filter(Boolean);
-    const payload = {
-      title,
-      brief,
-      contextId: el("task-context").value.trim() || undefined,
-      filesHint: filesHint.length ? filesHint : undefined,
-      priority: Number(el("task-priority").value) || 0,
-      assignee: el("task-assignee").value.trim() || undefined,
-    };
-    try {
-      await api(`/api/shows/${encodeURIComponent(state.show)}/tasks`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      ev.target.reset();
-      el("task-priority").value = "0";
-      fetchState();
-    } catch (err) {
-      alert(`create failed: ${err.message}`);
-    }
-  });
-
-  el("direction-form").addEventListener("submit", async (ev) => {
-    ev.preventDefault();
-    if (!state.show) return alert("pick a show first");
-    if (!confirm(`Clear direction for "${state.show}"? This demotes the current director.`)) return;
-    try {
-      await api(`/api/shows/${encodeURIComponent(state.show)}/direction/clear`, { method: "POST" });
-      fetchState();
-    } catch (err) {
-      alert(`clear failed: ${err.message}`);
-    }
+    setTimeout(() => {
+      btn.textContent = "copy";
+    }, 1500);
   });
 
   // --- token + show picker wiring ---

@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import Database from "better-sqlite3";
 import { Store } from "../src/server/store.js";
 import { SupersededError } from "../src/types.js";
 
@@ -33,6 +37,44 @@ describe("register / touchMember", () => {
     const touched = store.touchMember(m.id);
     expect(touched?.leaseExpiresAt).toBeGreaterThan(before);
     expect(store.touchMember("nobody")).toBeUndefined();
+  });
+});
+
+describe("register: session_url / resume_hint (self-reported chat link)", () => {
+  it("persists whichever is given and exposes it on the member and the board", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local", "planning session", undefined, "https://claude.ai/code/session_abc");
+    expect(director.sessionUrl).toBe("https://claude.ai/code/session_abc");
+    expect(director.resumeHint).toBeUndefined();
+
+    const worker = store.register("myshow", "claude-local", undefined, undefined, undefined, "claude --resume 7f3a9c");
+    expect(worker.resumeHint).toBe("claude --resume 7f3a9c");
+    expect(worker.sessionUrl).toBeUndefined();
+
+    const board = store.getBoard("myshow");
+    expect(board.members.find((m) => m.id === director.id)?.sessionUrl).toBe("https://claude.ai/code/session_abc");
+    expect(board.members.find((m) => m.id === worker.id)?.resumeHint).toBe("claude --resume 7f3a9c");
+  });
+
+  it("omits both keys entirely (not null) when neither is reported", () => {
+    const { store } = newStore();
+    const m = store.register("myshow", "claude-local");
+    expect(m).not.toHaveProperty("sessionUrl");
+    expect(m).not.toHaveProperty("resumeHint");
+
+    const board = store.getBoard("myshow");
+    const boardMember = board.members.find((x) => x.id === m.id)!;
+    expect(boardMember).not.toHaveProperty("sessionUrl");
+    expect(boardMember).not.toHaveProperty("resumeHint");
+  });
+
+  it("exposes the director's session_url/resume_hint on the board's director card", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local", undefined, undefined, "https://claude.ai/code/session_dir");
+    store.claimDirection(director.id);
+
+    const board = store.getBoard("myshow");
+    expect(board.director?.sessionUrl).toBe("https://claude.ai/code/session_dir");
   });
 });
 
@@ -592,5 +634,445 @@ describe("wake events", () => {
     store.events.once(`wake:${worker.id}`, () => (woke = true));
     store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: worker.id });
     expect(woke).toBe(true);
+  });
+});
+
+describe("saveNote: validation", () => {
+  it("throws for an unknown member", () => {
+    const { store } = newStore();
+    expect(() => store.saveNote("nobody", { body: "x" })).toThrow(/unknown member/);
+  });
+
+  it("rejects a body over NOTE_MAX_CHARS instead of truncating it silently", () => {
+    const { store } = newStore();
+    const author = store.register("myshow", "claude-local");
+    const atCap = "x".repeat(2000); // default NOTE_MAX_CHARS
+    expect(() => store.saveNote(author.id, { body: atCap })).not.toThrow();
+
+    const overCap = "x".repeat(2001);
+    expect(() => store.saveNote(author.id, { body: overCap })).toThrow(/NOTE_MAX_CHARS/);
+  });
+
+  it("rejects too many tags, or a single tag that's unreasonably long, instead of shipping them untrimmed into every claim/search payload", () => {
+    const { store } = newStore();
+    const author = store.register("myshow", "claude-local");
+    expect(() => store.saveNote(author.id, { body: "x", tags: Array(9).fill("t") })).toThrow(/too many tags/);
+    expect(() => store.saveNote(author.id, { body: "x", tags: Array(8).fill("t") })).not.toThrow();
+
+    expect(() => store.saveNote(author.id, { body: "x", tags: ["y".repeat(33)] })).toThrow(/tag exceeds/);
+    expect(() => store.saveNote(author.id, { body: "x", tags: ["y".repeat(32)] })).not.toThrow();
+  });
+
+  it("throws for an unknown or cross-show task_id instead of silently dropping the link", () => {
+    const { store } = newStore();
+    const author = store.register("myshow", "claude-local");
+    expect(() => store.saveNote(author.id, { body: "x", taskId: "t-nope" })).toThrow(/unknown task/);
+
+    const otherShowAuthor = store.register("othershow", "claude-local");
+    const { task: otherShowTask } = store.createTask({ show: "othershow", title: "t", brief: "b", createdBy: otherShowAuthor.id });
+    expect(() => store.saveNote(author.id, { body: "x", taskId: otherShowTask.id })).toThrow(/different show/);
+  });
+
+  it("derives contextId from the given taskId's task", () => {
+    const { store } = newStore();
+    const author = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, contextId: "ctx-9" });
+
+    const { note } = store.saveNote(author.id, { body: "x", taskId: task.id });
+    expect(note.contextId).toBe("ctx-9");
+    expect(note.taskId).toBe(task.id);
+  });
+});
+
+describe("saveNote: realtime push", () => {
+  it("delivers to non-author members whose *current, non-terminal* task overlaps by task_id, context_id, or files_hint glob -- including a heads-down worker whose member lease has gone stale", () => {
+    const { store, clock } = newStore();
+    const author = store.register("myshow", "claude-local");
+    const sameTaskWorker = store.register("myshow", "claude-local");
+    const sameContextWorker = store.register("myshow", "claude-local");
+    const globWorker = store.register("myshow", "claude-local");
+    const unrelatedWorker = store.register("myshow", "claude-local");
+    const headsDownWorker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+
+    const { task: theTask } = store.createTask({
+      show: "myshow",
+      title: "the task",
+      brief: "b",
+      createdBy: director.id,
+      contextId: "ctx-1",
+      assignee: sameTaskWorker.id,
+    });
+    store.claimNextTask(sameTaskWorker.id);
+
+    store.createTask({
+      show: "myshow",
+      title: "same context",
+      brief: "b",
+      createdBy: director.id,
+      contextId: "ctx-1",
+      assignee: sameContextWorker.id,
+    });
+    store.claimNextTask(sameContextWorker.id);
+
+    store.createTask({
+      show: "myshow",
+      title: "glob overlap",
+      brief: "b",
+      createdBy: director.id,
+      filesHint: ["src/server/**"],
+      assignee: globWorker.id,
+    });
+    store.claimNextTask(globWorker.id);
+
+    store.createTask({
+      show: "myshow",
+      title: "unrelated",
+      brief: "b",
+      createdBy: director.id,
+      filesHint: ["web/**"],
+      assignee: unrelatedWorker.id,
+    });
+    store.claimNextTask(unrelatedWorker.id);
+
+    // Also glob-overlapping, and heads-down: its member lease (90s) goes stale because the
+    // protocol only requires a heartbeat every ~10min while working, but its task is still
+    // very much in flight (task lease is 15min) -- it must still receive the note.
+    store.createTask({
+      show: "myshow",
+      title: "heads-down but still in flight",
+      brief: "b",
+      createdBy: director.id,
+      filesHint: ["src/server/**"],
+      assignee: headsDownWorker.id,
+    });
+    store.claimNextTask(headsDownWorker.id);
+
+    clock.t += 100_000; // past WORKER_LEASE_S (90s); renew everyone but headsDownWorker
+    for (const m of [author, sameTaskWorker, sameContextWorker, globWorker, unrelatedWorker, director]) {
+      store.touchMember(m.id);
+    }
+
+    let headsDownWoke = false;
+    store.events.once(`wake:${headsDownWorker.id}`, () => (headsDownWoke = true));
+
+    const { deliveredTo } = store.saveNote(author.id, {
+      body: "gotcha about the task",
+      filesHint: ["src/server/store.ts"],
+      taskId: theTask.id,
+    });
+
+    expect(deliveredTo.sort()).toEqual(
+      [sameTaskWorker.id, sameContextWorker.id, globWorker.id, headsDownWorker.id].sort(),
+    );
+    expect(deliveredTo).not.toContain(unrelatedWorker.id);
+    expect(deliveredTo).not.toContain(author.id);
+    // Delivered (queued for its next poll) but not worth an immediate wake -- its stale member
+    // lease means it isn't parked in await_work right now anyway.
+    expect(headsDownWoke).toBe(false);
+    expect(store.drainInbox(headsDownWorker.id).map((m) => m.body)).toEqual(["gotcha about the task"]);
+  });
+
+  it("wakes each delivered recipient and inserts a kind:'note' message carrying the note's task_id", () => {
+    const { store } = newStore();
+    const author = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: worker.id });
+    store.claimNextTask(worker.id);
+
+    let woke = false;
+    store.events.once(`wake:${worker.id}`, () => (woke = true));
+    store.saveNote(author.id, { body: "gotcha", taskId: task.id });
+    expect(woke).toBe(true);
+
+    const inbox = store.drainInbox(worker.id);
+    expect(inbox).toHaveLength(1);
+    expect(inbox[0]!.kind).toBe("note");
+    expect(inbox[0]!.body).toBe("gotcha");
+    expect(inbox[0]!.taskId).toBe(task.id);
+    expect(inbox[0]!.fromId).toBe(author.id);
+  });
+
+  it("delivers to nobody (empty deliveredTo, no throw) when no live member's current task overlaps", () => {
+    const { store } = newStore();
+    const author = store.register("myshow", "claude-local");
+    store.register("myshow", "claude-local"); // idle: no current task, can never overlap
+
+    const { deliveredTo } = store.saveNote(author.id, { body: "solo thought" });
+    expect(deliveredTo).toEqual([]);
+  });
+});
+
+describe("searchNotes: FTS5 bm25 ranking + hostile query safety", () => {
+  it("ranks a note mentioning the term more by relevance, scoped to the given show", () => {
+    const { store } = newStore();
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("othershow", "claude-local");
+    store.saveNote(a.id, { body: "the fox jumps over the lazy dog" });
+    const { note: densest } = store.saveNote(a.id, { body: "fox fox fox: everything about foxes and fox dens" });
+    store.saveNote(b.id, { body: "fox in a different show must never surface here" });
+
+    const hits = store.searchNotes("myshow", "fox");
+    expect(hits).toHaveLength(2); // othershow's note excluded
+    expect(hits[0]!.id).toBe(densest.id); // the denser mention ranks first
+  });
+
+  it("never throws or lets FTS5 operators/syntax through on a hostile query string", () => {
+    const { store } = newStore();
+    const a = store.register("myshow", "claude-local");
+    store.saveNote(a.id, { body: "fox hunting tips" });
+
+    const hostile = 'fox" OR 1=1 -- NEAR(a b) column:x *';
+    expect(() => store.searchNotes("myshow", hostile)).not.toThrow();
+  });
+
+  it("returns nothing for an empty/whitespace-only query instead of matching everything", () => {
+    const { store } = newStore();
+    const a = store.register("myshow", "claude-local");
+    store.saveNote(a.id, { body: "fox hunting tips" });
+    expect(store.searchNotes("myshow", "   ")).toEqual([]);
+  });
+
+  it("caps results at the given limit", () => {
+    const { store } = newStore();
+    const a = store.register("myshow", "claude-local");
+    for (let i = 0; i < 5; i++) store.saveNote(a.id, { body: `fox note number ${i}` });
+    expect(store.searchNotes("myshow", "fox", 2)).toHaveLength(2);
+  });
+
+  it("clamps a caller-supplied limit above MAX_SEARCH_NOTES_LIMIT instead of returning everything", () => {
+    const { store } = newStore();
+    const a = store.register("myshow", "claude-local");
+    for (let i = 0; i < 30; i++) store.saveNote(a.id, { body: `fox note number ${i}` });
+    expect(store.searchNotes("myshow", "fox", 100_000).length).toBeLessThanOrEqual(25);
+  });
+
+  it("never throws on a NUL byte in the query, which FTS5's scanner rejects even inside a quoted literal", () => {
+    const { store } = newStore();
+    const a = store.register("myshow", "claude-local");
+    store.saveNote(a.id, { body: "fox hunting tips" });
+
+    const withNul = `fox${String.fromCharCode(0)}hunt`;
+    expect(() => store.searchNotes("myshow", withNul)).not.toThrow();
+  });
+});
+
+describe("notesForTask: claim-time recall", () => {
+  it("unions BM25-over-title+brief hits with files_hint glob-overlap hits, deduped, excluding irrelevant notes", () => {
+    const { store, clock } = newStore();
+    const author = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+
+    const { note: textNote } = store.saveNote(author.id, { body: "combat balance gotcha: numbers stack oddly" });
+    clock.t += 1000;
+    const { note: globNote } = store.saveNote(author.id, { body: "totally unrelated topic", filesHint: ["src/server/store.ts"] });
+    clock.t += 1000;
+    store.saveNote(author.id, { body: "completely irrelevant filler about lunch" });
+
+    const { task } = store.createTask({
+      show: "myshow",
+      title: "combat balance",
+      brief: "tune the numbers",
+      createdBy: director.id,
+      filesHint: ["src/server/**"],
+    });
+
+    const notes = store.notesForTask(task);
+    const ids = notes.map((n) => n.id);
+    expect(ids).toContain(textNote.id);
+    expect(ids).toContain(globNote.id);
+    expect(ids).toHaveLength(2);
+  });
+
+  it("caps at the given limit", () => {
+    const { store } = newStore();
+    const author = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    for (let i = 0; i < 6; i++) store.saveNote(author.id, { body: `alpha beta gamma note ${i}` });
+    const { task } = store.createTask({ show: "myshow", title: "alpha beta gamma", brief: "b", createdBy: director.id });
+    expect(store.notesForTask(task, 3)).toHaveLength(3);
+  });
+
+  it("breaks ties newest-first among glob-only hits with no text relevance to the task", () => {
+    const { store, clock } = newStore();
+    const author = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    const { note: older } = store.saveNote(author.id, { body: "xyzzy plugh filler words", filesHint: ["src/server/**"] });
+    clock.t += 1000;
+    const { note: newer } = store.saveNote(author.id, { body: "xyzzy plugh more filler words", filesHint: ["src/server/**"] });
+
+    const { task } = store.createTask({
+      show: "myshow",
+      title: "totally different topic",
+      brief: "nothing textually in common",
+      createdBy: director.id,
+      filesHint: ["src/server/store.ts"],
+    });
+
+    const notes = store.notesForTask(task);
+    expect(notes.map((n) => n.id)).toEqual([newer.id, older.id]);
+  });
+
+  it("gives a files_hint glob-overlap hit priority over the NOTES_PER_TASK budget, not just whatever BM25-over-common-words fills first", () => {
+    const { store } = newStore();
+    const author = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+
+    // 4 notes (== default NOTES_PER_TASK) that all share only a common word with the brief,
+    // and have no files_hint at all.
+    for (let i = 0; i < 4; i++) {
+      store.saveNote(author.id, { body: `see the docs for background, item ${i}` });
+    }
+    // The one note that structurally matters: files_hint exactly overlaps the task's, but
+    // shares no vocabulary with the brief at all.
+    const { note: gotcha } = store.saveNote(author.id, { body: "xyzzy plugh gotcha", filesHint: ["src/persist/**"] });
+
+    const { task } = store.createTask({
+      show: "myshow",
+      title: "writer refactor",
+      brief: "see the docs before touching this",
+      createdBy: director.id,
+      filesHint: ["src/persist/writer.ts"],
+    });
+
+    const notes = store.notesForTask(task);
+    expect(notes.map((n) => n.id)).toContain(gotcha.id);
+  });
+
+  it("never throws when the task title/brief contains a NUL byte", () => {
+    const { store } = newStore();
+    const task = { show: "myshow", title: `foo${String.fromCharCode(0)}bar`, brief: "b", filesHint: [] };
+    expect(() => store.notesForTask(task)).not.toThrow();
+    expect(store.notesForTask(task)).toEqual([]);
+  });
+});
+
+describe("recentNotes", () => {
+  it("returns a show's notes newest-last, capped at the given limit", () => {
+    const { store, clock } = newStore();
+    const author = store.register("myshow", "claude-local");
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const { note } = store.saveNote(author.id, { body: `note ${i}` });
+      ids.push(note.id);
+      clock.t += 1000;
+    }
+    const recent = store.recentNotes("myshow", 2);
+    expect(recent.map((n) => n.id)).toEqual(ids.slice(-2));
+  });
+});
+
+describe("messages.kind migration", () => {
+  it("adds the kind column in place to a DB file created before this migration, backfilling the default on existing rows", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "showrunner-store-test-"));
+    const dbPath = path.join(dir, "showrunner.db");
+    try {
+      // Minimal pre-migration schema: shows/members/messages exactly as SCHEMA_SQL declared
+      // them before `kind` existed. Store's own SCHEMA_SQL is all CREATE ... IF NOT EXISTS, so
+      // reopening this file must leave these rows intact and only ALTER the messages table.
+      const legacy = new Database(dbPath);
+      legacy.exec(`
+        CREATE TABLE shows (name TEXT PRIMARY KEY, created_at INTEGER NOT NULL, config_json TEXT NOT NULL DEFAULT '{}');
+        CREATE TABLE members (
+          id TEXT PRIMARY KEY, show TEXT NOT NULL, kind TEXT NOT NULL, display_name TEXT,
+          role TEXT NOT NULL DEFAULT 'worker', registered_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+          lease_expires_at INTEGER NOT NULL, current_task_id TEXT, review_cursor INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE messages (
+          id TEXT PRIMARY KEY, show TEXT NOT NULL, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
+          task_id TEXT, body TEXT NOT NULL, created_at INTEGER NOT NULL
+        );
+      `);
+      legacy.prepare("INSERT INTO shows (name, created_at, config_json) VALUES (?, ?, '{}')").run("myshow", 1);
+      legacy
+        .prepare(
+          `INSERT INTO members (id, show, kind, display_name, role, registered_at, last_seen_at, lease_expires_at, current_task_id, review_cursor)
+           VALUES ('legacy-member', 'myshow', 'claude-local', NULL, 'worker', 1, 1, ?, NULL, 0)`,
+        )
+        .run(Date.now() + 10_000_000);
+      legacy
+        .prepare(
+          "INSERT INTO messages (id, show, from_id, to_id, task_id, body, created_at) VALUES ('m-legacy', 'myshow', 'legacy-member', 'legacy-member', NULL, 'pre-migration message', 1)",
+        )
+        .run();
+      legacy.close();
+
+      const store = new Store(dbPath);
+      const inbox = store.drainInbox("legacy-member");
+      expect(inbox).toHaveLength(1);
+      expect(inbox[0]!.body).toBe("pre-migration message");
+      expect(inbox[0]!.kind).toBe("message"); // backfilled default for the pre-existing row
+
+      // The migrated schema is fully functional for new kind:'note' rows too.
+      const director = store.register("myshow", "claude-local");
+      const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: "legacy-member" });
+      store.claimNextTask("legacy-member");
+      const { deliveredTo } = store.saveNote(director.id, { body: "post-migration note", taskId: task.id });
+      expect(deliveredTo).toContain("legacy-member");
+
+      const inbox2 = store.drainInbox("legacy-member");
+      expect(inbox2).toHaveLength(1);
+      expect(inbox2[0]!.kind).toBe("note");
+      expect(inbox2[0]!.body).toBe("post-migration note");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("members.session_url/resume_hint migration", () => {
+  it("adds both columns in place to a DB file created before this migration", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "showrunner-store-test-"));
+    const dbPath = path.join(dir, "showrunner.db");
+    try {
+      // Minimal pre-migration schema: members exactly as SCHEMA_SQL declared it before
+      // session_url/resume_hint existed. Reopening this file must leave the existing row
+      // intact and only ALTER the members table.
+      const legacy = new Database(dbPath);
+      legacy.exec(`
+        CREATE TABLE shows (name TEXT PRIMARY KEY, created_at INTEGER NOT NULL, config_json TEXT NOT NULL DEFAULT '{}');
+        CREATE TABLE members (
+          id TEXT PRIMARY KEY, show TEXT NOT NULL, kind TEXT NOT NULL, display_name TEXT,
+          role TEXT NOT NULL DEFAULT 'worker', registered_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+          lease_expires_at INTEGER NOT NULL, current_task_id TEXT, review_cursor INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE messages (
+          id TEXT PRIMARY KEY, show TEXT NOT NULL, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
+          task_id TEXT, body TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'message', created_at INTEGER NOT NULL
+        );
+      `);
+      legacy.prepare("INSERT INTO shows (name, created_at, config_json) VALUES (?, ?, '{}')").run("myshow", 1);
+      legacy
+        .prepare(
+          `INSERT INTO members (id, show, kind, display_name, role, registered_at, last_seen_at, lease_expires_at, current_task_id, review_cursor)
+           VALUES ('legacy-member', 'myshow', 'claude-local', NULL, 'worker', 1, 1, ?, NULL, 0)`,
+        )
+        .run(Date.now() + 10_000_000);
+      legacy.close();
+
+      const store = new Store(dbPath);
+
+      // Pre-existing row has no chat link: both keys omitted, not null.
+      const board = store.getBoard("myshow");
+      const legacyMember = board.members.find((m) => m.id === "legacy-member")!;
+      expect(legacyMember).not.toHaveProperty("sessionUrl");
+      expect(legacyMember).not.toHaveProperty("resumeHint");
+
+      // The migrated schema accepts new registrations with both columns populated.
+      const fresh = store.register(
+        "myshow",
+        "claude-local",
+        undefined,
+        undefined,
+        "https://claude.ai/code/session_x",
+        "claude --resume abc",
+      );
+      expect(fresh.sessionUrl).toBe("https://claude.ai/code/session_x");
+      expect(fresh.resumeHint).toBe("claude --resume abc");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

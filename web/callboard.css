@@ -54,7 +54,6 @@ button {
   cursor: pointer;
 }
 button:hover { border-color: var(--accent); }
-button.danger:hover { border-color: var(--red); color: var(--red); }
 
 #token-box { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 #token-input { width: 160px; }
@@ -85,7 +84,7 @@ main {
 }
 .card.wide { grid-column: 1 / -1; }
 
-#members-list, #activity-list, .task-list, .banner ul {
+#members-list, #activity-list, #notes-list, .task-list, .banner ul {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -127,7 +126,6 @@ main {
 .task-item .task-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-item .task-notes { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); font-size: 11px; color: var(--dim); }
 .task-item .task-notes div { margin-bottom: 3px; }
-.task-item button.cancel { margin-top: 6px; align-self: flex-start; }
 
 #activity-list li {
   padding: 5px 4px;
@@ -138,21 +136,29 @@ main {
 #activity-list .who { color: var(--accent); }
 #activity-list .when { color: var(--dim); float: right; }
 
-.admin-form {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 10px;
+#notes-list li { padding: 6px 4px; border-bottom: 1px solid var(--border); font-size: 12px; }
+#notes-list li:last-child { border-bottom: none; }
+#notes-list .note-row { display: flex; align-items: center; gap: 6px; }
+#notes-list .who { color: var(--accent); }
+#notes-list .when { color: var(--dim); margin-left: auto; }
+#notes-list .note-body { margin-top: 4px; color: var(--text); }
+
+.chat-link { margin-top: 6px; }
+.chat-open {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
 }
-.admin-form label {
-  width: 90px;
-  color: var(--dim);
+.chat-open:hover { text-decoration: underline; }
+.chat-open-small { color: var(--accent); text-decoration: none; margin-left: 2px; }
+.resume-hint {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 4px;
   font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
 }
-.admin-form input[type="text"], .admin-form input[type="number"] { flex: 1; min-width: 100px; }
+.copy-hint { font-size: 10px; padding: 1px 6px; }
 
 @media (max-width: 820px) {
   main { grid-template-columns: 1fr; }
