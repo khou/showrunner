@@ -127,10 +127,10 @@ describe("showrunner e2e (real server, real MCP client, streamable HTTP)", () =>
       const director1 = await connectClient(baseUrl, "e2e-director-1");
       const worker = await connectClient(baseUrl, "e2e-worker");
 
-      const regDirector = await callTool(director1, "register", { show: "spireash", kind: "claude-local", display_name: "director-one" });
+      const regDirector = await callTool(director1, "register", { show: "myshow", kind: "claude-local", display_name: "director-one" });
       const directorId = (regDirector.data as { member_id: string }).member_id;
 
-      const regWorker = await callTool(worker, "register", { show: "spireash", kind: "claude-local", display_name: "worker-one" });
+      const regWorker = await callTool(worker, "register", { show: "myshow", kind: "claude-local", display_name: "worker-one" });
       const workerId = (regWorker.data as { member_id: string }).member_id;
 
       const claim = await callTool(director1, "claim_direction", { member_id: directorId });
@@ -165,7 +165,7 @@ describe("showrunner e2e (real server, real MCP client, streamable HTTP)", () =>
 
       // A second director takes over: the human said "you're now the director".
       const director2 = await connectClient(baseUrl, "e2e-director-2");
-      const regDirector2 = await callTool(director2, "register", { show: "spireash", kind: "claude-local", display_name: "director-two" });
+      const regDirector2 = await callTool(director2, "register", { show: "myshow", kind: "claude-local", display_name: "director-two" });
       const director2Id = (regDirector2.data as { member_id: string }).member_id;
 
       const takeover = await callTool(director2, "claim_direction", { member_id: director2Id, takeover: true });
@@ -187,7 +187,7 @@ describe("showrunner e2e (real server, real MCP client, streamable HTTP)", () =>
   it(
     "await_work wakes on a task created ~1s later, well under the 25s hold",
     async () => {
-      const show = "spireash-poll";
+      const show = "myshow-poll";
       const director = await connectClient(baseUrl, "e2e-poll-director");
       const worker = await connectClient(baseUrl, "e2e-poll-worker");
 

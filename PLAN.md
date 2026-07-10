@@ -143,7 +143,7 @@ message`, `showrunner instructions` (prints the protocol text),
 2. **M2 — surfaces:** B1+B2+B3 in parallel (disjoint paths), compile clean.
 3. **M3 — verified:** WP C: `npm test` + `tsc --noEmit` green, e2e green.
 4. **M4 — hardened:** review findings fixed; README accurate.
-5. **M5 — live:** Fly deploy, real Claude Code session joins spireash show as
+5. **M5 — live:** Fly deploy, real Claude Code session joins a show as
    worker, director session delegates one real task, callboard shows it.
 
 ## Definition of done (v1)

@@ -1,14 +1,16 @@
 # showrunner
 
 A tiny always-on server that coordinates multiple coding-agent sessions on one
-project (a "show"). Deploy it once. Then tell any agent session, local or
-cloud, Claude Code or Cursor:
+project (a "show"). Deploy it once. Then, from inside any project repo, tell
+any agent session, local or cloud, Claude Code or Cursor:
 
-> "You're a worker for the spireash show."
+> "You're a showrunner worker."
 
-It registers, starts pulling tasks, and reports back. Tell a second session:
+It works out which show from the repo it's sitting in (git remote name, or
+the directory name), registers, starts pulling tasks, and reports back. Tell
+a second session:
 
-> "You're the director for the spireash show."
+> "You're the showrunner director."
 
 It takes over planning: breaking work into tasks, answering blockers,
 reviewing completions. Kill that session anytime; state lives on the server,
@@ -19,6 +21,30 @@ One SQLite file. One static dashboard. Eight MCP tools. No queue infra, no
 worktree manager, no per-agent push channel (agents poll; that's the only
 thing that works for cloud sessions anyway). See [DESIGN.md](DESIGN.md) for
 the full rationale.
+
+![The callboard: a director and three workers across Claude Code and Cursor, tasks moving through the columns, and a blocker escalated to the human](assets/callboard.png)
+
+A worker session, after the sentence:
+
+```text
+> You're a showrunner worker.
+
+⏺ showrunner:register({show: "mygame", kind: "claude-local"})
+  ← member_id "eager-crane"
+⏺ showrunner:await_work({member_id: "eager-crane"})
+  ← task t-19ebd84582 "Invite links expire after 24h" (brief: apps/gateway/src/invites.ts)
+⏺ …works on branch show/t-19ebd84582-invite-expiry, heartbeating update_task…
+⏺ showrunner:update_task({status: "input-required", note: "renew flow or plain 410?"})
+⏺ showrunner:send_message({to: "director", body: "Invite expiry UX: renew flow or 410?"})
+⏺ showrunner:await_work(…)   ← the director's answer arrives here; work resumes
+```
+
+The director session runs the same loop from the other side: it breaks work
+into tasks, reviews what comes back, and answers blockers. Kill it whenever;
+a new session with "you're now the director" picks up the same board.
+
+(The screenshot is reproducible: `scripts/seed-demo.mts` fills a local server
+with this demo show.)
 
 ## 60-second quickstart
 
@@ -41,9 +67,9 @@ Clone this repo, `npm install && npm run build`, then run
 `node dist/cli/index.js snippets --url https://<your-app>.fly.dev` to print
 all of them -- see [CLI](#cli) below for why it's not `npx showrunner`.)
 
-Now say the sentence:
+Now open a session in any project repo and say the sentence:
 
-> "You're a worker for the spireash show."
+> "You're a showrunner worker."
 
 Watch it register and start polling at `https://<your-app>.fly.dev`.
 

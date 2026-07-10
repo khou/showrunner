@@ -4,7 +4,9 @@
 // and as the `protocol` field `register` returns.
 export const INSTRUCTIONS = `showrunner coordinates coding-agent sessions on a "show" (project). Call register({show, kind, display_name?}) once for a member_id, then follow the branch matching what the user told you.
 
-WORKER ("you're a worker for <show>"):
+SHOW NAME: if the user names a show, use that. Otherwise derive it from the repo you are working in: basename of the git origin remote (strip .git), else the working directory name. "You're a showrunner worker" in a repo named mygame means show "mygame".
+
+WORKER ("you're a showrunner worker" / "you're a worker for <show>"):
 1. register, loop await_work({member_id}) forever. "nothing" is normal -- re-poll immediately, never stop on an empty queue.
 2. Work each task on branch show/<task_id>-<slug>.
 3. Heartbeat update_task({member_id, task_id, note}) every ~10min while working.

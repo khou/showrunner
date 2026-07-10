@@ -87,7 +87,9 @@ function tokenCookieHandshake(cfg: EnvConfig): MiddlewareHandler {
     });
     const url = new URL(c.req.url);
     url.searchParams.delete("token");
-    return c.redirect(`${url.pathname}${url.search}`, 302);
+    // Fragment survives the redirect but never reaches a server or its logs; the
+    // callboard JS stores it (so /api calls work) and strips it from the URL.
+    return c.redirect(`${url.pathname}${url.search}#token=${encodeURIComponent(cfg.token)}`, 302);
   };
 }
 

@@ -46,24 +46,24 @@ async function callTool(
 describe("await_work resolution order (PLAN.md pinned order)", () => {
   it("messages take precedence over a claimable task", async () => {
     const { store } = newStore();
-    const worker = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
-    store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     store.sendMessage(director.id, worker.id, "hello");
 
     const result = await resolveAwaitWork(store, worker.id, undefined, 0.05);
     expect(result.status).toBe("messages");
     if (result.status === "messages") expect(result.messages).toHaveLength(1);
     // the queued task was never touched by the messages branch
-    expect(store.getBoard("spireash").taskCounts.queued).toBe(1);
+    expect(store.getBoard("myshow").taskCounts.queued).toBe(1);
   });
 
   it("messages take precedence over a director's review items", async () => {
     const { store } = newStore();
-    const director = store.register("spireash", "claude-local");
+    const director = store.register("myshow", "claude-local");
     store.claimDirection(director.id);
-    const worker = store.register("spireash", "claude-local");
-    const { task } = store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const worker = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     store.claimNextTask(worker.id);
     store.updateTask(worker.id, task.id, { status: "input-required" });
     store.sendMessage(worker.id, director.id, "question inbound");
@@ -74,10 +74,10 @@ describe("await_work resolution order (PLAN.md pinned order)", () => {
 
   it("a director's review surfaces input-required tasks", async () => {
     const { store } = newStore();
-    const director = store.register("spireash", "claude-local");
+    const director = store.register("myshow", "claude-local");
     store.claimDirection(director.id);
-    const worker = store.register("spireash", "claude-local");
-    const { task } = store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const worker = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     store.claimNextTask(worker.id);
     store.updateTask(worker.id, task.id, { status: "input-required", note: "need a call" });
 
@@ -88,9 +88,9 @@ describe("await_work resolution order (PLAN.md pinned order)", () => {
 
   it("claims a task for a worker when nothing else is pending", async () => {
     const { store } = newStore();
-    const director = store.register("spireash", "claude-local");
-    const worker = store.register("spireash", "claude-local");
-    const { task } = store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
 
     const result = await resolveAwaitWork(store, worker.id, undefined, 0.05);
     expect(result.status).toBe("task");
@@ -99,9 +99,9 @@ describe("await_work resolution order (PLAN.md pinned order)", () => {
 
   it("a director never claims a task, even one pinned to them", async () => {
     const { store } = newStore();
-    const director = store.register("spireash", "claude-local");
+    const director = store.register("myshow", "claude-local");
     store.claimDirection(director.id);
-    store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id, assignee: director.id });
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: director.id });
 
     const result = await resolveAwaitWork(store, director.id, undefined, 0.05);
     expect(result.status).toBe("nothing");
@@ -109,10 +109,10 @@ describe("await_work resolution order (PLAN.md pinned order)", () => {
 
   it("a director's review surfaces rejected tasks too", async () => {
     const { store } = newStore();
-    const director = store.register("spireash", "claude-local");
+    const director = store.register("myshow", "claude-local");
     store.claimDirection(director.id);
-    const worker = store.register("spireash", "claude-local");
-    const { task } = store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const worker = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     store.claimNextTask(worker.id);
     store.updateTask(worker.id, task.id, { status: "rejected", note: "wrong env" });
 
@@ -125,10 +125,10 @@ describe("await_work resolution order (PLAN.md pinned order)", () => {
 describe("review does not busy-loop on an unanswered input-required task", () => {
   it("surfaces an input-required task once, then holds the full poll on the next call", async () => {
     const { store, clock } = newStore();
-    const director = store.register("spireash", "claude-local");
+    const director = store.register("myshow", "claude-local");
     store.claimDirection(director.id);
-    const worker = store.register("spireash", "claude-local");
-    const { task } = store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const worker = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     store.claimNextTask(worker.id);
     store.updateTask(worker.id, task.id, { status: "input-required" });
     clock.t += 1; // separate this update's timestamp from the director's claim-time cursor
@@ -148,15 +148,15 @@ describe("review does not busy-loop on an unanswered input-required task", () =>
 describe("a takeover director doesn't replay the show's completed-task history", () => {
   it("only sees completions from after it claimed direction", async () => {
     const { store, clock } = newStore();
-    const director1 = store.register("spireash", "claude-local");
+    const director1 = store.register("myshow", "claude-local");
     store.claimDirection(director1.id);
-    const worker = store.register("spireash", "claude-local");
-    const { task: oldTask } = store.createTask({ show: "spireash", title: "old", brief: "b", createdBy: director1.id });
+    const worker = store.register("myshow", "claude-local");
+    const { task: oldTask } = store.createTask({ show: "myshow", title: "old", brief: "b", createdBy: director1.id });
     store.claimNextTask(worker.id);
     store.updateTask(worker.id, oldTask.id, { status: "completed" });
     clock.t += 1000;
 
-    const director2 = store.register("spireash", "claude-local");
+    const director2 = store.register("myshow", "claude-local");
     store.claimDirection(director2.id, true); // takeover, well after oldTask completed
 
     const result = await resolveAwaitWork(store, director2.id, undefined, 0.05);
@@ -167,13 +167,13 @@ describe("a takeover director doesn't replay the show's completed-task history",
 describe("wake beats timeout", () => {
   it("resolves as soon as a task is created, well before a long hold would expire", async () => {
     const { store } = newStore();
-    const director = store.register("spireash", "claude-local");
-    const worker = store.register("spireash", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
 
     const started = Date.now();
     const pending = resolveAwaitWork(store, worker.id, 5, 5); // up to a 5s hold
     setTimeout(() => {
-      store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+      store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     }, 20);
 
     const result = await pending;
@@ -186,7 +186,7 @@ describe("wake beats timeout", () => {
 describe("jittered timeout returns nothing", () => {
   it("returns nothing quickly when the queue stays empty", async () => {
     const { store } = newStore();
-    const worker = store.register("spireash", "claude-local");
+    const worker = store.register("myshow", "claude-local");
 
     const started = Date.now();
     const result = await resolveAwaitWork(store, worker.id, undefined, 0.05);
@@ -198,14 +198,14 @@ describe("jittered timeout returns nothing", () => {
 
   it("always cleans up its wake listeners after resolving", async () => {
     const { store } = newStore();
-    const worker = store.register("spireash", "claude-local");
+    const worker = store.register("myshow", "claude-local");
     const countBefore =
-      store.events.listenerCount(`wake:${worker.id}`) + store.events.listenerCount("wake:show:spireash");
+      store.events.listenerCount(`wake:${worker.id}`) + store.events.listenerCount("wake:show:myshow");
 
     await resolveAwaitWork(store, worker.id, undefined, 0.05);
 
     const countAfter =
-      store.events.listenerCount(`wake:${worker.id}`) + store.events.listenerCount("wake:show:spireash");
+      store.events.listenerCount(`wake:${worker.id}`) + store.events.listenerCount("wake:show:myshow");
     expect(countAfter).toBe(countBefore);
   });
 });
@@ -234,8 +234,8 @@ describe("epoch fencing surfaces as a tool result", () => {
   it("create_task returns {status:'superseded'} with isError:false for a stale epoch", async () => {
     const { store } = newStore();
     const client = await connectClient(store);
-    const a = store.register("spireash", "claude-local");
-    const b = store.register("spireash", "claude-local");
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
     const claimA = await callTool(client, "claim_direction", { member_id: a.id });
     expect((claimA.data as { epoch: number }).epoch).toBe(1);
     store.claimDirection(b.id, true); // takeover: supersedes a at epoch 2
@@ -249,10 +249,10 @@ describe("epoch fencing surfaces as a tool result", () => {
   it("direct_task returns {status:'superseded'} with isError:false for a stale epoch", async () => {
     const { store } = newStore();
     const client = await connectClient(store);
-    const a = store.register("spireash", "claude-local");
-    const b = store.register("spireash", "claude-local");
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
     await callTool(client, "claim_direction", { member_id: a.id });
-    const { task } = store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: a.id });
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: a.id });
     store.claimDirection(b.id, true);
 
     const result = await callTool(client, "direct_task", {
@@ -269,7 +269,7 @@ describe("epoch fencing surfaces as a tool result", () => {
   it("the current epoch still succeeds", async () => {
     const { store } = newStore();
     const client = await connectClient(store);
-    const a = store.register("spireash", "claude-local");
+    const a = store.register("myshow", "claude-local");
     await callTool(client, "claim_direction", { member_id: a.id });
 
     const result = await callTool(client, "create_task", { member_id: a.id, epoch: 1, title: "t", brief: "b" });
@@ -282,8 +282,8 @@ describe("register and the join prompt", () => {
   it("register returns the protocol text and a fresh member id", async () => {
     const { store } = newStore();
     const client = await connectClient(store);
-    const result = await callTool(client, "register", { show: "spireash", kind: "claude-local" });
-    expect(result.data).toMatchObject({ show: "spireash", director: null, protocol: INSTRUCTIONS });
+    const result = await callTool(client, "register", { show: "myshow", kind: "claude-local" });
+    expect(result.data).toMatchObject({ show: "myshow", director: null, protocol: INSTRUCTIONS });
     expect((result.data as { member_id: string }).member_id).toMatch(/^[a-z]+-[a-z]+/);
   });
 

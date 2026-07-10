@@ -14,7 +14,11 @@ holds the task board, so that *any* agent session — Claude Code or Cursor,
 local Mac or cloud VM — can join a project ("show") as a **worker** or take
 over as **director** with a one-line prompt:
 
-> "You're a worker for the spireash show."
+> "You're a showrunner worker."
+
+The show name doesn't need saying: the session derives it from the repo it
+was opened in (git origin basename, else directory name). Naming a show
+explicitly ("a worker for the mygame show") always overrides.
 
 The server is the only stateful thing. Sessions are cattle: they register,
 pull work, report, and can die at any time without losing anything.
@@ -58,7 +62,7 @@ is 8 tools.
 
 | Term | Meaning |
 |---|---|
-| **show** | A project (e.g. `spireash`). One server hosts many shows. |
+| **show** | A project, named after its repo (e.g. `mygame`). One server hosts many shows. |
 | **member** | One agent session registered to a show. Gets a memorable id (`amber-fox`). |
 | **worker** | Member that pulls tasks and executes them in its own repo checkout. |
 | **director** | The one member per show holding the direction lease. Plans, creates tasks, reviews, answers blockers. |
@@ -227,7 +231,7 @@ auto-loaded into Claude Code context; also exposed as MCP prompt
 > posting a digest note to the board every ~30 minutes.
 
 That is the entire integration: configure the MCP server once per machine or
-repo, and any future session understands "you're a worker for spireash".
+repo, and any future session understands "you're a showrunner worker".
 
 ### Worker context depletion
 

@@ -331,6 +331,12 @@
 
   // --- token + show picker wiring ---
 
+  // ?token= handshake lands here with the token in the fragment: store it, hide it.
+  if (location.hash.startsWith("#token=")) {
+    saveToken(decodeURIComponent(location.hash.slice(7)));
+    history.replaceState(null, "", location.pathname + location.search);
+  }
+
   tokenInput.value = state.token;
   tokenStatus.textContent = state.token ? "saved" : "enter token to load shows";
   el("token-save").addEventListener("click", () => {

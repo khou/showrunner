@@ -306,7 +306,7 @@ Usage:
   showrunner snippets [--url <url>]
 
 Env:
-  SHOWRUNNER_URL     base URL of the showrunner server (e.g. https://spireash.fly.dev)
+  SHOWRUNNER_URL     base URL of the showrunner server (e.g. https://my-showrunner.fly.dev)
   SHOWRUNNER_TOKEN   bearer token (required for status/task add/message)
 `);
 }

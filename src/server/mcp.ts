@@ -215,7 +215,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     {
       description: "Join a show as a new member; returns member_id and the worker/director protocol.",
       inputSchema: {
-        show: z.string().min(1),
+        show: z.string().min(1).describe("Show name; by convention the repo name (git origin basename, else directory name) unless the user names one explicitly."),
         kind: MEMBER_KIND,
         display_name: z.string().optional(),
         capabilities: z.array(z.string()).optional(),

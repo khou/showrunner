@@ -2,7 +2,7 @@
   "mcpServers": {
     "showrunner": {
       "type": "http",
-      "url": "https://spireash.fly.dev/mcp",
+      "url": "https://my-showrunner.fly.dev/mcp",
       "headers": {
         "Authorization": "Bearer ${SHOWRUNNER_TOKEN}"
       }

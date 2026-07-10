@@ -17,8 +17,8 @@ function newStore() {
 describe("register / touchMember", () => {
   it("creates a show on first register and returns a member with a memorable id", () => {
     const { store } = newStore();
-    const m = store.register("spireash", "claude-local", "kevin's laptop");
-    expect(m.show).toBe("spireash");
+    const m = store.register("myshow", "claude-local", "kevin's laptop");
+    expect(m.show).toBe("myshow");
     expect(m.kind).toBe("claude-local");
     expect(m.displayName).toBe("kevin's laptop");
     expect(m.role).toBe("worker");
@@ -27,7 +27,7 @@ describe("register / touchMember", () => {
 
   it("touchMember renews the lease and returns undefined for unknown ids", () => {
     const { store, clock } = newStore();
-    const m = store.register("spireash", "claude-local");
+    const m = store.register("myshow", "claude-local");
     const before = m.leaseExpiresAt;
     clock.t += 10_000;
     const touched = store.touchMember(m.id);
@@ -39,10 +39,10 @@ describe("register / touchMember", () => {
 describe("claim atomicity", () => {
   it("two claims for the same queued task produce exactly one winner", () => {
     const { store } = newStore();
-    const w1 = store.register("spireash", "claude-local");
-    const w2 = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
-    store.createTask({ show: "spireash", title: "one task", brief: "b", createdBy: director.id });
+    const w1 = store.register("myshow", "claude-local");
+    const w2 = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "one task", brief: "b", createdBy: director.id });
 
     const claim1 = store.claimNextTask(w1.id);
     const claim2 = store.claimNextTask(w2.id);
@@ -57,12 +57,12 @@ describe("claim atomicity", () => {
 describe("dependency gating", () => {
   it("does not claim a task until its dependency is completed", () => {
     const { store } = newStore();
-    const worker = store.register("spireash", "claude-local");
-    const worker2 = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
-    const { task: base } = store.createTask({ show: "spireash", title: "base", brief: "b", createdBy: director.id });
+    const worker = store.register("myshow", "claude-local");
+    const worker2 = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    const { task: base } = store.createTask({ show: "myshow", title: "base", brief: "b", createdBy: director.id });
     store.createTask({
-      show: "spireash",
+      show: "myshow",
       title: "dependent",
       brief: "b",
       createdBy: director.id,
@@ -84,10 +84,10 @@ describe("dependency gating", () => {
 describe("idempotent redelivery", () => {
   it("returns the same task on a repeat claim while it's still held, instead of claiming a second one", () => {
     const { store } = newStore();
-    const worker = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
-    store.createTask({ show: "spireash", title: "t1", brief: "b", createdBy: director.id });
-    store.createTask({ show: "spireash", title: "t2", brief: "b", createdBy: director.id });
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "t1", brief: "b", createdBy: director.id });
+    store.createTask({ show: "myshow", title: "t2", brief: "b", createdBy: director.id });
 
     const first = store.claimNextTask(worker.id);
     const again = store.claimNextTask(worker.id);
@@ -95,15 +95,15 @@ describe("idempotent redelivery", () => {
     expect(again!.status).toBe("assigned");
 
     // The second task is still sitting untouched in the queue, not silently stranded.
-    expect(store.getBoard("spireash").taskCounts.queued).toBe(1);
+    expect(store.getBoard("myshow").taskCounts.queued).toBe(1);
   });
 
   it("claims a fresh task once the held one reaches a terminal status", () => {
     const { store } = newStore();
-    const worker = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
-    store.createTask({ show: "spireash", title: "t1", brief: "b", createdBy: director.id });
-    store.createTask({ show: "spireash", title: "t2", brief: "b", createdBy: director.id });
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "t1", brief: "b", createdBy: director.id });
+    store.createTask({ show: "myshow", title: "t2", brief: "b", createdBy: director.id });
 
     const first = store.claimNextTask(worker.id)!;
     store.updateTask(worker.id, first.id, { status: "completed" });
@@ -119,16 +119,16 @@ describe("priority / age ordering", () => {
     // one member (idempotent redelivery), so ordering across successive claims is tested with
     // members that don't already hold anything.
     const { store, clock } = newStore();
-    const w1 = store.register("spireash", "claude-local");
-    const w2 = store.register("spireash", "claude-local");
-    const w3 = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
+    const w1 = store.register("myshow", "claude-local");
+    const w2 = store.register("myshow", "claude-local");
+    const w3 = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
 
-    store.createTask({ show: "spireash", title: "low-pri", brief: "b", createdBy: director.id, priority: 0 });
+    store.createTask({ show: "myshow", title: "low-pri", brief: "b", createdBy: director.id, priority: 0 });
     clock.t += 1000;
-    const { task: oldHighPri } = store.createTask({ show: "spireash", title: "high-pri-old", brief: "b", createdBy: director.id, priority: 5 });
+    const { task: oldHighPri } = store.createTask({ show: "myshow", title: "high-pri-old", brief: "b", createdBy: director.id, priority: 5 });
     clock.t += 1000;
-    store.createTask({ show: "spireash", title: "high-pri-new", brief: "b", createdBy: director.id, priority: 5 });
+    store.createTask({ show: "myshow", title: "high-pri-new", brief: "b", createdBy: director.id, priority: 5 });
 
     const first = store.claimNextTask(w1.id);
     expect(first!.id).toBe(oldHighPri.id);
@@ -140,10 +140,10 @@ describe("priority / age ordering", () => {
 
   it("honors a pinned assignee: only that member can claim it", () => {
     const { store } = newStore();
-    const w1 = store.register("spireash", "claude-local");
-    const w2 = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
-    store.createTask({ show: "spireash", title: "pinned", brief: "b", createdBy: director.id, assignee: w2.id });
+    const w1 = store.register("myshow", "claude-local");
+    const w2 = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "pinned", brief: "b", createdBy: director.id, assignee: w2.id });
 
     expect(store.claimNextTask(w1.id)).toBeUndefined();
     const claimed = store.claimNextTask(w2.id);
@@ -154,9 +154,9 @@ describe("priority / age ordering", () => {
 describe("lease expiry requeues", () => {
   it("requeues an assigned task past its task lease and bumps attempt", () => {
     const { store, clock } = newStore();
-    const worker = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
-    store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     const claimed = store.claimNextTask(worker.id)!;
     expect(claimed.attempt).toBe(0);
 
@@ -164,7 +164,7 @@ describe("lease expiry requeues", () => {
     const result = store.sweep();
     expect(result.requeuedTasks).toEqual([claimed.id]);
 
-    const board = store.getBoard("spireash");
+    const board = store.getBoard("myshow");
     const task = board.tasks.find((t) => t.id === claimed.id)!;
     expect(task.status).toBe("queued");
     expect(task.assignee).toBeNull();
@@ -177,9 +177,9 @@ describe("lease expiry requeues", () => {
     // the 15min task lease, but the 90s worker (poll) lease has no such guarantee. Treating a
     // stale worker lease as task abandonment would requeue -- and duplicate -- live work.
     const { store, clock } = newStore();
-    const worker = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
-    store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     const claimed = store.claimNextTask(worker.id)!;
 
     clock.t += 90_001; // past default WORKER_LEASE_S (90s), well under the 900s task lease
@@ -187,7 +187,7 @@ describe("lease expiry requeues", () => {
     expect(result.expiredMembers).toContain(worker.id); // still shown stale on the callboard
     expect(result.requeuedTasks).toEqual([]); // but the task itself is untouched
 
-    const board = store.getBoard("spireash");
+    const board = store.getBoard("myshow");
     const task = board.tasks.find((t) => t.id === claimed.id)!;
     expect(task.status).toBe("assigned");
     expect(task.assignee).toBe(worker.id);
@@ -195,9 +195,9 @@ describe("lease expiry requeues", () => {
 
   it("does not churn an input-required task on task-lease expiry alone", () => {
     const { store, clock } = newStore();
-    const worker = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
-    store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     const claimed = store.claimNextTask(worker.id)!;
     store.updateTask(worker.id, claimed.id, { status: "input-required", note: "need a decision" });
 
@@ -212,9 +212,9 @@ describe("lease expiry requeues", () => {
 describe("idempotent completion after reaping", () => {
   it("accepts a late completion report after the task was requeued but not yet re-claimed", () => {
     const { store, clock } = newStore();
-    const worker = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
-    store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     const claimed = store.claimNextTask(worker.id)!;
 
     clock.t += 900_001;
@@ -233,10 +233,10 @@ describe("idempotent completion after reaping", () => {
 describe("updateTask fencing", () => {
   it("rejects a report from a member other than the current assignee", () => {
     const { store, clock } = newStore();
-    const a = store.register("spireash", "claude-local");
-    const b = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
-    store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     const claimed = store.claimNextTask(a.id)!;
 
     clock.t += 900_001; // reap a's lease
@@ -248,22 +248,22 @@ describe("updateTask fencing", () => {
 
   it("keeps terminal statuses sticky: a stale worker's report can't undo a director's cancel", () => {
     const { store } = newStore();
-    const worker = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
     store.claimDirection(director.id);
-    const { task } = store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     store.claimNextTask(worker.id);
     store.directTask(director.id, 1, task.id, { type: "cancel" });
 
     expect(() => store.updateTask(worker.id, task.id, { status: "working" })).toThrow(/already canceled/);
-    expect(store.getBoard("spireash").tasks.find((t) => t.id === task.id)!.status).toBe("canceled");
+    expect(store.getBoard("myshow").tasks.find((t) => t.id === task.id)!.status).toBe("canceled");
   });
 
   it("allows an idempotent same-status re-report on a terminal task", () => {
     const { store } = newStore();
-    const worker = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
-    const { task } = store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     store.claimNextTask(worker.id);
     store.updateTask(worker.id, task.id, { status: "completed" });
 
@@ -275,34 +275,34 @@ describe("updateTask fencing", () => {
 describe("directTask status validation", () => {
   it("rejects 'answer' on a task that isn't awaiting input", () => {
     const { store } = newStore();
-    const director = store.register("spireash", "claude-local");
+    const director = store.register("myshow", "claude-local");
     store.claimDirection(director.id);
-    const { task } = store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
 
     expect(() => store.directTask(director.id, 1, task.id, { type: "answer", body: "sure" })).toThrow(/not awaiting input/);
   });
 
   it("rejects 'cancel' on an already-completed task, but allows canceling an already-canceled one", () => {
     const { store } = newStore();
-    const worker = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
     store.claimDirection(director.id);
-    const { task: done } = store.createTask({ show: "spireash", title: "done", brief: "b", createdBy: director.id });
+    const { task: done } = store.createTask({ show: "myshow", title: "done", brief: "b", createdBy: director.id });
     store.claimNextTask(worker.id);
     store.updateTask(worker.id, done.id, { status: "completed" });
     expect(() => store.directTask(director.id, 1, done.id, { type: "cancel" })).toThrow(/already completed/);
 
-    const { task: canceled } = store.createTask({ show: "spireash", title: "c", brief: "b", createdBy: director.id });
+    const { task: canceled } = store.createTask({ show: "myshow", title: "c", brief: "b", createdBy: director.id });
     store.directTask(director.id, 1, canceled.id, { type: "cancel" });
     expect(() => store.directTask(director.id, 1, canceled.id, { type: "cancel" })).not.toThrow();
   });
 
   it("rejects 'requeue' on a terminal task", () => {
     const { store } = newStore();
-    const worker = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
     store.claimDirection(director.id);
-    const { task } = store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     store.claimNextTask(worker.id);
     store.updateTask(worker.id, task.id, { status: "failed" });
 
@@ -313,15 +313,15 @@ describe("directTask status validation", () => {
 describe("direction: CAS, takeover, stale epoch", () => {
   it("first claim always succeeds and starts at epoch 1", () => {
     const { store } = newStore();
-    const m = store.register("spireash", "claude-local");
+    const m = store.register("myshow", "claude-local");
     const result = store.claimDirection(m.id);
     expect(result).toEqual({ ok: true, epoch: 1 });
   });
 
   it("a second member cannot claim while the lease is valid, unless taking over", () => {
     const { store } = newStore();
-    const a = store.register("spireash", "claude-local");
-    const b = store.register("spireash", "claude-local");
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
     store.claimDirection(a.id);
 
     const blocked = store.claimDirection(b.id);
@@ -337,8 +337,8 @@ describe("direction: CAS, takeover, stale epoch", () => {
 
   it("claim succeeds again once the lease has expired", () => {
     const { store, clock } = newStore();
-    const a = store.register("spireash", "claude-local");
-    const b = store.register("spireash", "claude-local");
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
     store.claimDirection(a.id);
     clock.t += 600_001; // past default DIRECTION_LEASE_S (600s)
     const result = store.claimDirection(b.id);
@@ -347,14 +347,14 @@ describe("direction: CAS, takeover, stale epoch", () => {
 
   it("checkEpoch throws SupersededError with the new holder once superseded", () => {
     const { store } = newStore();
-    const a = store.register("spireash", "claude-local");
-    const b = store.register("spireash", "claude-local");
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
     store.claimDirection(a.id);
     store.claimDirection(b.id, true);
 
-    expect(() => store.checkEpoch("spireash", a.id, 1)).toThrow(SupersededError);
+    expect(() => store.checkEpoch("myshow", a.id, 1)).toThrow(SupersededError);
     try {
-      store.checkEpoch("spireash", a.id, 1);
+      store.checkEpoch("myshow", a.id, 1);
       expect.unreachable();
     } catch (err) {
       expect(err).toBeInstanceOf(SupersededError);
@@ -362,15 +362,15 @@ describe("direction: CAS, takeover, stale epoch", () => {
       expect((err as SupersededError).epoch).toBe(2);
     }
     // The current holder with the current epoch passes and renews the lease.
-    expect(() => store.checkEpoch("spireash", b.id, 2)).not.toThrow();
+    expect(() => store.checkEpoch("myshow", b.id, 2)).not.toThrow();
   });
 
   it("directTask surfaces SupersededError for a stale epoch instead of acting", () => {
     const { store } = newStore();
-    const a = store.register("spireash", "claude-local");
-    const b = store.register("spireash", "claude-local");
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
     store.claimDirection(a.id);
-    const { task } = store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: a.id });
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: a.id });
     store.claimDirection(b.id, true); // supersedes a
 
     expect(() => store.directTask(a.id, 1, task.id, { type: "cancel" })).toThrow(SupersededError);
@@ -378,8 +378,8 @@ describe("direction: CAS, takeover, stale epoch", () => {
 
   it("seeds a new/takeover director's review cursor to the claim time, not 0", () => {
     const { store, clock } = newStore();
-    const a = store.register("spireash", "claude-local");
-    const b = store.register("spireash", "claude-local");
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
     clock.t += 5000;
 
     store.claimDirection(a.id); // fresh claim
@@ -394,7 +394,7 @@ describe("direction: CAS, takeover, stale epoch", () => {
 
   it("does not reset an active director's cursor on a same-holder re-claim", () => {
     const { store, clock } = newStore();
-    const a = store.register("spireash", "claude-local");
+    const a = store.register("myshow", "claude-local");
     store.claimDirection(a.id);
     clock.t += 5000;
     store.setReviewCursor(a.id, clock.t);
@@ -407,41 +407,41 @@ describe("direction: CAS, takeover, stale epoch", () => {
 describe("clearDirection", () => {
   it("nulls the director instead of installing a stand-in, and fences the old epoch", () => {
     const { store } = newStore();
-    const a = store.register("spireash", "claude-local");
+    const a = store.register("myshow", "claude-local");
     store.claimDirection(a.id); // epoch 1
 
-    store.clearDirection("spireash");
+    store.clearDirection("myshow");
 
-    const dirState = store.directionState("spireash");
+    const dirState = store.directionState("myshow");
     expect(dirState.directorId).toBeUndefined();
     expect(dirState.epoch).toBe(2);
-    const board = store.getBoard("spireash");
+    const board = store.getBoard("myshow");
     expect(board.director).toBeNull();
     expect(board.members.find((m) => m.id === a.id)!.role).toBe("worker");
 
     // The old director is fenced: its stale epoch is rejected like any other takeover.
-    expect(() => store.checkEpoch("spireash", a.id, 1)).toThrow(SupersededError);
+    expect(() => store.checkEpoch("myshow", a.id, 1)).toThrow(SupersededError);
   });
 
   it("is a no-op for a show that was never directed", () => {
     const { store } = newStore();
-    store.register("spireash", "claude-local");
-    expect(() => store.clearDirection("spireash")).not.toThrow();
-    expect(store.directionState("spireash").directorId).toBeUndefined();
+    store.register("myshow", "claude-local");
+    expect(() => store.clearDirection("myshow")).not.toThrow();
+    expect(store.directionState("myshow").directorId).toBeUndefined();
   });
 });
 
 describe("messages: unread-only inbox", () => {
   it("throws for an unknown message recipient instead of black-holing it", () => {
     const { store } = newStore();
-    const sender = store.register("spireash", "claude-local");
+    const sender = store.register("myshow", "claude-local");
     expect(() => store.sendMessage(sender.id, "not-a-real-member", "hi")).toThrow(/unknown member/);
   });
 
   it("delivers unread messages once and marks them read", () => {
     const { store } = newStore();
-    const director = store.register("spireash", "claude-local");
-    const worker = store.register("spireash", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
     store.sendMessage(director.id, worker.id, "hello");
 
     const first = store.drainInbox(worker.id);
@@ -454,9 +454,9 @@ describe("messages: unread-only inbox", () => {
 
   it("delivers 'director'-addressed messages to whoever currently holds direction", () => {
     const { store } = newStore();
-    const a = store.register("spireash", "claude-local");
-    const b = store.register("spireash", "claude-local");
-    const sender = store.register("spireash", "claude-local");
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
+    const sender = store.register("myshow", "claude-local");
     store.claimDirection(a.id);
     store.sendMessage(sender.id, "director", "status?");
 
@@ -466,8 +466,8 @@ describe("messages: unread-only inbox", () => {
 
   it("delivers 'all'-addressed messages to every member independently", () => {
     const { store } = newStore();
-    const a = store.register("spireash", "claude-local");
-    const b = store.register("spireash", "claude-local");
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
     store.sendMessage(a.id, "all", "heads up");
 
     expect(store.drainInbox(a.id)).toHaveLength(1);
@@ -480,9 +480,9 @@ describe("messages: unread-only inbox", () => {
 describe("overlap warnings", () => {
   it("warns (never blocks) when files_hint globs intersect an in-flight task", () => {
     const { store } = newStore();
-    const director = store.register("spireash", "claude-local");
+    const director = store.register("myshow", "claude-local");
     store.createTask({
-      show: "spireash",
+      show: "myshow",
       title: "server work",
       brief: "b",
       createdBy: director.id,
@@ -490,7 +490,7 @@ describe("overlap warnings", () => {
     });
 
     const { task, overlaps } = store.createTask({
-      show: "spireash",
+      show: "myshow",
       title: "store work",
       brief: "b",
       createdBy: director.id,
@@ -504,10 +504,10 @@ describe("overlap warnings", () => {
 
   it("does not warn when globs don't intersect", () => {
     const { store } = newStore();
-    const director = store.register("spireash", "claude-local");
-    store.createTask({ show: "spireash", title: "cli work", brief: "b", createdBy: director.id, filesHint: ["src/cli/**"] });
+    const director = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "cli work", brief: "b", createdBy: director.id, filesHint: ["src/cli/**"] });
     const { overlaps } = store.createTask({
-      show: "spireash",
+      show: "myshow",
       title: "web work",
       brief: "b",
       createdBy: director.id,
@@ -518,10 +518,10 @@ describe("overlap warnings", () => {
 
   it("ignores completed tasks when computing overlaps", () => {
     const { store } = newStore();
-    const worker = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
     const { task: done } = store.createTask({
-      show: "spireash",
+      show: "myshow",
       title: "old",
       brief: "b",
       createdBy: director.id,
@@ -531,7 +531,7 @@ describe("overlap warnings", () => {
     store.updateTask(worker.id, done.id, { status: "completed" });
 
     const { overlaps } = store.createTask({
-      show: "spireash",
+      show: "myshow",
       title: "new",
       brief: "b",
       createdBy: director.id,
@@ -544,10 +544,10 @@ describe("overlap warnings", () => {
 describe("sweep correctness", () => {
   it("reports expired members and direction, requeues both stale-task cases, in one pass", () => {
     const { store, clock } = newStore();
-    const a = store.register("spireash", "claude-local");
-    const worker = store.register("spireash", "claude-local");
+    const a = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
     store.claimDirection(a.id);
-    store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: a.id });
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: a.id });
     store.claimNextTask(worker.id);
 
     clock.t += 900_001; // past task, worker, and direction leases alike
@@ -555,14 +555,14 @@ describe("sweep correctness", () => {
 
     expect(result.requeuedTasks).toHaveLength(1);
     expect(result.expiredMembers.sort()).toEqual([a.id, worker.id].sort());
-    expect(result.expiredDirectionShows).toEqual(["spireash"]);
+    expect(result.expiredDirectionShows).toEqual(["myshow"]);
   });
 
   it("is idempotent: a second sweep with nothing new expired changes nothing further", () => {
     const { store, clock } = newStore();
-    const worker = store.register("spireash", "claude-local");
-    const director = store.register("spireash", "claude-local");
-    store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     store.claimNextTask(worker.id);
 
     clock.t += 900_001;
@@ -577,20 +577,20 @@ describe("sweep correctness", () => {
 describe("wake events", () => {
   it("emits wake:show:{show} when an unpinned task is created", () => {
     const { store } = newStore();
-    const director = store.register("spireash", "claude-local");
+    const director = store.register("myshow", "claude-local");
     let woke = false;
-    store.events.once("wake:show:spireash", () => (woke = true));
-    store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id });
+    store.events.once("wake:show:myshow", () => (woke = true));
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     expect(woke).toBe(true);
   });
 
   it("emits wake:{memberId} when a task is created with a pinned assignee", () => {
     const { store } = newStore();
-    const director = store.register("spireash", "claude-local");
-    const worker = store.register("spireash", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
     let woke = false;
     store.events.once(`wake:${worker.id}`, () => (woke = true));
-    store.createTask({ show: "spireash", title: "t", brief: "b", createdBy: director.id, assignee: worker.id });
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: worker.id });
     expect(woke).toBe(true);
   });
 });
