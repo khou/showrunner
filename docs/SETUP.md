@@ -142,16 +142,24 @@ Prefer the **repo-committed** MCP from step 4. Do not add a user-global
 showrunner MCP that hardcodes the director token for everyone.
 
 - **Workers (local or Claude Code cloud):** open the project; committed
-  `showrunner` MCP is enough. No env var required. Paste:
-  `You're a showrunner worker.`
+  `showrunner` MCP is enough. No env var required. Paste (the loop rule goes
+  in the FIRST line -- cloud clients treat "task done, summarize" as
+  end-of-turn if it isn't):
+  `You're a showrunner worker. Loop forever: await_work -> do the task ->
+  update_task -> await_work. Finishing a task is never a reason to stop;
+  only eviction or my stop message ends the loop.`
 - **Director (this setup session and later trusted sessions):** need the
   `showrunner-director` MCP entry plus `SHOWRUNNER_TOKEN` in the process
   env (from `.env` / shell / cloud Runtime Secret). Paste:
   `You're the showrunner director.`
-- **Cursor cloud:** dashboard-only as of 3.8 (repo MCP ignored). Paste URL
-  + literal **worker** token for workers; director sessions need the
-  **director** token separately. Point the user at the dashboard; do not
-  handle tokens in a browser for them.
+- **Cursor cloud:** Cloud Agents do NOT load repo `.mcp.json` /
+  `.cursor/mcp.json` (as of 3.8). The operator must add the showrunner HTTP
+  MCP in the Cursor Cloud Agents / Integrations dashboard (URL + literal
+  **worker** token) so `await_work` is a native tool; director sessions need
+  the **director** token separately. Point the user at the dashboard; do not
+  handle tokens in a browser for them. Sessions with shell access can skip
+  MCP entirely and drive the `/v1` HTTP mirror with curl (same tools, same
+  tokens; see docs/OPERATING.md "The /v1 HTTP mirror").
 - **Claude Code cloud directors:** add `SHOWRUNNER_TOKEN` to cloud env and
   allowlist `$APP.fly.dev`. Workers need neither.
 
@@ -183,8 +191,9 @@ Tell the user, concretely:
   ```
   Healthy means: `{"ok":true}`, a live director (this session), zero stale
   members.
-- **Next step:** open another agent session in this repo and say
-  `You're a showrunner worker.` It appears on the callboard within seconds.
+- **Next step:** open another agent session in this repo and paste the
+  worker prompt from step 5 (`You're a showrunner worker. Loop forever: ...`).
+  It appears on the callboard within seconds.
   Then tell THIS (director) session what to build.
 - **Optional dedicated lane:** if they want capability routing, open a
   role-focused worker and note the preference in `SHOWRUNNER.md`, e.g.

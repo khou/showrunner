@@ -463,7 +463,7 @@ Auth: `Authorization: Bearer` (or `?token=` once → cookie). Two tokens:
   `/data` for SQLite. `fly secrets set SHOWRUNNER_TOKEN=... SHOWRUNNER_WORKER_TOKEN=...`.
 - **Env knobs:** `SHOWRUNNER_TOKEN` (required), `SHOWRUNNER_WORKER_TOKEN`
   (optional), `PORT`, `DATA_DIR`, `POLL_HOLD_SECONDS=50`, `WORKER_LEASE_S=150`,
-  `TASK_LEASE_S=900`, `DIRECTION_LEASE_S=600`, `NOTE_MAX_CHARS=2000`,
+  `TASK_LEASE_S=900`, `DIRECTION_LEASE_S=600`, `ESCALATION_WAIT_S=900`, `NOTE_MAX_CHARS=2000`,
   `NOTES_PER_TASK=4`. Rule seed-defaults for new shows: `REQUIRE_TASK_RELEASE=false`,
   `REQUIRE_HUMAN_MERGE_APPROVAL=false`, `WORKER_NOTE_PROPAGATION=true`,
   `REQUIRE_INVITE=false`, `ARTIFACT_TEXT_MAX_CHARS=10000`,

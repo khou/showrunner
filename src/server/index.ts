@@ -12,6 +12,7 @@ import { getCookie, setCookie } from "hono/cookie";
 import { readEnvConfig, resolveAuthLevel, type AuthLevel, type EnvConfig } from "../types.js";
 import { createApiRoutes } from "./api.js";
 import { createMcpServer, createStatelessTransport } from "./mcp.js";
+import { createRestRoutes } from "./rest.js";
 import { Store } from "./store.js";
 
 const config = readEnvConfig();
@@ -163,6 +164,11 @@ app.post("/mcp", async (c) => {
 app.use("/api/*", requireBearer(config));
 app.use("/api/*", requireDirectorApi());
 app.route("/api", createApiRoutes(store, dbPath));
+
+// /v1: plain-HTTPS mirror of the MCP tools (rest.ts). Worker bearer suffices; director-only
+// tools enforce their own role check from authLevel, exactly as they do over /mcp.
+app.use("/v1/*", requireBearer(config));
+app.route("/v1", createRestRoutes(store, config.pollHoldSeconds));
 
 // The callboard shell carries no secrets (all data comes from the gated /api), so GET / is
 // unauthenticated like the rest of web/ -- gating it was decorative anyway, since the same

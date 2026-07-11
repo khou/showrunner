@@ -423,6 +423,8 @@ edit policy by editing a repo file.
 
 - Decisions the director may make alone: <...>
 - Decisions that must go to the human (\`send_message\` to \`human\`): <...>
+- Design/product references the director should consult to answer worker
+  questions before escalating: <docs/..., design files, prior decisions>
 `;
 
 /** Writes a file unless it exists; reports either way. */
@@ -532,7 +534,9 @@ next steps:
        You're the showrunner director.
 
   Workers (anyone with the repo — no secrets; worker token is in committed MCP):
-       You're a showrunner worker.
+       You're a showrunner worker. Loop forever: await_work -> do the task ->
+       update_task -> await_work. Finishing a task is never a reason to stop;
+       only eviction or my stop message ends the loop.
 
   Ways to run:
     A. Simple fleet — one director + N general workers (default).

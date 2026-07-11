@@ -365,6 +365,10 @@ export interface LeaseConfig {
   workerLeaseS: number;
   taskLeaseS: number;
   directionLeaseS: number;
+  /** How long a worker's input-required escalation keeps its task redelivered to it before
+   * claimNextTask starts offering other queued work instead (the "move on after ~15min
+   * unanswered" fallback). The parked task stays assigned to the escalating member. */
+  escalationWaitS: number;
 }
 
 export interface NoteConfig {
@@ -390,7 +394,7 @@ export interface EnvConfig extends LeaseConfig, NoteConfig {
 
 // workerLeaseS covers ~3 idle poll cycles (POLL_HOLD_SECONDS=50 + re-poll overhead) so an idle
 // worker never flickers stale between polls; a heads-down worker is judged by the task lease.
-const DEFAULT_LEASES: LeaseConfig = { workerLeaseS: 150, taskLeaseS: 900, directionLeaseS: 600 };
+const DEFAULT_LEASES: LeaseConfig = { workerLeaseS: 150, taskLeaseS: 900, directionLeaseS: 600, escalationWaitS: 900 };
 const DEFAULT_NOTES: NoteConfig = { noteMaxChars: 2000, notesPerTask: 4 };
 // OOTB rule defaults (seeded into a new show; env vars below override deployment-wide). Automation
 // stays frictionless for solo shows: release gate off, merge approval off, notes propagate.
@@ -414,6 +418,7 @@ export function readLeaseConfig(env: NodeJS.ProcessEnv = process.env): LeaseConf
     workerLeaseS: parsePositiveInt(env.WORKER_LEASE_S, DEFAULT_LEASES.workerLeaseS),
     taskLeaseS: parsePositiveInt(env.TASK_LEASE_S, DEFAULT_LEASES.taskLeaseS),
     directionLeaseS: parsePositiveInt(env.DIRECTION_LEASE_S, DEFAULT_LEASES.directionLeaseS),
+    escalationWaitS: parsePositiveInt(env.ESCALATION_WAIT_S, DEFAULT_LEASES.escalationWaitS),
   };
 }
 
