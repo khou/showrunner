@@ -29,6 +29,7 @@ const ok = (label: string, cond: boolean, detail?: any) => {
 const auth = (reg: any) => ({ member_id: reg.member_id, member_secret: reg.member_secret })
 
 const SHOW = process.env.SR_SHOW ?? `verify-${Date.now() % 100000}`
+console.log(`verify show: ${SHOW}`) // printed for the SETUP.md cleanup step (show delete --show <name>)
 const dir1 = await connect('director-1')
 const SESSION_URL = 'https://claude.ai/code/session_verify'
 const reg1 = await call(dir1, 'register', { show: SHOW, kind: 'other', display_name: 'live-verify director', session_url: SESSION_URL })

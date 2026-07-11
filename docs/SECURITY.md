@@ -131,9 +131,10 @@ showrunner delivers the intent; the VCS enforces it.
 ### 6. Dual tokens + untrusted-content annotation (defense in depth)
 
 - **Dual bearer tokens.** The worker token (committable) can register, pull
-  tasks, and write notes/messages, but cannot `claim_direction` / `create_task`
-  / `direct_task` / `update_rules` / `mint_invite` / `evict_member` or mutate the
-  admin `/api`. Keep the director token secret; rotate via `fly secrets set`.
+  tasks, and write notes/messages, but cannot `claim_direction` /
+  `release_direction` / `create_task` / `direct_task` / `update_rules` /
+  `mint_invite` / `evict_member` or mutate the admin `/api`. Keep the director
+  token secret; rotate via `fly secrets set`.
 - **Untrusted-content annotation.** On delivery, every peer-authored field
   (task brief/title, notes, messages, review journals) is tagged
   `trust:"untrusted_peer"` with fixed guidance telling the reader to treat it as
