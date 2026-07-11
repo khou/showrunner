@@ -14,6 +14,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TSX_BIN = path.join(REPO_ROOT, "node_modules", ".bin", "tsx");
 const TOKEN = "e2e-test-token";
+const WORKER_TOKEN = "e2e-worker-token";
 
 /**
  * A free port from the OS, released immediately. Passed to the server as PORT: cheaper and
@@ -62,9 +63,9 @@ function stopServer(proc: ChildProcess): Promise<void> {
   });
 }
 
-async function connectClient(baseUrl: string, name: string): Promise<Client> {
+async function connectClient(baseUrl: string, name: string, token: string = TOKEN): Promise<Client> {
   const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), {
-    requestInit: { headers: { Authorization: `Bearer ${TOKEN}` } },
+    requestInit: { headers: { Authorization: `Bearer ${token}` } },
   });
   const client = new Client({ name, version: "0.0.1" });
   await client.connect(transport);
@@ -94,7 +95,13 @@ describe("showrunner e2e (real server, real MCP client, streamable HTTP)", () =>
 
     proc = spawn(TSX_BIN, [path.join(REPO_ROOT, "src", "server", "index.ts")], {
       cwd: REPO_ROOT,
-      env: { ...process.env, SHOWRUNNER_TOKEN: TOKEN, PORT: String(port), DATA_DIR: dataDir },
+      env: {
+        ...process.env,
+        SHOWRUNNER_TOKEN: TOKEN,
+        SHOWRUNNER_WORKER_TOKEN: WORKER_TOKEN,
+        PORT: String(port),
+        DATA_DIR: dataDir,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     proc.stderr?.on("data", (chunk: Buffer) => {
@@ -119,6 +126,25 @@ describe("showrunner e2e (real server, real MCP client, streamable HTTP)", () =>
 
     const apiRes = await fetch(`${baseUrl}/api/shows`, { headers: { Authorization: "Bearer wrong-token" } });
     expect(apiRes.status).toBe(401);
+  });
+
+  it("worker token can read /api but cannot mutate; cannot claim_direction via MCP", async () => {
+    const getRes = await fetch(`${baseUrl}/api/shows`, { headers: { Authorization: `Bearer ${WORKER_TOKEN}` } });
+    expect(getRes.status).toBe(200);
+
+    const postRes = await fetch(`${baseUrl}/api/shows/e2e-dual/direction/clear`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${WORKER_TOKEN}` },
+    });
+    expect(postRes.status).toBe(403);
+
+    const worker = await connectClient(baseUrl, "e2e-dual-worker", WORKER_TOKEN);
+    const reg = await callTool(worker, "register", { show: "e2e-dual", kind: "claude-local" });
+    const memberId = (reg.data as { member_id: string }).member_id;
+    const claim = await callTool(worker, "claim_direction", { member_id: memberId, takeover: true });
+    expect(claim.isError).toBe(true);
+    expect(claim.data).toMatchObject({ status: "forbidden" });
+    await worker.close();
   });
 
   it(

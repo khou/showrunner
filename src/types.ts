@@ -1,6 +1,8 @@
 // Shared domain types for the showrunner store, MCP surface, HTTP API, and CLI.
 // See DESIGN.md for vocabulary and PLAN.md for the pinned contracts these mirror.
 
+import { timingSafeEqual } from "node:crypto";
+
 export type MemberKind = "claude-local" | "claude-cloud" | "cursor-local" | "cursor-cloud" | "other";
 
 export type MemberRole = "worker" | "director";
@@ -239,7 +241,15 @@ export interface NoteConfig {
   notesPerTask: number;
 }
 
+/** Bearer auth level after matching SHOWRUNNER_TOKEN vs SHOWRUNNER_WORKER_TOKEN. */
+export type AuthLevel = "director" | "worker";
+
 export interface EnvConfig extends LeaseConfig, NoteConfig {
+  /** Director/admin token (SHOWRUNNER_TOKEN). */
+  directorToken: string;
+  /** Worker token (SHOWRUNNER_WORKER_TOKEN, or director when unset). */
+  workerToken: string;
+  /** Alias of directorToken for CLI / magic links / admin. */
   token: string;
   port: number;
   dataDir: string;
@@ -273,14 +283,26 @@ export function readNoteConfig(env: NodeJS.ProcessEnv = process.env): NoteConfig
   };
 }
 
-/** Full server config. Throws if SHOWRUNNER_TOKEN is unset, so the server refuses to start. */
+/**
+ * Full server config. Throws if SHOWRUNNER_TOKEN is unset.
+ * SHOWRUNNER_WORKER_TOKEN is optional; when unset, worker == director (single-token mode).
+ */
 export function readEnvConfig(env: NodeJS.ProcessEnv = process.env): EnvConfig {
-  const token = env.SHOWRUNNER_TOKEN;
-  if (!token) {
+  const directorToken = env.SHOWRUNNER_TOKEN;
+  if (!directorToken) {
     throw new Error("SHOWRUNNER_TOKEN is required (server refuses to start without it)");
   }
+  const workerRaw = env.SHOWRUNNER_WORKER_TOKEN;
+  const workerToken = workerRaw && workerRaw.length > 0 ? workerRaw : directorToken;
+  if (workerRaw && workerRaw.length > 0 && workerRaw === directorToken) {
+    console.warn(
+      "showrunner: SHOWRUNNER_WORKER_TOKEN equals SHOWRUNNER_TOKEN; running in single-token mode (anyone with the token can direct)",
+    );
+  }
   return {
-    token,
+    directorToken,
+    workerToken,
+    token: directorToken,
     port: parsePositiveInt(env.PORT, 8080),
     dataDir: env.DATA_DIR && env.DATA_DIR.length > 0 ? env.DATA_DIR : "/data",
     pollHoldSeconds: parsePositiveInt(env.POLL_HOLD_SECONDS, 25),
@@ -288,4 +310,21 @@ export function readEnvConfig(env: NodeJS.ProcessEnv = process.env): EnvConfig {
     ...readLeaseConfig(env),
     ...readNoteConfig(env),
   };
+}
+
+/** Match a presented bearer/cookie/query token to an auth level, or null if neither matches. */
+export function resolveAuthLevel(
+  presented: string,
+  cfg: Pick<EnvConfig, "directorToken" | "workerToken">,
+): AuthLevel | null {
+  const abuf = Buffer.from(presented);
+  const match = (expected: string): boolean => {
+    const bbuf = Buffer.from(expected);
+    if (abuf.length !== bbuf.length) return false;
+    return timingSafeEqual(abuf, bbuf);
+  };
+  // Prefer director when both match (single-token mode: workerToken === directorToken).
+  if (match(cfg.directorToken)) return "director";
+  if (match(cfg.workerToken)) return "worker";
+  return null;
 }

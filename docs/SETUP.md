@@ -9,8 +9,9 @@ Agent ground rules:
 - Ask before anything account-shaped or persistent: creating the Fly app
   (costs ~$2-3/month), editing shell profiles, installing LaunchAgents,
   changing app configs outside the project repo.
-- The bearer token is a secret. Never commit it, never paste it into web
-  pages, never echo it in full except in the final callboard link.
+- The **director** bearer token is a secret. Never commit it, never paste it
+  into web pages, never echo it in full except in the final callboard link.
+  The **worker** token is intended to be committed into project MCP configs.
 - Report progress as you go; finish with the "Final report" section.
 
 ## 0. Prerequisites
@@ -53,15 +54,18 @@ sed -i '' "s/^primary_region = .*/primary_region = \"$REGION\"/" fly.toml
 fly volumes create showrunner_data --size 1 --region "$REGION" -a "$APP" --yes
 ```
 
-Generate the token. Default home is `~/.showrunner-token`; if that file
-already exists, this machine has a deployment already: reuse it only if
-you are re-deploying the SAME app, otherwise pick a different filename
-and use it consistently below.
+Generate two tokens. Director stays private (`~/.showrunner-token`); worker
+may be committed into project MCP configs after init.
 
 ```bash
 TOKEN_FILE=~/.showrunner-token
+WORKER_TOKEN_FILE=~/.showrunner-worker-token
 [ -f "$TOKEN_FILE" ] || (openssl rand -hex 24 > "$TOKEN_FILE" && chmod 600 "$TOKEN_FILE")
-fly secrets set SHOWRUNNER_TOKEN="$(cat $TOKEN_FILE)" -a "$APP" --stage
+[ -f "$WORKER_TOKEN_FILE" ] || (openssl rand -hex 24 > "$WORKER_TOKEN_FILE" && chmod 600 "$WORKER_TOKEN_FILE")
+fly secrets set \
+  SHOWRUNNER_TOKEN="$(cat $TOKEN_FILE)" \
+  SHOWRUNNER_WORKER_TOKEN="$(cat $WORKER_TOKEN_FILE)" \
+  -a "$APP" --stage
 fly deploy -a "$APP"
 ```
 
@@ -75,12 +79,15 @@ the long-poll. Do not commit the fly.toml app-name change.
 URL=https://$APP.fly.dev
 curl -sf $URL/healthz                                    # {"ok":true}
 curl -s $URL/api/shows | head -1                         # 401 (auth works)
-SR_URL=$URL SR_TOKEN=$(cat $TOKEN_FILE) npx tsx scripts/live-verify.mts
+SR_URL=$URL SR_TOKEN=$(cat $TOKEN_FILE) \
+  SR_WORKER_TOKEN=$(cat $WORKER_TOKEN_FILE) \
+  npx tsx scripts/live-verify.mts
 ```
 
 live-verify drives the full lifecycle (register, direction, long-poll
-wake, notes, takeover) with the real MCP client; all checks must PASS.
-It creates a throwaway `verify-*` show; clean it up:
+wake, notes, takeover) with the real MCP client; when `SR_WORKER_TOKEN` is
+set it also asserts the worker bearer cannot claim direction. All checks
+must PASS. It creates a throwaway `verify-*` show; clean it up:
 
 ```bash
 node dist/cli/index.js show delete --show <the verify-* show it printed> --url $URL --token $(cat $TOKEN_FILE)
@@ -88,48 +95,17 @@ node dist/cli/index.js show delete --show <the verify-* show it printed> --url $
 
 ## 4. Connect the user's agent clients
 
-Ask which of these the user actually uses, and do only those.
+Prefer repo-committed MCP from step 5 (`init`) over user-global MCP adds.
+Workers use the hardcoded worker token in `.mcp.json` / `.cursor/mcp.json`.
+Director sessions need `SHOWRUNNER_TOKEN` (director) in the local/cloud env
+for the `showrunner-director` entry.
 
-**Claude Code (CLI + desktop):**
+**Cursor cloud agents:** dashboard-only as of 3.8 — paste URL + literal
+**worker** token for workers; director sessions need the director token
+separately. Point the user at it; do not handle tokens in a browser for them.
 
-```bash
-claude mcp add --transport http --scope user showrunner $URL/mcp \
-  --header "Authorization: Bearer $(cat $TOKEN_FILE)"
-```
-
-If the `claude mcp` subcommand is unavailable in your session, give the
-user the command to run themselves rather than editing `~/.claude.json`
-by hand.
-
-**Cursor (desktop):** merge into `~/.cursor/mcp.json` (back it up first,
-preserve existing servers):
-
-```json
-"showrunner": {
-  "url": "<URL>/mcp",
-  "headers": { "Authorization": "Bearer ${env:SHOWRUNNER_TOKEN}" }
-}
-```
-
-`${env:...}` needs the variable in the app's environment:
-- Terminal-launched sessions: add to the shell profile (ask first):
-  `export SHOWRUNNER_TOKEN="$(cat ~/.showrunner-token)"` and
-  `export SHOWRUNNER_URL="https://<APP>.fly.dev"`.
-- Dock-launched GUI apps do not read shell profiles: `launchctl setenv
-  SHOWRUNNER_TOKEN ...` now, plus (ask first) a LaunchAgent that re-runs
-  it at login. Restart the app to pick it up.
-- Tell the user: allow/auto-run the showrunner tools in the client's MCP
-  settings, or worker poll loops stall on approval prompts.
-
-**Cursor cloud agents:** config lives ONLY in the cursor.com dashboard
-(repo `.cursor/mcp.json` is ignored there and env interpolation is
-broken, as of Cursor 3.8): the user pastes the server URL + literal
-token there themselves. Point them at it; do not handle the token in a
-browser for them.
-
-**Claude Code cloud (claude.ai/code):** the committed `.mcp.json` from
-step 5 is picked up automatically; the user adds `SHOWRUNNER_TOKEN` to
-the cloud environment settings and allowlists the `<APP>.fly.dev` domain.
+**Claude Code cloud:** committed `.mcp.json` is enough for workers. Director
+sessions add `SHOWRUNNER_TOKEN` to cloud env and allowlist `<APP>.fly.dev`.
 
 ## 5. Initialize the project repo as a show
 
@@ -138,19 +114,22 @@ name; keep it):
 
 ```bash
 cd <project repo>
-SHOWRUNNER_TOKEN=$(cat $TOKEN_FILE) node ~/showrunner/dist/cli/index.js init --show <repo-name> --url $URL
+node ~/showrunner/dist/cli/index.js init \
+  --show <repo-name> \
+  --url $URL \
+  --token "$(cat $TOKEN_FILE)" \
+  --worker-token "$(cat $WORKER_TOKEN_FILE)"
 ```
 
-This scaffolds `.showrunner` (name pin), `SHOWRUNNER.md` (director
-playbook), `.mcp.json` + `.cursor/mcp.json` (client configs), and a
-gitignored `.env`. Then:
+This scaffolds `.showrunner`, `SHOWRUNNER.md`, `SHOWRUNNER.rules.md`,
+committed dual-token MCP configs (worker Bearer hardcoded), and a gitignored
+`.env` with the director token. It prints the callboard link and ways-to-run.
+Then:
 
 1. Fill in `SHOWRUNNER.md` for THIS project: read the repo (README,
-   docs, build commands) and draft the playbook honestly: what the
-   project is, area/file map for `files_hint`, conventions workers must
-   follow (build/test commands), what escalates to the human. Show the
+   docs, build commands) and draft the playbook honestly. Show the
    user before committing.
-2. Commit `.showrunner`, `SHOWRUNNER.md`, `.mcp.json`,
+2. Commit `.showrunner`, `SHOWRUNNER.md`, `SHOWRUNNER.rules.md`, `.mcp.json`,
    `.cursor/mcp.json` (never `.env`).
 
 ## 6. Take direction

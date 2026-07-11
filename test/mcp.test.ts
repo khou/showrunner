@@ -545,3 +545,36 @@ describe("register warns when creating a new show that looks like a checkout of 
     }
   });
 });
+
+describe("dual-token authLevel gating", () => {
+  it("worker authLevel can register but cannot claim_direction or create_task", async () => {
+    const { store } = newStore();
+    const workerClient = await connectClient(store, { ...FAST_CONFIG, authLevel: "worker" });
+    const reg = await callTool(workerClient, "register", { show: "authshow", kind: "claude-local" });
+    const memberId = (reg.data as { member_id: string }).member_id;
+    expect(memberId).toBeTruthy();
+
+    const claim = await callTool(workerClient, "claim_direction", { member_id: memberId, takeover: true });
+    expect(claim.isError).toBe(true);
+    expect(claim.data).toMatchObject({ status: "forbidden", reason: "director token required" });
+
+    const created = await callTool(workerClient, "create_task", {
+      member_id: memberId,
+      epoch: 1,
+      title: "nope",
+      brief: "should fail",
+    });
+    expect(created.isError).toBe(true);
+    expect(created.data).toMatchObject({ status: "forbidden" });
+  });
+
+  it("director authLevel can claim_direction", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store, { ...FAST_CONFIG, authLevel: "director" });
+    const reg = await callTool(client, "register", { show: "authshow", kind: "claude-local" });
+    const memberId = (reg.data as { member_id: string }).member_id;
+    const claim = await callTool(client, "claim_direction", { member_id: memberId, takeover: true });
+    expect(claim.isError).toBe(false);
+    expect(claim.data).toMatchObject({ status: "claimed" });
+  });
+});

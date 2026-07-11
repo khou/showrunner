@@ -1,7 +1,13 @@
 {
   "mcpServers": {
     "showrunner": {
-      "url": "https://my-showrunner.fly.dev/mcp",
+      "url": "https://<your-app>.fly.dev/mcp",
+      "headers": {
+        "Authorization": "Bearer <WORKER_TOKEN>"
+      }
+    },
+    "showrunner-director": {
+      "url": "https://<your-app>.fly.dev/mcp",
       "headers": {
         "Authorization": "Bearer ${env:SHOWRUNNER_TOKEN}"
       }

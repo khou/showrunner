@@ -9,17 +9,21 @@ for why it's built this way.
 
 | Client | How | Notes |
 |---|---|---|
-| Claude Code local | `claude mcp add --transport http showrunner <url>/mcp --header "Authorization: Bearer $SHOWRUNNER_TOKEN"` (user scope), or a committed `.mcp.json` with `${SHOWRUNNER_TOKEN}` | v2.1.2xx+; the 25s poll needs no timeout tuning |
-| Claude Code cloud | commit `.mcp.json` (see below) + set `SHOWRUNNER_TOKEN` as an env var in the cloud environment + add the server's host to the network allowlist | no browser OAuth in cloud sessions, bearer token only |
-| Cursor local | `.cursor/mcp.json` with `url` + `headers: {"Authorization": "Bearer ${env:SHOWRUNNER_TOKEN}"}` | 3.0+ required; allowlist/auto-run the showrunner tools or the poll loop stalls on approval prompts |
-| Cursor cloud | paste URL + a **hardcoded** token into the cursor.com/agents dashboard MCP config | best-effort: env interpolation and repo-committed config are both broken there as of 3.8 |
+| Claude Code local/cloud | committed `.mcp.json` from `init`: hardcoded worker Bearer on `showrunner`; `${SHOWRUNNER_TOKEN}` on `showrunner-director` | workers need no env; director sessions set director token + allowlist host |
+| Cursor local | `.cursor/mcp.json` same split (`${env:SHOWRUNNER_TOKEN}` for director) | 3.0+; allowlist/auto-run tools or poll stalls |
+| Cursor cloud | paste URL + hardcoded **worker** token in cursor.com/agents dashboard | best-effort as of 3.8; director needs director token separately |
 
-Committed `.mcp.json` (Claude Code, local and cloud):
+Committed dual-token shape (see [examples/](../examples/)):
 
 ```json
 {
   "mcpServers": {
     "showrunner": {
+      "type": "http",
+      "url": "https://<your-app>.fly.dev/mcp",
+      "headers": { "Authorization": "Bearer <WORKER_TOKEN>" }
+    },
+    "showrunner-director": {
       "type": "http",
       "url": "https://<your-app>.fly.dev/mcp",
       "headers": { "Authorization": "Bearer ${SHOWRUNNER_TOKEN}" }
@@ -28,23 +32,7 @@ Committed `.mcp.json` (Claude Code, local and cloud):
 }
 ```
 
-`.cursor/mcp.json` (Cursor local):
-
-```json
-{
-  "mcpServers": {
-    "showrunner": {
-      "url": "https://<your-app>.fly.dev/mcp",
-      "headers": { "Authorization": "Bearer ${env:SHOWRUNNER_TOKEN}" }
-    }
-  }
-}
-```
-
-Working examples with a placeholder URL are in [examples/](../examples/). Or,
-from a clone of this repo, run `node dist/cli/index.js snippets --url <your-url>`
-(after `npm install && npm run build`) to get all of the above with your URL
-already filled in.
+Or run `node dist/cli/index.js snippets --url <your-url> --worker-token <worker>` after build.
 
 ## Direction and takeover
 
@@ -168,7 +156,8 @@ decisions (especially answers to `input-required`) as notes.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `SHOWRUNNER_TOKEN` | *(required)* | Bearer token gating `/mcp` and `/api`. Server refuses to start without it. |
+| `SHOWRUNNER_TOKEN` | *(required)* | Director/admin bearer. Server refuses to start without it. |
+| `SHOWRUNNER_WORKER_TOKEN` | *(optional)* | Worker bearer. When unset, equals director (single-token mode). |
 | `PORT` | `8080` | HTTP port. |
 | `DATA_DIR` | `/data` | Where the SQLite file lives. |
 | `POLL_HOLD_SECONDS` | `25` | Max long-poll hold for `await_work`. |
@@ -200,18 +189,18 @@ showrunner task cancel --show <name> --id <task-id>
 showrunner message --show <name> --to <member-id|director|all|human> --body <text>
 showrunner direction clear --show <name>
 showrunner show delete --show <name>        # removes the show and everything under it
-showrunner init --show <name> [--url <url>] # .showrunner, SHOWRUNNER.md, SHOWRUNNER.rules.md, mcp configs
+showrunner init --show <name> --url <url> --token <director> --worker-token <worker>
 showrunner open [--show <name>] [--print]  # callboard magic link (?token=…&show=…)
 showrunner instructions
-showrunner snippets [--url <url>]
+showrunner snippets [--url <url>] [--worker-token <token>]
 ```
 
 `init` sets a repo up as a show: it writes `.showrunner` (the name pin),
-`SHOWRUNNER.md` (the show playbook: how the director should decompose work
-for THIS project, area/file map, conventions, escalation rules; the director
-protocol reads it right after `claim_direction` and it overrides the generic
-defaults), `SHOWRUNNER.rules.md` (fleet automation/role defaults; user-editable),
-and `.mcp.json` / `.cursor/mcp.json` pointed at your server.
+`SHOWRUNNER.md` (the show playbook), `SHOWRUNNER.rules.md` (fleet rules),
+committed `.mcp.json` / `.cursor/mcp.json` with a **hardcoded worker** Bearer
+plus a `showrunner-director` entry that reads `SHOWRUNNER_TOKEN` from env, and
+a gitignored `.env` with the director token. It prints the callboard link and
+ways-to-run (simple fleet vs dedicated lanes).
 Fill in the playbook, tweak rules, commit, and every clone, worktree, and
 cloud checkout gets the same show name and direction rules.
 
@@ -275,9 +264,10 @@ again.
 
 ## Security posture
 
-One shared bearer token gates everything. Anyone with it can read and write
-every show on the deployment. That's the intended tradeoff for one person
-running several sessions. Rotate it with `fly secrets set SHOWRUNNER_TOKEN=...`
-if it leaks. No per-member tokens or per-show ACLs in v1. The server holds
-task titles/briefs, journals, and notes -- keep secrets out of them, point at
-repo files instead (which also saves tokens).
+Two bearer tokens. The **worker** token is meant to be committed so clones can
+join without secrets; it can register, pull tasks, and write notes, but cannot
+claim direction or mutate admin `/api`. The **director** token stays secret
+(`.env` / Fly / cloud Runtime Secret). Rotate with
+`fly secrets set SHOWRUNNER_TOKEN=... SHOWRUNNER_WORKER_TOKEN=...`. No
+per-member tokens or per-show ACLs. Keep secrets out of task briefs; point at
+repo files instead.

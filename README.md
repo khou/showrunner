@@ -25,16 +25,31 @@ from inside the project repo you want coordinated:
 
 You bring a [Fly.io](https://fly.io) account (the agent will prompt you to
 `fly auth login` if needed; login and billing stay in your hands). The agent
-deploys the server (one small always-on machine, ~$3/mo), wires your
-clients, scaffolds this repo, and finishes as the show's director with your
-dashboard link. Prefer doing it by hand? [docs/SETUP.md](docs/SETUP.md) is
-the same runbook, human-readable.
+deploys the server (one small always-on machine, ~$3/mo), scaffolds this
+repo with dual-token MCP configs, and finishes as the show's director with
+your dashboard link. Prefer doing it by hand? [docs/SETUP.md](docs/SETUP.md)
+is the same runbook, human-readable.
 
-From then on, in any session in the repo:
+**Auth split:** `init` commits a **worker** bearer into `.mcp.json` /
+`.cursor/mcp.json` so anyone who clones can join as a worker with no secrets
+setup. The **director** token stays in gitignored `.env` (and the
+`showrunner-director` MCP entry). Only the director token can
+`claim_direction` / create tasks / mutate the callboard API.
+
+From then on:
 
 > "You're a showrunner worker."
 
-> "You're the showrunner director."
+> "You're the showrunner director." (needs director MCP + `SHOWRUNNER_TOKEN`)
+
+**Ways to run**
+
+- **A. Simple fleet** — one director + N general workers (default).
+- **B. Dedicated lanes (optional)** — edit `SHOWRUNNER.rules.md` Dedicated
+  workers, then open role-focused sessions (e.g. art / verify) with a clear
+  `display_name`. Director pins matching tasks with `assignee`. Useful when
+  some sessions have tools others lack (laptop secrets, GPU, browser, local
+  stack vs cloud).
 
 See [DESIGN.md](DESIGN.md) for why it's built this way, and
 [docs/OPERATING.md](docs/OPERATING.md) for everything operational: client
