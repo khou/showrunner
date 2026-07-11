@@ -223,6 +223,9 @@ talk MCP.
 
 ## Verifying a deployment
 
+`scripts/seed-demo.mts` fills a local server with a realistic demo show
+(the one in the README screenshot) for a look around the callboard.
+
 `scripts/live-verify.mts` drives the full lifecycle against a real deployment
 with the real MCP SDK client: register, claim direction, create task, worker
 claims and completes, director reviews, mid-poll wake latency, shared notes
