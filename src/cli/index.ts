@@ -4,6 +4,7 @@
 import { parseArgs } from "node:util";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 import type { BoardState, CreateTaskInput, DirectionState, Message, MessageTarget, OverlapWarning, Task } from "../types.js";
 import { INSTRUCTIONS } from "../server/instructions.js";
 
@@ -286,7 +287,7 @@ const PLAYBOOK_TEMPLATE = `# Show playbook
 
 Read by the director right after \`claim_direction\`. Everything here overrides
 the generic protocol defaults. Keep it short; briefs should point at docs, not
-duplicate them.
+duplicate them. Fleet automation/role defaults live in \`SHOWRUNNER.rules.md\`.
 
 ## What this project is
 
@@ -309,6 +310,58 @@ duplicate them.
 
 - Decisions the director may make alone: <...>
 - Decisions that must go to the human (\`send_message\` to \`human\`): <...>
+`;
+
+const RULES_TEMPLATE = `# Showrunner rules
+
+User-editable. The director reads this after \`claim_direction\` and reminds
+workers; every worker re-reads it when claiming a task. Playbook
+(\`SHOWRUNNER.md\`) is how to decompose this project; this file is how the
+fleet behaves.
+
+## Automation defaults (flip to change)
+
+**Default path: feature branch → PR → squash-merge when green.**
+Do **not** commit or push directly to \`main\` unless you flip that below.
+
+| Default | Setting |
+|---|---|
+| **ON** | Open a PR when a task has a reviewable unit |
+| **ON** | Squash-merge that PR when verify is green (do not wait for the human) |
+| **OFF** | Require human approval before merge |
+| **OFF** | Allow direct commits/pushes to \`main\` (keep off; use PR → squash-merge) |
+| **ON** | Close superseded / abandoned drafts in the same session |
+| **ON** | Verification is part of done (see verify step in \`SHOWRUNNER.md\`) |
+
+To require human merge approval: set "Require human approval before merge" to
+**ON**. The path remains PR → squash-merge after approval — still not
+direct-to-main.
+
+## Dedicated workers (optional)
+
+By default assign any idle registered worker. Soft preferences only
+(\`assignee\` when a matching worker is registered):
+
+- *(none)* — example: prefer one worker for visual/art; prefer one for verify/playtest
+
+## Subagents
+
+Sessions may fan out their own subagents to speed up work. Encouraged when it
+helps. Showrunner task ownership stays with the registered session.
+
+## Models (optional)
+
+Model choice is normally up to whoever opens the session. Edit only if the
+director itself spawns cloud agents via API keys:
+
+- Smarter models for strategic / architectural / design-direction work
+- Cheaper/faster models for routine implementation
+- Prefer plan-included models when cost matters; still prefer capable over weak when the task is hard
+- Do not hardcode vendor-specific model IDs unless you want to
+
+## Project rules
+
+Add show-specific standing rules below. Keep them short; point at docs.
 `;
 
 /** Writes a file unless it exists; reports either way. */
@@ -356,6 +409,7 @@ function cmdInit(argv: string[]): void {
   process.stdout.write(`initializing showrunner for show "${values.show}" in ${dir}\n`);
   scaffold(join(dir, ".showrunner"), values.show + "\n");
   scaffold(join(dir, "SHOWRUNNER.md"), PLAYBOOK_TEMPLATE);
+  scaffold(join(dir, "SHOWRUNNER.rules.md"), RULES_TEMPLATE);
   scaffold(join(dir, ".mcp.json"), JSON.stringify(mcpEntry, null, 2) + "\n");
   // Local convenience only: MCP config ${VAR} interpolation reads process env, not .env
   // files, so this feeds shells/direnv/tooling. Never committed; .gitignore is amended.
@@ -375,11 +429,42 @@ function cmdInit(argv: string[]): void {
   scaffold(join(dir, ".cursor", "mcp.json"), JSON.stringify(cursorEntry, null, 2) + "\n");
   process.stdout.write(`
 next steps:
-  1. Fill in SHOWRUNNER.md (the director's playbook for this show) and commit all four files.
+  1. Fill in SHOWRUNNER.md (playbook) and edit SHOWRUNNER.rules.md (automation defaults), then commit.
   2. Make sure SHOWRUNNER_TOKEN is set in the environment of every client
      (shell env for local sessions, environment settings for cloud sessions).
-  3. In any session in this repo: "You're a showrunner worker." / "You're the showrunner director."
+  3. Open the callboard: showrunner open
+  4. In any session in this repo: "You're a showrunner worker." / "You're the showrunner director."
 `);
+}
+
+// --- open (callboard magic link) ---
+
+function cmdOpen(argv: string[]): void {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      show: { type: "string" },
+      url: { type: "string" },
+      token: { type: "string" },
+      print: { type: "boolean", default: false },
+    },
+    allowPositionals: false,
+  });
+  const cfg = requireConfig({ url: values.url, token: values.token });
+  const show =
+    values.show ??
+    (existsSync(".showrunner") ? readFileSync(".showrunner", "utf8").trim().split("\n")[0] : undefined);
+  const qs = new URLSearchParams({ token: cfg.token });
+  if (show) qs.set("show", show);
+  const link = `${cfg.url}/?${qs.toString()}`;
+  if (values.print) {
+    process.stdout.write(link + "\n");
+    return;
+  }
+  process.stdout.write(`opening ${cfg.url}/?token=…${show ? `&show=${show}` : ""}\n`);
+  const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", link] : [link];
+  spawn(opener, args, { detached: true, stdio: "ignore" }).unref();
 }
 
 // --- instructions ---
@@ -471,6 +556,7 @@ Usage:
   showrunner direction clear --show <name> [--url <url>] [--token <token>]
   showrunner show delete --show <name> [--url <url>] [--token <token>]
   showrunner init --show <name> [--url <url>] [--dir <path>] [--token <token>]
+  showrunner open [--show <name>] [--url <url>] [--token <token>] [--print]
   showrunner instructions
   showrunner snippets [--url <url>]
 
@@ -505,6 +591,9 @@ async function main(): Promise<void> {
         break;
       case "init":
         cmdInit(rest);
+        break;
+      case "open":
+        cmdOpen(rest);
         break;
       case "instructions":
         cmdInstructions();

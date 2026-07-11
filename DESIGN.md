@@ -181,6 +181,22 @@ placement means it travels with every clone, worktree, and cloud checkout,
 and a takeover director in a brand-new session picks it up with zero server
 machinery. The server never stores or parses it.
 
+### Showrunner rules (SHOWRUNNER.rules.md)
+
+Playbook is *how to break down this project*. Rules are *how the fleet
+behaves*: PR/merge automation, optional dedicated-worker preferences, and
+short project standing rules. `showrunner init` scaffolds
+`SHOWRUNNER.rules.md` with OOTB defaults that favor full automation (open PR,
+squash-merge when green, verify is part of done). Users edit the file to
+require human merge approval or name soft assignee preferences (e.g. prefer
+one registered worker for art, one for verify). The director reads rules after
+`claim_direction`, reminds the cast via `send_message` to `all`, and workers
+re-read them when claiming a task. Same repo placement as the playbook; the
+server never stores or parses it.
+
+Sessions may fan out their own subagents to speed work; showrunner membership
+and task ownership stay with the registered session.
+
 ## Shared notes: realtime memory
 
 Agents working in parallel learn things the others need *now*, not on their

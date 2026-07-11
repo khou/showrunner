@@ -89,7 +89,11 @@ function tokenCookieHandshake(cfg: EnvConfig): MiddlewareHandler {
     url.searchParams.delete("token");
     // Fragment survives the redirect but never reaches a server or its logs; the
     // callboard JS stores it (so /api calls work) and strips it from the URL.
-    return c.redirect(`${url.pathname}${url.search}#token=${encodeURIComponent(cfg.token)}`, 302);
+    // Preserve ?show= across the handshake so deep links keep working.
+    const show = url.searchParams.get("show");
+    url.searchParams.delete("token");
+    const showQs = show ? `?show=${encodeURIComponent(show)}` : url.search;
+    return c.redirect(`${url.pathname}${showQs}#token=${encodeURIComponent(cfg.token)}`, 302);
   };
 }
 
