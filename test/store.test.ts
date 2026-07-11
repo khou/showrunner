@@ -1577,3 +1577,19 @@ describe("escalation parking (input-required)", () => {
     }
   });
 });
+
+describe("adminCancelTask stamps status_changed_at", () => {
+  it("advances status_changed_at so a canceled task's escalation-clock semantics are consistent", () => {
+    const { store, clock } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const t = store.createTask({ show: "myshow", title: "T", brief: "b", createdBy: director.id }).task;
+    store.claimNextTask(worker.id);
+    clock.t += 5000;
+    store.adminCancelTask(t.id, "human");
+    const row = store.getBoard("myshow").tasks.find((x) => x.id === t.id)!;
+    expect(row.status).toBe("canceled");
+    // pendingInputRequired must never surface a canceled task.
+    expect(store.pendingInputRequired("myshow")).toHaveLength(0);
+  });
+});

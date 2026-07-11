@@ -1,5 +1,5 @@
 // Shared domain types for the showrunner store, MCP surface, HTTP API, and CLI.
-// See DESIGN.md for vocabulary and PLAN.md for the pinned contracts these mirror.
+// See DESIGN.md for vocabulary and the current env/lease contract (PLAN.md is the historical v0 pin).
 
 import { timingSafeEqual } from "node:crypto";
 

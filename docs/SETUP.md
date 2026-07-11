@@ -124,8 +124,8 @@ equal). It writes:
 | `.env` | **no** | `SHOWRUNNER_TOKEN` (director) + `SHOWRUNNER_URL` |
 
 Fleet rules are **not** a repo file: they are server-held per-show state, seeded
-with OOTB defaults on the server and edited with `showrunner rules set` or the
-callboard. `init` also prints the callboard magic link and copy-paste
+with OOTB defaults on the server and edited with `showrunner rules set` (the
+callboard only displays them). `init` also prints the callboard magic link and copy-paste
 worker/director prompts (ways to run: simple fleet vs dedicated lanes).
 
 Then:

@@ -1251,7 +1251,7 @@ export class Store {
       const priority = input.priority ?? 0;
 
       // released defaults true; a caller (the create_task tool under REQUIRE_TASK_RELEASE) passes
-      // false to withhold the task from workers until a human releases it on the callboard.
+      // false to withhold the task from workers until a human releases it (showrunner task release).
       const released = input.released === false ? 0 : 1;
       this.db
         .prepare(
@@ -1313,6 +1313,23 @@ export class Store {
         }
       }
       return mapTask(this.getTaskRowRaw(taskId)!);
+    });
+  }
+
+  /** Unanswered escalations in a show: tasks parked input-required, oldest first, with the
+   * age since they were parked (status_changed_at). The director's idle polls surface these as
+   * a standing reminder -- the review cursor shows each escalation only once, but a pending
+   * decision must keep nagging until it's answered. */
+  pendingInputRequired(show: string): { id: string; title: string; assignee: string | null; parkedAt: number; ageMs: number }[] {
+    const now = this.now();
+    const rows = this.db
+      .prepare(
+        "SELECT id, title, assignee, status_changed_at, updated_at FROM tasks WHERE show = ? AND status = 'input-required' ORDER BY COALESCE(status_changed_at, updated_at) ASC",
+      )
+      .all(show) as { id: string; title: string; assignee: string | null; status_changed_at: number | null; updated_at: number }[];
+    return rows.map((r) => {
+      const parkedAt = r.status_changed_at ?? r.updated_at;
+      return { id: r.id, title: r.title, assignee: r.assignee, parkedAt, ageMs: now - parkedAt };
     });
   }
 
@@ -1612,7 +1629,9 @@ export class Store {
       const status = row.status as TaskStatus;
       if (!TERMINAL_STATUSES.has(status)) {
         const at = this.now();
-        this.db.prepare("UPDATE tasks SET status = 'canceled', lease_expires_at = NULL, updated_at = ? WHERE id = ?").run(at, taskId);
+        this.db
+          .prepare("UPDATE tasks SET status = 'canceled', lease_expires_at = NULL, updated_at = ?, status_changed_at = ? WHERE id = ?")
+          .run(at, at, taskId);
         if (row.assignee) {
           this.db.prepare("UPDATE members SET current_task_id = NULL WHERE id = ? AND current_task_id = ?").run(row.assignee, taskId);
           this.events.emit(`wake:${row.assignee}`);
@@ -1753,7 +1772,7 @@ export class Store {
     // auto-pushed to peers -- closing the unprompted worker->peer channel. Explicit search_notes
     // still works (a pull the reader initiates, not a push).
     if (!this.getShowRules(show).switches.workerNotePropagation) return [];
-    // Delivery is gated on the recipient's *current task* being live, not the 90s member
+    // Delivery is gated on the recipient's *current task* being live, not the 150s member
     // lease: a worker heads-down executing only has to heartbeat every ~10min (see the sweep()
     // comment below), so it's routinely outside its member lease window while still genuinely
     // working -- exactly the primary intended recipient of a note about the task it's on. The

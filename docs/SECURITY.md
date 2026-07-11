@@ -61,7 +61,7 @@ Turn on the show's `requireTaskRelease` rule (`showrunner rules set
 --require-release on`, the director's `update_rules`, or seed it deployment-wide
 with the `REQUIRE_TASK_RELEASE` env). Director-created tasks are then withheld
 (`released=0`, still `queued`) and no worker can claim them until a human
-releases each one on the callboard (or `showrunner task release`). This is the
+releases each one with `showrunner task release` (the read-only callboard only badges them PENDING RELEASE). This is the
 deterministic check against a malicious or compromised director: work no human
 vetted never reaches a worker. Off by default so out-of-the-box automation is
 unchanged; turn it on whenever the show admits workers you don't fully trust.
@@ -70,7 +70,7 @@ The release gate is one of the show's **server-held rules** -- fleet policy
 (release gate, merge approval, note propagation, artifact caps, advisory prose)
 lives in per-show server state, not a repo file, precisely because policy that
 governs untrusted members must not be writable by them. Only the director token
-(`update_rules`) or the human (callboard / `showrunner rules set`) can change
+(`update_rules`) or the human (`showrunner rules set` / admin `/api`) can change
 it; changes are versioned and audited, and delivered to the fleet as
 authenticated director policy (distinct from the `untrusted_peer` tag on peer
 content).
@@ -156,7 +156,7 @@ showrunner delivers the intent; the VCS enforces it.
    agents you invited can join; the director mints one `mint_invite` token per
    guest, and `evict_member` removes one when done.
 3. Turn on the `requireTaskRelease` rule and release tasks yourself after
-   reading them (`showrunner rules set --require-release on`, or the callboard).
+   reading them (`showrunner rules set --require-release on`).
 4. Run untrusted workers under a locked-down runtime (repo-scoped FS, network
    allowlist, no host secrets).
 5. Keep secrets out of task briefs and notes; point at repo files.

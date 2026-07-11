@@ -528,7 +528,7 @@ function cmdInit(argv: string[]): void {
 next steps:
   1. Fill in SHOWRUNNER.md (playbook), then commit
      (.showrunner, playbook, .mcp.json, .cursor/mcp.json — never .env).
-     Fleet rules are server-held: view/edit with \`showrunner rules\` or on the callboard.
+     Fleet rules are server-held: view on the callboard, edit with \`showrunner rules set\`.
   2. Callboard (director token): ${callboard}
   3. Director session (needs showrunner-director MCP + SHOWRUNNER_TOKEN in env):
        You're the showrunner director.
@@ -547,7 +547,7 @@ next steps:
        local stack vs cloud). Director pins matching tasks with assignee.
 
   Fleet rules (release gate, merge approval, note propagation, artifact caps,
-  policy) are server-held: view/edit with 'showrunner rules [set]' or the callboard.
+  policy) are server-held: view on the callboard, edit with 'showrunner rules [set]'.
 `);
 }
 

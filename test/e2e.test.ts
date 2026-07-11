@@ -213,7 +213,7 @@ describe("showrunner e2e (real server, real MCP client, streamable HTTP)", () =>
   );
 
   it(
-    "await_work wakes on a task created ~1s later, well under the 25s hold",
+    "await_work wakes on a task created ~1s later, well under the 50s hold",
     async () => {
       const show = "myshow-poll";
       const director = await connectClient(baseUrl, "e2e-poll-director");
