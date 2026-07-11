@@ -328,6 +328,7 @@ function cmdInit(argv: string[]): void {
       show: { type: "string" },
       url: { type: "string" },
       dir: { type: "string" },
+      token: { type: "string" },
     },
     allowPositionals: false,
   });
@@ -356,6 +357,20 @@ function cmdInit(argv: string[]): void {
   scaffold(join(dir, ".showrunner"), values.show + "\n");
   scaffold(join(dir, "SHOWRUNNER.md"), PLAYBOOK_TEMPLATE);
   scaffold(join(dir, ".mcp.json"), JSON.stringify(mcpEntry, null, 2) + "\n");
+  // Local convenience only: MCP config ${VAR} interpolation reads process env, not .env
+  // files, so this feeds shells/direnv/tooling. Never committed; .gitignore is amended.
+  const token = values.token ?? process.env.SHOWRUNNER_TOKEN;
+  if (token) {
+    scaffold(join(dir, ".env"), `SHOWRUNNER_TOKEN=${token}\nSHOWRUNNER_URL=${base}\n`);
+    const giPath = join(dir, ".gitignore");
+    const gi = existsSync(giPath) ? readFileSync(giPath, "utf8") : "";
+    if (!gi.split("\n").some((l) => l.trim() === ".env")) {
+      writeFileSync(giPath, gi + (gi.endsWith("\n") || gi === "" ? "" : "\n") + ".env\n");
+      process.stdout.write(`  added .env to ${giPath}\n`);
+    }
+  } else {
+    process.stdout.write("  skipped .env (no --token and SHOWRUNNER_TOKEN unset)\n");
+  }
   mkdirSync(join(dir, ".cursor"), { recursive: true });
   scaffold(join(dir, ".cursor", "mcp.json"), JSON.stringify(cursorEntry, null, 2) + "\n");
   process.stdout.write(`
@@ -455,7 +470,7 @@ Usage:
                       [--url <url>] [--token <token>]
   showrunner direction clear --show <name> [--url <url>] [--token <token>]
   showrunner show delete --show <name> [--url <url>] [--token <token>]
-  showrunner init --show <name> [--url <url>] [--dir <path>]
+  showrunner init --show <name> [--url <url>] [--dir <path>] [--token <token>]
   showrunner instructions
   showrunner snippets [--url <url>]
 

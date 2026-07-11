@@ -48,7 +48,10 @@
       headers: { ...(opts && opts.headers), Authorization: `Bearer ${state.token}` },
     });
     if (res.status === 401) {
-      tokenStatus.textContent = "invalid token";
+      state.token = "";
+      localStorage.removeItem(TOKEN_KEY);
+      tokenBox.hidden = false;
+      tokenStatus.textContent = "invalid token; paste a valid one";
       tokenStatus.style.color = "var(--red)";
       throw new Error("unauthorized");
     }
@@ -328,10 +331,20 @@
     history.replaceState(null, "", location.pathname + location.search);
   }
 
-  tokenInput.value = state.token;
-  tokenStatus.textContent = state.token ? "saved" : "enter token to load shows";
+  // The token box only exists for the unauthenticated empty state; once a token is
+  // stored (via the ?token= link handshake or a one-time paste) it disappears. The
+  // token itself is never rendered back into the page.
+  const tokenBox = el("token-box");
+  function syncAuthUi() {
+    tokenBox.hidden = Boolean(state.token);
+    if (!state.token) tokenStatus.textContent = "open your ?token= link, or paste the token";
+  }
+  syncAuthUi();
+  tokenInput.value = "";
   el("token-save").addEventListener("click", () => {
     saveToken(tokenInput.value.trim());
+    tokenInput.value = "";
+    syncAuthUi();
     loadShows();
   });
   showSelect.addEventListener("change", () => selectShow(showSelect.value));

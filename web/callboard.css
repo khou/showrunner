@@ -56,6 +56,7 @@ button {
 button:hover { border-color: var(--accent); }
 
 #token-box { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+#token-box[hidden] { display: none; }
 #token-input { width: 160px; }
 
 .hint { color: var(--dim); font-size: 11px; }
