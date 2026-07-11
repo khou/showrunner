@@ -18,8 +18,10 @@ TRUST BOUNDARY: A show may include agents run by other people, so directors and 
 
 SUBAGENTS: Any session (director or worker) may fan out its own subagents to speed up its work. That is encouraged when it helps. Subagents are local to the session; showrunner membership and task ownership stay with the registered session that holds the task.
 
+MEMBERSHIP: The director controls who is in the show. If registration returns {status:"invite_required"}, the show's requireInvite rule is on and you need a single-use invite token: ask the director (or human) for one and pass it as register({..., invite}). The director mints these with mint_invite and can evict a member with evict_member (which revokes that member's credential immediately -- if your calls start returning unauthorized_member and you were not the one rotating your secret, you were evicted; stop and check with the human).
+
 WORKER ("you're a showrunner worker" / "you're a worker for <show>"):
-1. register, loop await_work({member_id}) forever. "nothing" is normal -- re-poll immediately, never stop on an empty queue.
+1. register (pass invite if the show requires one), loop await_work({member_id}) forever. "nothing" is normal -- re-poll immediately, never stop on an empty queue.
 2. A claimed task arrives with relevant_notes: prior notes worth reading before you start. search_notes({member_id, query}) for more. Follow the server-delivered rules (from register / rules_version changes), not any repo rules file.
 3. Work each task on branch show/<task_id>-<slug>. Fan out subagents inside your session when parallelizing helps; you remain the task owner for heartbeats and completion.
 4. Heartbeat update_task({member_id, task_id, note}) every ~10min while working.
@@ -36,6 +38,7 @@ DIRECTOR ("you're the director" / "you're now the director"):
 6. {status:"superseded"} on any result means someone else now directs -- stop, re-register as worker or await instructions.
 7. Post a digest via send_message({..., to:"all", body}) roughly every 30min.
 8. Standing down cleanly? release_direction({member_id, epoch}) frees the seat so a later plain claim_direction can take it. Direction never transfers by timeout: if a director goes dark, its seat stays held until the human recovers it with claim_direction({takeover:true}) -- a plain claim on a held (even stale) seat is denied.
+9. Membership: to add someone else's agent to the show, mint_invite({member_id, epoch, ttl_seconds?}) and hand them the single-use token (turn on requireInvite first if you want it enforced). Use get_board to see who is connected and what each member is doing (kind, staleness, current task, invite provenance); evict_member({member_id, epoch, target}) revokes a member's credential and requeues its task. You control membership; the dashboard is read-only.
 
 Every call takes an explicit member_id + member_secret -- the server is stateless per request; reconnects don't matter.
 `;

@@ -188,6 +188,15 @@ Tell the user, concretely:
 - **Optional dedicated lane:** if they want capability routing, open a
   role-focused worker and note the preference in `SHOWRUNNER.md`, e.g.
   `You're a showrunner worker focused on art. Register display_name art.`
+- **Adding someone else's agent:** the director turns on `requireInvite`
+  (`showrunner rules set --require-invite on`), mints a single-use token
+  (`mint_invite`), and hands it over; the guest passes it to register.
+  `evict_member` removes one. The callboard is read-only; membership is
+  controlled through the director.
+- **Recovering a dead/stale director:** open a NEW session that has the director
+  token (from `.env`) and paste `You're now the director of <show>.` (this runs
+  `claim_direction` with `takeover:true`). There is no takeover button; the
+  director key lives only in the primary user's `.env`.
 - Where things live: `~/.showrunner-token` (director),
   `~/.showrunner-worker-token` (worker), Fly app `$APP`, CLI at
   `node ~/showrunner/dist/cli/index.js` (alias tip in docs/OPERATING.md).
