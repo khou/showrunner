@@ -31,19 +31,16 @@
     <section id="director-card" class="card">
       <h2>director</h2>
       <div id="director-body">no show selected</div>
+      <ul id="director-members" class="director-members"></ul>
     </section>
 
     <section id="members-card" class="card hero">
       <div class="members-header">
         <h2>members</h2>
+        <button id="dormant-toggle" type="button" class="evicted-toggle" hidden></button>
         <button id="evicted-toggle" type="button" class="evicted-toggle" hidden></button>
       </div>
       <ul id="members-list"><li class="hint">no show selected</li></ul>
-    </section>
-
-    <section id="rules-card" class="card">
-      <h2>rules</h2>
-      <div id="rules-body">no show selected</div>
     </section>
 
     <section id="tasks-card" class="card wide">
@@ -67,7 +64,13 @@
       </div>
     </section>
 
-    <details id="activity-card" class="card wide">
+    <!-- rules (col 1) precedes activity (col 2) so sparse grid placement keeps them on one row -->
+    <section id="rules-card" class="card bottom-rules">
+      <h2>rules</h2>
+      <div id="rules-body">no show selected</div>
+    </section>
+
+    <details id="activity-card" class="card bottom-activity">
       <summary><h2 id="activity-summary">activity</h2></summary>
       <ul id="activity-list"><li class="hint">no show selected</li></ul>
     </details>

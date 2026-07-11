@@ -33,7 +33,7 @@ function stripBoard(board: BoardState) {
   return {
     ...board,
     tasks: board.tasks.map(stripTaskView),
-    escalations: { ...board.escalations, inputRequired: board.escalations.inputRequired.map(stripTaskView) },
+    escalations: { inputRequired: board.escalations.inputRequired.map(stripTaskView) },
   };
 }
 
@@ -49,7 +49,7 @@ function forbiddenDirector(): CallToolResult {
     {
       status: "forbidden",
       reason: "director token required",
-      hint: "director-only tools (claim_direction, release_direction, create_task, direct_task, update_rules, mint_invite, evict_member) need the showrunner-director MCP entry (SHOWRUNNER_TOKEN). The committed worker token cannot direct.",
+      hint: "director-only tools (claim_direction, release_direction, create_task, direct_task, take_input, update_rules, mint_invite, evict_member) need the showrunner-director MCP entry (SHOWRUNNER_TOKEN). The committed worker token cannot direct.",
     },
     true,
   );
@@ -172,6 +172,9 @@ export interface PendingInput {
   title: string;
   assignee: string | null;
   age_minutes: number;
+  // True once this escalation was taken on (take_input): the worker was reassured and its wait
+  // clock reset, so the director still owes an answer but the worker isn't about to abandon it.
+  taken: boolean;
 }
 
 // DESIGN.md "Recall at claim time": bodies trimmed to ~300 chars in the claim-time payload
@@ -311,12 +314,13 @@ function nothingResult(store: Store, member: Member): AwaitWorkResult {
   if (pending.length === 0) return { status: "nothing", hint: "re-poll immediately" };
   return {
     status: "nothing",
-    hint: `${pending.length} task(s) awaiting your input. Answer each with direct_task({action:"answer", body}) -- decide from the rules/playbook/design docs where you can, escalate to the human only if it truly needs their authority. Workers park these and move on after ~15min, so don't let them sit.`,
+    hint: `${pending.length} task(s) awaiting your input. Answer each with direct_task({action:"answer", body}) -- decide from the rules/playbook/design docs where you can, and only what truly needs the human's authority goes to the human, whom you ask directly in this session. Workers park these and move on after ~15min; if you can't answer at once, take_input({task_id}) reassures the worker and resets its wait clock while you get the answer.`,
     pending_input: pending.map((p) => ({
       task_id: p.id,
       title: p.title,
       assignee: p.assignee,
       age_minutes: Math.round(p.ageMs / 60000),
+      taken: p.takenAt !== null,
     })),
   };
 }
@@ -624,7 +628,8 @@ function registerTools(store: Store, config: McpServerConfig, reg: RegisterToolF
   reg(
     "send_message",
     {
-      description: "Send a message to a member id, 'director', 'all', or 'human'.",
+      description:
+        "Send a message to a member id, 'director', or 'all'. There is no 'human' target: a director needing the human's input asks in its own agent session, where the human is present.",
       inputSchema: {
         member_id: z.string().min(1),
         member_secret: MEMBER_SECRET,
@@ -851,6 +856,34 @@ function registerTools(store: Store, config: McpServerConfig, reg: RegisterToolF
       try {
         const task = store.directTask(member.id, args.epoch, args.task_id, action.value);
         return jsonResult({ task });
+      } catch (err) {
+        if (err instanceof SupersededError) return supersededResult(err);
+        return jsonResult({ status: "error", message: (err as Error).message }, true);
+      }
+    },
+  );
+
+  reg(
+    "take_input",
+    {
+      description:
+        "Director-only: take on a worker's input-required escalation. Messages the waiting worker that an answer is coming and resets its escalation-wait clock, so it keeps holding the parked task instead of dropping it for other work after ~15min -- call it the moment you can't answer instantly (you need the human, or need time). It does NOT resolve the task: get the decision (ask the human directly in this session if it needs their authority), then direct_task({action:'answer', body}) to unblock the worker. Epoch-fenced. Requires the director bearer token.",
+      inputSchema: {
+        member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
+        epoch: z.number().int(),
+        task_id: z.string().min(1),
+      },
+    },
+    async (args) => {
+      const denied = requireDirectorAuth();
+      if (denied) return denied;
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
+      if ("result" in resolved) return resolved.result;
+      const { member } = resolved;
+      try {
+        const task = store.takeInput(member.id, args.epoch, args.task_id);
+        return jsonResult({ status: "taken", task });
       } catch (err) {
         if (err instanceof SupersededError) return supersededResult(err);
         return jsonResult({ status: "error", message: (err as Error).message }, true);

@@ -22,7 +22,13 @@
     expanded: new Set(), // task ids with journal expanded
     pollTimer: null,
     showEvicted: false,
+    showDormant: false,
   };
+
+  // Stale AND unseen this long, with no live task -> "dormant": a dead session the human hasn't
+  // evicted. There is no eviction timer (leases only mark staleness), so these accumulate; collapse
+  // them behind a toggle so an 8h-old row doesn't bury the live cast.
+  const DORMANT_MS = 15 * 60 * 1000;
 
   const el = (id) => document.getElementById(id);
   const showSelect = el("show-select");
@@ -153,11 +159,81 @@
     // liveness/identity details render on the director card instead.
     const directorMember = director ? ((board && board.members) || []).find((m) => m.id === director.memberId) : null;
     renderDirector(director, directorMember);
+    renderDirectorMembers(board);
     renderMembers(board);
     renderRules(board && board.rules);
     renderTasks(board);
     renderActivity(board);
     renderQueueBanner(board);
+  }
+
+  // Best-effort grouping: a member is "director-affiliated" if it holds the director role, or its
+  // self-reported display name follows the "director ..." helper convention. There is no
+  // server-side "spawned by the director" flag, so the convention match is a heuristic, not a
+  // guarantee -- it just keeps director-labeled helpers out of the worker roster (they render
+  // under the director card instead). The seat holder is excluded by id where this is used.
+  function isDirectorAffiliated(m) {
+    return m.role === "director" || /^director\b/i.test(m.displayName || "");
+  }
+
+  function isDormant(m, tasksById) {
+    return m.stale && !isHeadsDown(m, tasksById) && Date.now() - m.lastSeenAt > DORMANT_MS;
+  }
+
+  // Roster order: actively-working members float to the top, then engaged-but-blocked
+  // (input-required), then live-and-idle, then stale, then dormant, then evicted;
+  // most-recently-seen breaks ties within a rank.
+  function memberActivityRank(m, tasksById) {
+    if (m.evicted) return 5;
+    if (isDormant(m, tasksById)) return 4;
+    const t = m.currentTaskId ? tasksById.get(m.currentTaskId) : null;
+    // Progressing a task, including heads-down (stale poll lease, live task lease).
+    if (isHeadsDown(m, tasksById) || (t && (t.status === "working" || t.status === "assigned"))) return 0;
+    if (t && t.status === "input-required") return 1; // engaged but blocked on the director
+    if (!m.stale) return 2; // live and idle (available)
+    return 3; // stale but recently seen
+  }
+  function byActivity(tasksById) {
+    return (a, b) => memberActivityRank(a, tasksById) - memberActivityRank(b, tasksById) || b.lastSeenAt - a.lastSeenAt;
+  }
+
+  // Director-affiliated members render here, under the director card -- not in the worker roster.
+  function renderDirectorMembers(board) {
+    const list = el("director-members");
+    if (!list) return;
+    if (!state.show || !board) {
+      list.innerHTML = "";
+      return;
+    }
+    const directorId = board.director ? board.director.memberId : null;
+    const tasksById = new Map((board.tasks || []).map((t) => [t.id, t]));
+    const affiliated = (board.members || [])
+      .filter(
+        (m) =>
+          m.id !== directorId &&
+          !(m.kind === "other" && m.displayName === "human") &&
+          !m.evicted &&
+          isDirectorAffiliated(m),
+      )
+      .sort(byActivity(tasksById));
+    list.innerHTML = affiliated
+      .map((m) => {
+        const headsDown = isHeadsDown(m, tasksById);
+        const dot = headsDown ? "headsdown" : m.stale ? "stale" : "fresh";
+        const chat = m.sessionUrl
+          ? ` <a class="chat-open-small" href="${escapeHtml(m.sessionUrl)}" target="_blank" rel="noopener" title="open chat">&#8599;</a>`
+          : "";
+        const desc = m.displayName ? `<span class="hint member-desc">${escapeHtml(m.displayName)}</span>` : "";
+        return `<li>
+          <span class="dot ${dot}"></span>
+          <span class="member-id">${escapeHtml(m.id)}</span>${chat}
+          ${desc}
+          <span class="badge">${escapeHtml(m.kind)}</span>
+          <span class="badge role-${escapeHtml(m.role)}">${escapeHtml(m.role)}</span>
+          <span class="hint member-seen">${headsDown ? "heads-down &middot; " : m.stale ? "lease expired &middot; " : ""}seen ${relTime(m.lastSeenAt)}</span>
+        </li>`;
+      })
+      .join("");
   }
 
   // Server-held show rules, display-only (the callboard is a read-only window). Switches show as
@@ -296,36 +372,54 @@
 
   function renderMembers(board) {
     const list = el("members-list");
-    const toggle = el("evicted-toggle");
+    const evictedToggle = el("evicted-toggle");
+    const dormantToggle = el("dormant-toggle");
     if (!state.show) {
       list.innerHTML = `<li class="hint">no show selected</li>`;
-      if (toggle) toggle.hidden = true;
+      if (evictedToggle) evictedToggle.hidden = true;
+      if (dormantToggle) dormantToggle.hidden = true;
       return;
     }
-    // The current seat holder already renders on the director card; repeating it here made
-    // the director read as one more member. The kind:"other"/"human" row is api.ts's synthetic
-    // audit actor for HTTP/CLI writes, not a session anyone can talk to -- hide it too.
+    // Worker roster only. The seat holder renders on the director card, director-affiliated
+    // helpers group under it (renderDirectorMembers), and the kind:"other"/"human" row is api.ts's
+    // synthetic audit actor for HTTP/CLI writes, not a session anyone can talk to. Evicted members
+    // stay in the roster even if director-affiliated (renderDirectorMembers drops evicted rows), so
+    // "show evicted" can still surface them -- audit visibility must not fall through the grouping.
     const directorId = board && board.director ? board.director.memberId : null;
     const members = (board ? board.members : []).filter(
-      (m) => m.id !== directorId && !(m.kind === "other" && m.displayName === "human"),
+      (m) => m.id !== directorId && !(m.kind === "other" && m.displayName === "human") && (!isDirectorAffiliated(m) || m.evicted),
     );
-    const evictedCount = members.filter((m) => m.evicted).length;
-    if (toggle) {
-      toggle.hidden = evictedCount === 0 && !state.showEvicted;
-      toggle.textContent = state.showEvicted ? `hide evicted (${evictedCount})` : `show evicted (${evictedCount})`;
-    }
-    const visible = state.showEvicted ? members : members.filter((m) => !m.evicted);
-    if (!visible.length) {
-      list.innerHTML = members.length
-        ? `<li class="hint">no active members (${evictedCount} evicted hidden)</li>`
-        : `<li class="hint">no members registered yet</li>`;
-      return;
-    }
     const tasks = (board && board.tasks) || [];
     const tasksById = new Map(tasks.map((t) => [t.id, t]));
     const doneBy = new Map();
     for (const t of tasks) {
       if (t.status === "completed" && t.assignee) doneBy.set(t.assignee, (doneBy.get(t.assignee) || 0) + 1);
+    }
+
+    // Evicted (credential revoked) and dormant (long-stale, no live task) both collapse behind a
+    // toggle so the roster shows the live cast; the sort floors them regardless.
+    const evictedCount = members.filter((m) => m.evicted).length;
+    const dormantCount = members.filter((m) => !m.evicted && isDormant(m, tasksById)).length;
+    if (evictedToggle) {
+      evictedToggle.hidden = evictedCount === 0 && !state.showEvicted;
+      evictedToggle.textContent = state.showEvicted ? `hide evicted (${evictedCount})` : `show evicted (${evictedCount})`;
+    }
+    if (dormantToggle) {
+      dormantToggle.hidden = dormantCount === 0 && !state.showDormant;
+      dormantToggle.textContent = state.showDormant ? `hide dormant (${dormantCount})` : `show dormant (${dormantCount})`;
+    }
+
+    const visible = members
+      .filter((m) => (m.evicted ? state.showEvicted : isDormant(m, tasksById) ? state.showDormant : true))
+      .sort(byActivity(tasksById));
+    if (!visible.length) {
+      const hidden = [];
+      if (dormantCount) hidden.push(`${dormantCount} dormant`);
+      if (evictedCount) hidden.push(`${evictedCount} evicted`);
+      list.innerHTML = members.length
+        ? `<li class="hint">no active members (${hidden.join(", ")} hidden)</li>`
+        : `<li class="hint">no members registered yet</li>`;
+      return;
     }
     list.innerHTML = visible
       .map((m) => {
@@ -358,10 +452,9 @@
   }
 
   // Three columns of things worth reading here: what's waiting (queued), what's blocked on a
-  // human/director decision (needs input, plus messages addressed to `human`), and what agents
-  // reported back as failed/rejected. In-flight lives on the members hero (it IS what members
-  // are working on); completed work just gets merged, so neither earns a column -- both stay
-  // visible as totals in the tasks header.
+  // director decision (needs input), and what agents reported back as failed/rejected. In-flight
+  // lives on the members hero (it IS what members are working on); completed work just gets
+  // merged, so neither earns a column -- both stay visible as totals in the tasks header.
   const COLUMN_OF = {
     queued: "queued",
     "input-required": "needsinput",
@@ -380,7 +473,6 @@
   };
 
   const FAILURES_SHOWN = 20;
-  const HUMAN_MSG_TTL_MS = 24 * 60 * 60 * 1000;
   const ATTENTION_PULSE_MS = 2000; // must match attention-pulse duration in callboard.css
 
   // Every poll recreates the pulsing nodes, which would restart the animation at 0% and make
@@ -432,20 +524,9 @@
         shown = items.slice(0, FAILURES_SHOWN);
         overflow = `<li class="hint">showing latest ${FAILURES_SHOWN} of ${items.length}</li>`;
       }
-      let html = shown.map((t) => taskItemHtml(t, col)).join("") + overflow;
-      let count = items.length;
-      if (col === "needsinput" && board && board.escalations) {
-        // Messages addressed to `human` are escalations too; they live here so decisions
-        // waiting on you have exactly one home. There is no ack/read mechanism for the human,
-        // so bound by recency or a message would pulse amber forever.
-        const msgs = board.escalations.humanMessages
-          .filter((m) => Date.now() - m.createdAt < HUMAN_MSG_TTL_MS)
-          .slice(-5);
-        html += msgs.map(humanMessageHtml).join("");
-        count += msgs.length;
-      }
+      const html = shown.map((t) => taskItemHtml(t, col)).join("") + overflow;
       ul.innerHTML = html || `<li class="hint">empty</li>`;
-      setCount(col, count);
+      setCount(col, items.length);
     }
 
     document.querySelectorAll(".task-item").forEach((node) => {
@@ -463,13 +544,6 @@
     const report = t.notes && t.notes.length ? t.notes[t.notes.length - 1] : null;
     if (!report) return "";
     return `<div class="failure-report">${escapeHtml(report.author)}: ${escapeHtml(report.body)} <span class="hint">(${relTime(report.createdAt)})</span></div>`;
-  }
-
-  function humanMessageHtml(m) {
-    return `<li class="msg-item attention"${pulsePhaseAttr()}>
-      <div class="hint"><span class="who">${escapeHtml(m.fromId)}</span> -&gt; human &middot; ${relTime(m.createdAt)}</div>
-      <div>${escapeHtml(m.body)}</div>
-    </li>`;
   }
 
   function taskItemHtml(t, col) {
@@ -492,11 +566,17 @@
     const pendingUi = pending
       ? `<span class="badge badge-hold" title="withheld until a human releases it with: showrunner task release">PENDING RELEASE</span>`
       : "";
+    // A director has taken this escalation on (take_input): the worker was reassured and its wait
+    // clock reset, so this is being handled, not just sitting.
+    const takenUi = col === "needsinput" && t.inputTakenAt
+      ? `<span class="badge badge-taken" title="a director has taken this on; an answer is coming">director on it</span>`
+      : "";
     return `<li class="task-item${attention}${pending ? " task-hold" : ""}"${attention ? pulsePhaseAttr() : ""} data-id="${escapeHtml(t.id)}">
       <div class="task-row">
         <span class="task-title">${escapeHtml(t.title)}</span>
         ${statusBadge}
         <span class="badge">p${t.priority}</span>
+        ${takenUi}
         ${pendingUi}
       </div>
       <div class="hint">${escapeHtml(t.id)} &middot; ${t.assignee ? escapeHtml(t.assignee) : "unassigned"} &middot; attempt ${t.attempt} &middot; ${relTime(t.updatedAt)}</div>
@@ -599,6 +679,10 @@
   showSelect.addEventListener("change", () => selectShow(showSelect.value));
   el("evicted-toggle").addEventListener("click", () => {
     state.showEvicted = !state.showEvicted;
+    fetchState();
+  });
+  el("dormant-toggle").addEventListener("click", () => {
+    state.showDormant = !state.showDormant;
     fetchState();
   });
 

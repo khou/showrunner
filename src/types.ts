@@ -64,6 +64,10 @@ export interface Task {
   // False only while withheld by the human release gate (REQUIRE_TASK_RELEASE); an unreleased
   // task is queued but not claimable until a human releases it. Defaults true everywhere else.
   released: boolean;
+  // Set when a director "takes on" this task's input-required escalation (take_input): the
+  // worker's escalation-wait clock re-bases to this, so it keeps holding the parked task while
+  // the director fetches an answer. Null unless a currently-taken-on input-required task.
+  inputTakenAt: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -107,8 +111,10 @@ export type DirectTaskAction =
   | { type: "answer"; body: string }
   | { type: "approve" };
 
-// `to` may be a member id, or one of these role/broadcast addresses (DESIGN.md).
-export type MessageTarget = string | "director" | "all" | "human";
+// `to` may be a member id, or one of these role/broadcast addresses (DESIGN.md). There is no
+// "human" target: a director needing the human's input asks in its own agent session (the human
+// is present there), it does not route a message through the server.
+export type MessageTarget = string | "director" | "all";
 
 // 'note' marks a message delivered by save_note's realtime push (DESIGN.md "Shared notes: push
 // on save"), so a recipient's await_work can tell a note from an ordinary message without
@@ -261,6 +267,9 @@ export interface BoardTaskView {
   // Lets the callboard tell a heads-down assignee (stale poll lease, live task lease -- amber)
   // from a gone one (both expired -- red), mirroring the reaper's own judgment.
   leaseExpiresAt: number | null;
+  // Set once a director has taken on this input-required escalation (take_input); the callboard
+  // badges the card so the human sees the blocker is being handled, not just sitting.
+  inputTakenAt: number | null;
   notes?: TaskNote[]; // present only when verbose
 }
 
@@ -283,7 +292,6 @@ export interface BoardState {
   tasks: BoardTaskView[];
   escalations: {
     inputRequired: BoardTaskView[];
-    humanMessages: Message[];
   };
   rules: ShowRules; // current server-held show rules (the callboard renders these)
   recentMessages?: Message[]; // present only when verbose (DESIGN.md "Activity feed": notes + messages)

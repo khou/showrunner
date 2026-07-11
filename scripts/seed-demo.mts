@@ -50,7 +50,6 @@ const blocked = t('Invite links expire after 24h', 'Gateway change; see apps/gat
 store.claimNextTask(w3.id)
 store.updateTask(w3.id, blocked.id, { status: 'input-required', note: 'Should expired links show a renew flow or a plain 410?' })
 store.sendMessage(w3.id, 'director', 'Invite expiry UX: renew flow or plain 410? Brief does not say.', blocked.id)
-store.sendMessage(w3.id, 'human', 'Design call needed on invite expiry UX before I can finish t-invites.', blocked.id)
 store.saveNote(director.id, {
   body: 'Decision: expired invite links show "this link expired, ask for a new one" instead of a bare 410. Keeps the funnel from dead-ending. Applies to any future expiring-link flow, not just invites.',
   tags: ['decision'],
