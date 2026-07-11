@@ -626,6 +626,7 @@ export class Store {
         assignee: t.assignee,
         priority: t.priority,
         attempt: t.attempt,
+        createdAt: t.created_at,
         updatedAt: t.updated_at,
       };
       if (verbose) view.notes = this.getNotes(t.id);

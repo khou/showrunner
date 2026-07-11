@@ -58,8 +58,9 @@ export function createApiRoutes(store: Store, dbPath: string): Hono {
     const show = c.req.param("show");
     const board = store.getBoard(show, true);
     // Store.recentNotes returns newest-last (chronological, matching getRecentMessages'
-    // convention for feeds that get re-merged/sorted elsewhere); the callboard's NOTES panel
-    // renders this list as-is, so flip it to newest-first here.
+    // convention for feeds that get re-merged/sorted elsewhere). The callboard's activity
+    // feed re-sorts everything it merges, so the newest-first flip here is only for other
+    // /state consumers reading the list directly.
     const recentNotes = store.recentNotes(show, 10).reverse();
     return c.json({ ...board, recentNotes });
   });

@@ -1,8 +1,12 @@
 // Callboard: single-file, no build step. Polls GET /api/shows/:show/state every 2s and renders
-// director/members/tasks/notes/activity/escalations. A window, not a control panel (DESIGN.md):
+// director/members/tasks/activity/escalations. A window, not a control panel (DESIGN.md):
 // no task forms, no message box, no admin actions -- those live in the CLI against the same
 // /api the poll here reads. Steer the show by talking to the director agent in its own chat,
 // which the chat link below opens.
+//
+// Nomenclature: a "member" is any registered session; "worker" and "director" are roles a
+// member holds. UI copy says "member"; roles appear only as badges and in role-specific
+// phrases like the worker prompt.
 (function () {
   "use strict";
 
@@ -10,6 +14,7 @@
   const SHOW_KEY = "showrunner_show";
   const POLL_MS = 2000;
   const NOTE_BODY_TRIM = 140;
+  const ACTIVITY_LIMIT = 50;
 
   const state = {
     token: localStorage.getItem(TOKEN_KEY) || "",
@@ -92,6 +97,9 @@
       const url = new URL(location.href);
       url.searchParams.set("show", pick);
       history.replaceState(null, "", url.pathname + url.search + url.hash);
+      // Deep link / reload where the stored show already matches: selectShow was skipped
+      // above, so polling has to start here or the board sits on its placeholders forever.
+      if (!state.pollTimer) startPolling();
     }
   }
 
@@ -123,11 +131,16 @@
 
   async function fetchState() {
     if (!state.token || !state.show) return;
+    const show = state.show;
     try {
-      const data = await api(`/api/shows/${encodeURIComponent(state.show)}/state`);
+      const data = await api(`/api/shows/${encodeURIComponent(show)}/state`);
+      // A slow response can land after the user switched shows; rendering it would overwrite
+      // the new show's board until the next tick.
+      if (show !== state.show) return;
       render(data);
       lastPoll.textContent = `updated ${relTime(Date.now())}`;
     } catch (err) {
+      if (show !== state.show) return;
       lastPoll.textContent = `poll failed: ${err.message}`;
     }
   }
@@ -136,28 +149,31 @@
 
   function render(board) {
     renderDirector(board && board.director);
-    renderMembers(board ? board.members : []);
+    renderMembers(board);
     renderTasks(board ? board.tasks : []);
-    renderNotes(board);
     renderActivity(board);
     renderBanner(board && board.escalations);
-    renderWorkersBanner(board);
+    renderQueueBanner(board);
   }
 
-  function renderWorkersBanner(board) {
-    const workersBanner = el("workers-banner");
-    if (!workersBanner) return;
+  function renderQueueBanner(board) {
+    const queueBanner = el("queue-banner");
+    if (!queueBanner) return;
     if (!board || !state.show) {
-      workersBanner.hidden = true;
+      queueBanner.hidden = true;
       return;
     }
     const queued = (board.tasks || []).filter((t) => t.status === "queued").length;
-    const liveWorkers = (board.members || []).filter((m) => m.role === "worker" && !m.stale).length;
+    // The kind:"other"/displayName:"human" row is api.ts's stand-in for HTTP/CLI actions
+    // (registered with role "worker"); it never pulls tasks, so don't let it hide the banner.
+    const liveWorkers = (board.members || []).filter(
+      (m) => m.role === "worker" && !m.stale && !(m.kind === "other" && m.displayName === "human"),
+    ).length;
     if (queued > 0 && liveWorkers === 0) {
-      workersBanner.hidden = false;
-      workersBanner.innerHTML = `<strong>${queued} task${queued === 1 ? "" : "s"} queued</strong> — no live workers. Open a session and say: <code>You're a showrunner worker.</code>`;
+      queueBanner.hidden = false;
+      queueBanner.innerHTML = `<strong>${queued} task${queued === 1 ? "" : "s"} queued</strong>, no live worker members. Open a session and say: <code>You're a showrunner worker.</code>`;
     } else {
-      workersBanner.hidden = true;
+      queueBanner.hidden = true;
     }
   }
 
@@ -195,30 +211,58 @@
     `;
   }
 
-  function renderMembers(members) {
+  // The "now" line: what this member is doing right now, joined to the task list so it reads
+  // as a title, not an opaque task id.
+  function memberNowHtml(m, tasksById) {
+    if (!m.currentTaskId) {
+      return `<div class="member-now idle"><span class="now-label">idle</span></div>`;
+    }
+    const t = tasksById.get(m.currentTaskId);
+    if (!t) {
+      return `<div class="member-now"><span class="now-label">on</span> <span class="now-title">${escapeHtml(m.currentTaskId)}</span></div>`;
+    }
+    return `<div class="member-now">
+      <span class="now-label status-${escapeHtml(t.status)}">${escapeHtml(t.status)}</span>
+      <span class="now-title" title="${escapeHtml(t.id)}">${escapeHtml(t.title)}</span>
+      <span class="hint">${relTime(t.updatedAt)}</span>
+    </div>`;
+  }
+
+  function renderMembers(board) {
     const list = el("members-list");
     if (!state.show) {
       list.innerHTML = `<li class="hint">no show selected</li>`;
       return;
     }
+    const members = board ? board.members : [];
     if (!members.length) {
       list.innerHTML = `<li class="hint">no members registered yet</li>`;
       return;
     }
+    const tasks = (board && board.tasks) || [];
+    const tasksById = new Map(tasks.map((t) => [t.id, t]));
+    const doneBy = new Map();
+    for (const t of tasks) {
+      if (t.status === "completed" && t.assignee) doneBy.set(t.assignee, (doneBy.get(t.assignee) || 0) + 1);
+    }
     list.innerHTML = members
       .map((m) => {
         const dot = m.stale ? "stale" : "fresh";
-        const name = escapeHtml(m.displayName || m.id);
         const chat = m.sessionUrl
           ? ` <a class="chat-open-small" href="${escapeHtml(m.sessionUrl)}" target="_blank" rel="noopener" title="open chat">&#8599;</a>`
           : "";
-        return `<li>
-          <span class="dot ${dot}"></span>
-          <span>${name}${chat}</span>
-          <span class="badge">${escapeHtml(m.kind)}</span>
-          <span class="badge">${escapeHtml(m.role)}</span>
-          <span class="hint">${m.currentTaskId ? `on ${escapeHtml(m.currentTaskId)}` : "idle"}</span>
-          <span class="hint" style="margin-left:auto">seen ${relTime(m.lastSeenAt)}</span>
+        const desc = m.displayName ? `<span class="hint member-desc">${escapeHtml(m.displayName)}</span>` : "";
+        return `<li class="member-item">
+          <div class="member-row">
+            <span class="dot ${dot}"></span>
+            <span class="member-id">${escapeHtml(m.id)}</span>${chat}
+            ${desc}
+            <span class="badge">${escapeHtml(m.kind)}</span>
+            <span class="badge role-${escapeHtml(m.role)}">${escapeHtml(m.role)}</span>
+            <span class="hint member-seen">${m.stale ? "lease expired &middot; " : ""}seen ${relTime(m.lastSeenAt)}</span>
+          </div>
+          ${memberNowHtml(m, tasksById)}
+          <div class="hint member-meta">${doneBy.get(m.id) || 0} done &middot; joined ${relTime(m.registeredAt)}</div>
         </li>`;
       })
       .join("");
@@ -235,6 +279,16 @@
     canceled: "done",
   };
 
+  // Per-column order. Queued mirrors await_work's claim order (priority DESC, age ASC) so the
+  // top of the column is first in line -- modulo dependencies and pinned assignees, which
+  // claimNextTask also honors; needs-input floats the longest-blocked decision to the top.
+  const SORT_OF = {
+    queued: (a, b) => b.priority - a.priority || a.createdAt - b.createdAt,
+    inflight: (a, b) => b.updatedAt - a.updatedAt,
+    needsinput: (a, b) => a.updatedAt - b.updatedAt,
+    done: (a, b) => b.updatedAt - a.updatedAt,
+  };
+
   function renderTasks(tasks) {
     const buckets = { queued: [], inflight: [], needsinput: [], done: [] };
     for (const t of tasks) (buckets[COLUMN_OF[t.status]] || buckets.done).push(t);
@@ -245,7 +299,8 @@
         ul.innerHTML = `<li class="hint">no show selected</li>`;
         continue;
       }
-      ul.innerHTML = items.length ? items.map(taskItemHtml).join("") : `<li class="hint">empty</li>`;
+      items.sort(SORT_OF[col]);
+      ul.innerHTML = items.length ? items.map((t) => taskItemHtml(t, col)).join("") : `<li class="hint">empty</li>`;
     }
 
     document.querySelectorAll(".task-item").forEach((node) => {
@@ -257,16 +312,21 @@
     });
   }
 
-  function taskItemHtml(t) {
+  function taskItemHtml(t, col) {
     const expanded = state.expanded.has(t.id);
     const notes = expanded && t.notes
       ? `<div class="task-notes">${t.notes
           .map((n) => `<div>${escapeHtml(n.author)}: ${escapeHtml(n.body)} <span class="hint">(${relTime(n.createdAt)})</span></div>`)
           .join("")}</div>`
       : "";
+    // queued/needs-input columns are single-status; the mixed columns badge each task's status.
+    const statusBadge = col === "inflight" || col === "done"
+      ? `<span class="badge status-${escapeHtml(t.status)}">${escapeHtml(t.status)}</span>`
+      : "";
     return `<li class="task-item" data-id="${escapeHtml(t.id)}">
       <div class="task-row">
         <span class="task-title">${escapeHtml(t.title)}</span>
+        ${statusBadge}
         <span class="badge">p${t.priority}</span>
       </div>
       <div class="hint">${escapeHtml(t.id)} &middot; ${t.assignee ? escapeHtml(t.assignee) : "unassigned"} &middot; attempt ${t.attempt} &middot; ${relTime(t.updatedAt)}</div>
@@ -274,51 +334,38 @@
     </li>`;
   }
 
-  function renderNotes(board) {
-    const list = el("notes-list");
-    if (!board) {
-      list.innerHTML = `<li class="hint">no show selected</li>`;
-      return;
-    }
-    const notes = board.recentNotes || [];
-    if (!notes.length) {
-      list.innerHTML = `<li class="hint">no notes yet</li>`;
-      return;
-    }
-    // board.recentNotes arrives newest-first (api.ts); render as-is.
-    list.innerHTML = notes.map(noteItemHtml).join("");
-  }
-
-  function noteItemHtml(n) {
-    const tags = (n.tags || []).map((t) => `<span class="badge">${escapeHtml(t)}</span>`).join("");
-    const body = n.body.length > NOTE_BODY_TRIM ? `${n.body.slice(0, NOTE_BODY_TRIM)}…` : n.body;
-    return `<li>
-      <div class="note-row">
-        <span class="who">${escapeHtml(n.author)}</span>
-        ${tags}
-        <span class="when">${relTime(n.createdAt)}</span>
-      </div>
-      <div class="note-body">${escapeHtml(body)}</div>
-    </li>`;
-  }
-
+  // One demoted feed (collapsed by default): shared notes + task journal entries + messages,
+  // newest first. The board's job is members + queue; this is the paper trail when you need it.
   function renderActivity(board) {
     const list = el("activity-list");
+    const summary = el("activity-summary");
     if (!board) {
       list.innerHTML = `<li class="hint">no show selected</li>`;
+      if (summary) summary.textContent = "activity";
       return;
     }
-    const notes = [];
-    for (const t of board.tasks) {
-      for (const n of t.notes || []) notes.push({ who: n.author, body: `[${t.title}] ${n.body}`, at: n.createdAt });
+    const entries = [];
+    for (const n of board.recentNotes || []) {
+      const tags = (n.tags || []).map((t) => `<span class="badge">${escapeHtml(t)}</span>`).join(" ");
+      const body = n.body.length > NOTE_BODY_TRIM ? `${n.body.slice(0, NOTE_BODY_TRIM)}…` : n.body;
+      entries.push({ at: n.createdAt, html: `<span class="who">${escapeHtml(n.author)}</span> <span class="badge">note</span> ${tags} ${escapeHtml(body)}` });
+    }
+    for (const t of board.tasks || []) {
+      for (const n of t.notes || []) {
+        entries.push({ at: n.createdAt, html: `<span class="who">${escapeHtml(n.author)}</span> [${escapeHtml(t.title)}] ${escapeHtml(n.body)}` });
+      }
     }
     for (const m of board.recentMessages || []) {
-      notes.push({ who: m.fromId, body: `-> ${m.toId}: ${m.body}`, at: m.createdAt });
+      // kind:"note" messages are save_note's realtime echoes to overlapping members; the note
+      // itself is already in recentNotes above, so rendering the echoes would duplicate it.
+      if (m.kind === "note") continue;
+      entries.push({ at: m.createdAt, html: `<span class="who">${escapeHtml(m.fromId)}</span> -&gt; ${escapeHtml(m.toId)}: ${escapeHtml(m.body)}` });
     }
-    notes.sort((a, b) => b.at - a.at);
-    const top = notes.slice(0, 50);
+    entries.sort((a, b) => b.at - a.at);
+    const top = entries.slice(0, ACTIVITY_LIMIT);
+    if (summary) summary.textContent = top.length ? `activity (${top.length})` : "activity";
     list.innerHTML = top.length
-      ? top.map((n) => `<li><span class="who">${escapeHtml(n.who)}</span> ${escapeHtml(n.body)} <span class="when">${relTime(n.at)}</span></li>`).join("")
+      ? top.map((e) => `<li><span class="entry">${e.html}</span><span class="when">${relTime(e.at)}</span></li>`).join("")
       : `<li class="hint">no activity yet</li>`;
   }
 
