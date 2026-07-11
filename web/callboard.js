@@ -21,6 +21,7 @@
     show: localStorage.getItem(SHOW_KEY) || "",
     expanded: new Set(), // task ids with journal expanded
     pollTimer: null,
+    showEvicted: false,
   };
 
   const el = (id) => document.getElementById(id);
@@ -147,7 +148,11 @@
   // --- rendering ---
 
   function render(board) {
-    renderDirector(board && board.director);
+    const director = board && board.director;
+    // The seat holder's member row is filtered out of the members list, so its
+    // liveness/identity details render on the director card instead.
+    const directorMember = director ? ((board && board.members) || []).find((m) => m.id === director.memberId) : null;
+    renderDirector(director, directorMember);
     renderMembers(board);
     renderRules(board && board.rules);
     renderTasks(board);
@@ -189,8 +194,15 @@
     const queued = (board.tasks || []).filter((t) => t.status === "queued").length;
     // The kind:"other"/displayName:"human" row is api.ts's stand-in for HTTP/CLI actions
     // (registered with role "worker"); it never pulls tasks, so don't let it hide the banner.
+    // Evicted members can't pull tasks either (credential revoked), so they don't count as
+    // live; heads-down members do (they'll re-poll once their current task lands).
+    const tasksById = new Map(((board && board.tasks) || []).map((t) => [t.id, t]));
     const liveWorkers = (board.members || []).filter(
-      (m) => m.role === "worker" && !m.stale && !(m.kind === "other" && m.displayName === "human"),
+      (m) =>
+        m.role === "worker" &&
+        (!m.stale || isHeadsDown(m, tasksById)) &&
+        !m.evicted &&
+        !(m.kind === "other" && m.displayName === "human"),
     ).length;
     if (queued > 0 && liveWorkers === 0) {
       queueBanner.hidden = false;
@@ -226,7 +238,7 @@
     </div>`;
   }
 
-  function renderDirector(director) {
+  function renderDirector(director, member) {
     const body = el("director-body");
     if (!state.show) {
       body.textContent = "no show selected";
@@ -244,13 +256,25 @@
     // A stale holder still holds the seat (no transfer by timeout); surface the recovery prompt so
     // the human can spin up a replacement director session that takes over.
     const recovery = director.stale ? recoveryPromptHtml() : "";
+    const desc = member && member.displayName ? ` <span class="hint">${escapeHtml(member.displayName)}</span>` : "";
+    const kind = member ? ` <span class="badge">${escapeHtml(member.kind)}</span>` : "";
+    const seen = member ? ` &middot; seen ${relTime(member.lastSeenAt)}` : "";
     body.innerHTML = `
-      <div><span class="dot ${dot}"></span> ${escapeHtml(director.memberId)}</div>
-      <div class="hint">epoch ${director.epoch} &middot; ${director.stale ? "lease expired (still holds the seat)" : "lease active"}</div>
+      <div><span class="dot ${dot}"></span> ${escapeHtml(director.memberId)}${desc}${kind}</div>
+      <div class="hint">epoch ${director.epoch} &middot; ${director.stale ? "lease expired (still holds the seat)" : "lease active"}${seen}</div>
       ${prov}
       <div class="chat-link">${chatLinkHtml(director)}</div>
       ${recovery}
     `;
+  }
+
+  // A member whose poll lease lapsed while it holds a live in-flight task is heads-down
+  // (working, quiet), not gone: the reaper judges assigned/working tasks by the task lease
+  // alone, so the board mirrors that instead of flashing red at every tool-free stretch.
+  function isHeadsDown(m, tasksById) {
+    if (!m.stale || !m.currentTaskId) return false;
+    const t = tasksById.get(m.currentTaskId);
+    return !!(t && (t.status === "assigned" || t.status === "working") && t.leaseExpiresAt && t.leaseExpiresAt > Date.now());
   }
 
   // The "now" line: what this member is doing right now, joined to the task list so it reads
@@ -272,13 +296,29 @@
 
   function renderMembers(board) {
     const list = el("members-list");
+    const toggle = el("evicted-toggle");
     if (!state.show) {
       list.innerHTML = `<li class="hint">no show selected</li>`;
+      if (toggle) toggle.hidden = true;
       return;
     }
-    const members = board ? board.members : [];
-    if (!members.length) {
-      list.innerHTML = `<li class="hint">no members registered yet</li>`;
+    // The current seat holder already renders on the director card; repeating it here made
+    // the director read as one more member. The kind:"other"/"human" row is api.ts's synthetic
+    // audit actor for HTTP/CLI writes, not a session anyone can talk to -- hide it too.
+    const directorId = board && board.director ? board.director.memberId : null;
+    const members = (board ? board.members : []).filter(
+      (m) => m.id !== directorId && !(m.kind === "other" && m.displayName === "human"),
+    );
+    const evictedCount = members.filter((m) => m.evicted).length;
+    if (toggle) {
+      toggle.hidden = evictedCount === 0 && !state.showEvicted;
+      toggle.textContent = state.showEvicted ? `hide evicted (${evictedCount})` : `show evicted (${evictedCount})`;
+    }
+    const visible = state.showEvicted ? members : members.filter((m) => !m.evicted);
+    if (!visible.length) {
+      list.innerHTML = members.length
+        ? `<li class="hint">no active members (${evictedCount} evicted hidden)</li>`
+        : `<li class="hint">no members registered yet</li>`;
       return;
     }
     const tasks = (board && board.tasks) || [];
@@ -287,9 +327,10 @@
     for (const t of tasks) {
       if (t.status === "completed" && t.assignee) doneBy.set(t.assignee, (doneBy.get(t.assignee) || 0) + 1);
     }
-    list.innerHTML = members
+    list.innerHTML = visible
       .map((m) => {
-        const dot = m.stale ? "stale" : "fresh";
+        const headsDown = isHeadsDown(m, tasksById);
+        const dot = headsDown ? "headsdown" : m.stale ? "stale" : "fresh";
         const chat = m.sessionUrl
           ? ` <a class="chat-open-small" href="${escapeHtml(m.sessionUrl)}" target="_blank" rel="noopener" title="open chat">&#8599;</a>`
           : "";
@@ -307,7 +348,7 @@
             <span class="badge role-${escapeHtml(m.role)}">${escapeHtml(m.role)}</span>
             ${inviteBadge}
             ${evictedBadge}
-            <span class="hint member-seen">${m.stale ? "lease expired &middot; " : ""}seen ${relTime(m.lastSeenAt)}</span>
+            <span class="hint member-seen">${headsDown ? "heads-down &middot; " : m.stale ? "lease expired &middot; " : ""}seen ${relTime(m.lastSeenAt)}</span>
           </div>
           ${m.evicted ? "" : memberNowHtml(m, tasksById)}
           <div class="hint member-meta">${doneBy.get(m.id) || 0} done &middot; joined ${relTime(m.registeredAt)}</div>
@@ -556,6 +597,10 @@
     loadShows();
   });
   showSelect.addEventListener("change", () => selectShow(showSelect.value));
+  el("evicted-toggle").addEventListener("click", () => {
+    state.showEvicted = !state.showEvicted;
+    fetchState();
+  });
 
   if (state.token) loadShows();
   setInterval(() => {

@@ -39,7 +39,7 @@ is 14 tools.
    calls at ~60s (error -32001, not configurable, progress notifications do
    NOT reset its timer); Claude Code's HTTP first-byte budget has a 60s
    minimum; Fly's proxy drops connections after 60s with no bytes. So the
-   server holds `await_work` for **25s** (env-tunable — Cursor's limit changed
+   server holds `await_work` for **50s** (env-tunable — Cursor's limit changed
    three times in a year), returns an explicit `nothing` result, and the
    worker immediately re-polls.
 3. **Static bearer tokens are the only auth that works everywhere.** Cloud
@@ -326,7 +326,7 @@ matter).
    self-reports (cloud sessions their URL, local CLI sessions a resume
    command); the callboard renders it.
 2. `await_work({member_id, wait_seconds?})` — **the long-poll.** Holds up to
-   `min(wait_seconds, POLL_HOLD_SECONDS=25)`. Returns first-available of:
+   `min(wait_seconds, POLL_HOLD_SECONDS=50)`. Returns first-available of:
    a newly claimed task (worker), unread messages, direction-change or
    review-needed notices (director), else `{status:"nothing", hint}`.
    Renews the member lease. Callers re-poll immediately; the server adds
@@ -462,7 +462,7 @@ Auth: `Authorization: Bearer` (or `?token=` once → cookie). Two tokens:
   (autostop + long-poll is exactly the wrong pair), 1GB volume mounted at
   `/data` for SQLite. `fly secrets set SHOWRUNNER_TOKEN=... SHOWRUNNER_WORKER_TOKEN=...`.
 - **Env knobs:** `SHOWRUNNER_TOKEN` (required), `SHOWRUNNER_WORKER_TOKEN`
-  (optional), `PORT`, `DATA_DIR`, `POLL_HOLD_SECONDS=25`, `WORKER_LEASE_S=90`,
+  (optional), `PORT`, `DATA_DIR`, `POLL_HOLD_SECONDS=50`, `WORKER_LEASE_S=150`,
   `TASK_LEASE_S=900`, `DIRECTION_LEASE_S=600`, `NOTE_MAX_CHARS=2000`,
   `NOTES_PER_TASK=4`. Rule seed-defaults for new shows: `REQUIRE_TASK_RELEASE=false`,
   `REQUIRE_HUMAN_MERGE_APPROVAL=false`, `WORKER_NOTE_PROPAGATION=true`,

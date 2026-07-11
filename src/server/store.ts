@@ -1009,6 +1009,7 @@ export class Store {
         createdAt: t.created_at,
         updatedAt: t.updated_at,
         released: t.released !== 0,
+        leaseExpiresAt: t.lease_expires_at,
       };
       if (verbose) view.notes = this.getNotes(t.id);
       return view;

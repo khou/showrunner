@@ -258,6 +258,9 @@ export interface BoardTaskView {
   // False when withheld by the human release gate: a queued task that no worker can claim until
   // a human releases it. The callboard surfaces these as a distinct "pending release" state.
   released: boolean;
+  // Lets the callboard tell a heads-down assignee (stale poll lease, live task lease -- amber)
+  // from a gone one (both expired -- red), mirroring the reaper's own judgment.
+  leaseExpiresAt: number | null;
   notes?: TaskNote[]; // present only when verbose
 }
 
@@ -385,7 +388,9 @@ export interface EnvConfig extends LeaseConfig, NoteConfig {
   sweepIntervalS: number;
 }
 
-const DEFAULT_LEASES: LeaseConfig = { workerLeaseS: 90, taskLeaseS: 900, directionLeaseS: 600 };
+// workerLeaseS covers ~3 idle poll cycles (POLL_HOLD_SECONDS=50 + re-poll overhead) so an idle
+// worker never flickers stale between polls; a heads-down worker is judged by the task lease.
+const DEFAULT_LEASES: LeaseConfig = { workerLeaseS: 150, taskLeaseS: 900, directionLeaseS: 600 };
 const DEFAULT_NOTES: NoteConfig = { noteMaxChars: 2000, notesPerTask: 4 };
 // OOTB rule defaults (seeded into a new show; env vars below override deployment-wide). Automation
 // stays frictionless for solo shows: release gate off, merge approval off, notes propagate.
@@ -458,7 +463,9 @@ export function readEnvConfig(env: NodeJS.ProcessEnv = process.env): EnvConfig {
     token: directorToken,
     port: parsePositiveInt(env.PORT, 8080),
     dataDir: env.DATA_DIR && env.DATA_DIR.length > 0 ? env.DATA_DIR : "/data",
-    pollHoldSeconds: parsePositiveInt(env.POLL_HOLD_SECONDS, 25),
+    // Must stay clear of the three ~60s connection walls (Cursor tool-call kill, Claude Code
+    // first-byte budget, Fly proxy no-bytes drop) -- see DESIGN.md; 50s leaves ~10s of margin.
+    pollHoldSeconds: parsePositiveInt(env.POLL_HOLD_SECONDS, 50),
     sweepIntervalS: parsePositiveInt(env.SWEEP_INTERVAL_S, 5),
     ...readLeaseConfig(env),
     ...readNoteConfig(env),

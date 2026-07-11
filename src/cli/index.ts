@@ -414,6 +414,8 @@ edit policy by editing a repo file.
 ## Conventions workers must follow
 
 - Branch per task: \`show/<task_id>-<slug>\` (protocol default).
+- Subagents: fan out freely inside your session, but a subagent never
+  registers as a member -- it reports to the session that spawned it.
 - <build/test command a task is not done without>
 - <code style, commit style, or review notes>
 

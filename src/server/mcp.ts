@@ -393,7 +393,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     "register",
     {
       description:
-        "Join a show as a new member; returns member_id, member_secret, and the worker/director protocol. If the show's requireInvite rule is on, a worker-token registration must pass a valid `invite` (minted by the director); director-token registration is exempt.",
+        "Join a show as a new member; returns member_id, member_secret, and the worker/director protocol. Top-level sessions only: a subagent spawned by a member's session must NOT register -- it works under its parent's identity. If the show's requireInvite rule is on, a worker-token registration must pass a valid `invite` (minted by the director); director-token registration is exempt.",
       inputSchema: {
         show: z.string().min(1).describe("Show name. Priority: user-named, else .showrunner file at repo root, else git origin basename, else directory name."),
         kind: MEMBER_KIND,
