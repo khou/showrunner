@@ -28,7 +28,7 @@ prior system ships.
 
 Deliberately **not**: a runner UI, a worktree manager, an A2A node, a product.
 State is one SQLite file; the dashboard is one static page; the tool surface
-is 12 tools.
+is 14 tools.
 
 ## Constraints that shaped the design (research findings)
 
@@ -94,7 +94,9 @@ shows      { name PK, created_at, config_json }
 show_rules { show PK, version, switches_json, policy, updated_at, updated_by }
 members    { id PK, show, kind, display_name, role, registered_at,
              last_seen_at, lease_expires_at, current_task_id, secret_hash,
-             rules_version_seen }
+             rules_version_seen, invite_id, evicted_at, evicted_by }
+invites    { id PK, show, token_hash, minted_by, minted_at, expires_at,
+             used_at, used_by }   -- single-use, show-scoped, hash-only
 direction  { show PK, director_id, epoch, lease_expires_at }   -- one row per show
 direction_events { id PK, show, actor, method, epoch, created_at }  -- audit log
 tasks      { id PK, show, context_id, title, brief, files_hint_json,
@@ -219,8 +221,9 @@ into two parts, and the schema is explicit about which is which:
   code path it governs: `requireTaskRelease` (the release gate, in
   `createTask`/`claimNextTask`), `workerNotePropagation` (in `pushNote` +
   `notesForTask`), `artifactTextMaxChars`/`artifactDataMaxBytes` (in
-  `updateTask`), and `requireHumanMergeApproval` (delivered, agent-followed --
-  there is no merge through the server to block).
+  `updateTask`), `requireInvite` (in `register`), and `requireHumanMergeApproval`
+  (delivered, agent-followed -- there is no merge through the server to block;
+  pair with the repo's branch protection for an enforced gate).
 - **`policy`** -- advisory prose, delivered but **never enforced**.
 
 New shows are seeded with OOTB defaults (favoring automation: release gate off,
@@ -237,6 +240,30 @@ Delivered rules are tagged authenticated director policy, distinct from the
 
 Sessions may fan out their own subagents to speed work; showrunner membership
 and task ownership stay with the registered session.
+
+### Membership: invites and eviction (director-controlled)
+
+Who is in a show is the director's call, not anyone holding the shared worker
+token. Two director-token, epoch-fenced tools plus one rule switch:
+
+- `mint_invite` issues a **single-use, show-scoped** invite that expires; the DB
+  stores only its SHA-256 (member-secret discipline), plaintext shown once.
+  `register` exchanges an invite for the member's individual credential,
+  consuming it atomically and recording provenance (which invite, minted by
+  whom) on the member row.
+- The `requireInvite` switch (default off) gates worker-token registration on a
+  valid invite; the director token is exempt. Off keeps solo shows frictionless;
+  on is how a show admits a specific outside agent.
+- `evict_member` revokes the target's credential (`secret_hash -> NULL`, so every
+  later call is `unauthorized_member`), requeues its in-flight task (attempt+1,
+  journal kept), stamps the membership evicted (actor/time -- the audit trail on
+  the row), and notifies the cast. Evicted members stay visible on `get_board`
+  and the callboard, flagged. Eviction is durable only with `requireInvite` on;
+  otherwise an evicted party can re-register with the shared worker token.
+
+A compromised director can mint/evict at will -- membership control is only as
+trustworthy as the director token; recovery is takeover + token rotation (see
+docs/SECURITY.md).
 
 ## Shared notes: realtime memory
 
@@ -279,7 +306,7 @@ after finishing one, save a note if you learned something the next agent
 would want (with `files_hint` of the affected globs). Directors record
 generalizable decisions (especially answers to `input-required`) as notes.
 
-## MCP tool surface (12 tools)
+## MCP tool surface (14 tools)
 
 Everything takes/returns compact JSON. `member_id` is explicit in every call
 (the server is stateless per-request; reconnects and session restarts don't
@@ -344,6 +371,12 @@ matter).
    the show's server-held rules (machine-enforced switches and/or advisory
    policy prose). Bumps `version`, is audited (`updated_by`), and notifies the
    cast. The human's equivalent is the admin `/api` route (callboard / CLI).
+12. `mint_invite({member_id, epoch, ttl_seconds?})` → `{invite_token}` — mint a
+   single-use, show-scoped invite (hash stored, plaintext once, expires) so a
+   specific outside agent can register when `requireInvite` is on.
+13. `evict_member({member_id, epoch, target})` — revoke a member's credential
+   (all later calls `unauthorized_member`), requeue its in-flight task
+   (attempt+1, journal kept), stamp the membership evicted, notify the cast.
 
 ### The one-line-prompt trick
 
@@ -433,8 +466,9 @@ Auth: `Authorization: Bearer` (or `?token=` once → cookie). Two tokens:
   `TASK_LEASE_S=900`, `DIRECTION_LEASE_S=600`, `NOTE_MAX_CHARS=2000`,
   `NOTES_PER_TASK=4`. Rule seed-defaults for new shows: `REQUIRE_TASK_RELEASE=false`,
   `REQUIRE_HUMAN_MERGE_APPROVAL=false`, `WORKER_NOTE_PROPAGATION=true`,
-  `ARTIFACT_TEXT_MAX_CHARS=10000`, `ARTIFACT_DATA_MAX_BYTES=16384` (per-show
-  values live in the show's rules and are changed with `update_rules`).
+  `REQUIRE_INVITE=false`, `ARTIFACT_TEXT_MAX_CHARS=10000`,
+  `ARTIFACT_DATA_MAX_BYTES=16384` (per-show values live in the show's rules and
+  are changed with `update_rules`).
 - **Reclaim sweep:** one `setInterval` (5s) expires leases, requeues tasks,
   wakes relevant waiters. Restart-safe because all state is in SQLite.
 

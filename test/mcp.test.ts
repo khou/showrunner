@@ -835,6 +835,101 @@ describe("release_direction + timeout no longer opens the seat", () => {
   });
 });
 
+describe("invites + require_invite (director-controlled membership)", () => {
+  it("mint_invite is director-gated and epoch-fenced", async () => {
+    const { store } = newStore();
+    const workerClient = await connectClient(store, { ...FAST_CONFIG, authLevel: "worker" });
+    const wreg = await callTool(workerClient, "register", { show: "myshow", kind: "claude-local" });
+    const w = wreg.data as { member_id: string; member_secret: string };
+    const forbidden = await callTool(workerClient, "mint_invite", { member_id: w.member_id, member_secret: w.member_secret, epoch: 1 });
+    expect(forbidden.data).toMatchObject({ status: "forbidden", reason: "director token required" });
+
+    // Director side: epoch fencing.
+    const client = await connectClient(store);
+    const a = reg(store, "myshow");
+    const b = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: a.id, member_secret: a.secret });
+    store.claimDirection(b.id, true); // a is stale at epoch 1
+    const stale = await callTool(client, "mint_invite", { member_id: a.id, member_secret: a.secret, epoch: 1 });
+    expect(stale.data).toMatchObject({ status: "superseded" });
+  });
+
+  it("require_invite refuses worker registration without an invite, and accepts a minted one", async () => {
+    const { store } = newStore();
+    const director = reg(store, "myshow");
+    store.updateShowRules("myshow", { switches: { requireInvite: true } }, "human");
+
+    // Worker-token registration with no invite is refused.
+    const workerClient = await connectClient(store, { ...FAST_CONFIG, authLevel: "worker" });
+    const refused = await callTool(workerClient, "register", { show: "myshow", kind: "claude-local" });
+    expect(refused.isError).toBe(true);
+    expect(refused.data).toMatchObject({ status: "invite_required" });
+
+    // Director mints an invite (director client), worker exchanges it.
+    const dirClient = await connectClient(store);
+    await callTool(dirClient, "claim_direction", { member_id: director.id, member_secret: director.secret });
+    const minted = await callTool(dirClient, "mint_invite", { member_id: director.id, member_secret: director.secret, epoch: 1 });
+    const token = (minted.data as { invite_token: string }).invite_token;
+    expect(token).toBeTruthy();
+
+    const joined = await callTool(workerClient, "register", { show: "myshow", kind: "claude-local", invite: token });
+    expect(joined.isError).toBe(false);
+    expect((joined.data as { member_id: string }).member_id).toBeTruthy();
+
+    // Reusing the same invite is rejected (single-use).
+    const reused = await callTool(workerClient, "register", { show: "myshow", kind: "claude-local", invite: token });
+    expect(reused.isError).toBe(true);
+    expect(reused.data).toMatchObject({ status: "invite_rejected", reason: "used" });
+  });
+
+  it("director-token registration is exempt from require_invite", async () => {
+    const { store } = newStore();
+    reg(store, "myshow");
+    store.updateShowRules("myshow", { switches: { requireInvite: true } }, "human");
+    const dirClient = await connectClient(store); // director authLevel
+    const res = await callTool(dirClient, "register", { show: "myshow", kind: "claude-local" });
+    expect(res.isError).toBe(false);
+    expect((res.data as { member_id: string }).member_id).toBeTruthy();
+  });
+});
+
+describe("evict_member", () => {
+  it("director-gated, epoch-fenced, and can't evict self", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const a = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: a.id, member_secret: a.secret });
+    const self = await callTool(client, "evict_member", { member_id: a.id, member_secret: a.secret, epoch: 1, target: a.id });
+    expect(self.isError).toBe(true);
+    expect(self.data).toMatchObject({ status: "error" });
+
+    const workerClient = await connectClient(store, { ...FAST_CONFIG, authLevel: "worker" });
+    const wreg = await callTool(workerClient, "register", { show: "myshow", kind: "claude-local" });
+    const w = wreg.data as { member_id: string; member_secret: string };
+    const forbidden = await callTool(workerClient, "evict_member", { member_id: w.member_id, member_secret: w.member_secret, epoch: 1, target: a.id });
+    expect(forbidden.data).toMatchObject({ status: "forbidden" });
+  });
+
+  it("revokes the target's credential so its next authed call is unauthorized, and requeues its task", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const director = reg(store, "myshow");
+    const worker = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: director.id, member_secret: director.secret });
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
+    store.claimNextTask(worker.id);
+
+    const evicted = await callTool(client, "evict_member", { member_id: director.id, member_secret: director.secret, epoch: 1, target: worker.id });
+    expect(evicted.data).toMatchObject({ status: "evicted", member_id: worker.id, requeued_task_id: task.id });
+
+    // The evicted worker's credential no longer authenticates any tool call.
+    const afterEvict = await callTool(client, "update_task", { member_id: worker.id, member_secret: worker.secret, task_id: task.id, note: "still here?" });
+    expect(afterEvict.data).toMatchObject({ status: "unauthorized_member" });
+    // The task is back in the queue for someone else.
+    expect(store.getBoard("myshow").tasks.find((t) => t.id === task.id)?.status).toBe("queued");
+  });
+});
+
 describe("register delivers current rules as authenticated policy", () => {
   it("includes the full rules and a director-policy trust tag", async () => {
     const { store } = newStore();

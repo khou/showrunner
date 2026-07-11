@@ -41,9 +41,15 @@ There's one director per show, held as a lease, not tied to any session.
 - First session to say `claim_direction` becomes director.
 - The human is the only one who can force a takeover: "you're now the
   director" calls `claim_direction(takeover: true)`, which always wins.
-- No auto-promotion. If the director's session dies, the show runs headless:
-  workers keep draining the queue, the callboard shows "no director", and
-  nothing self-appoints. You decide who directs next.
+- No auto-promotion, and **no transfer by timeout**: a stale/expired direction
+  lease does not open the seat, so a plain `claim_direction` by anyone else is
+  denied while a holder exists. A director can stand down cleanly with
+  `release_direction`.
+- Dead-director recovery is a human action: open a NEW session that has the
+  director token (from your `.env`) and paste `You're now the director of
+  <show>.` -- that runs `claim_direction(takeover: true)`. The callboard shows
+  this prompt when the seat is headless or stale. There is no takeover/clear
+  button; the director key lives only in your `.env`.
 - Old director sessions find out they've been superseded the next time they
   call a director-only tool: the server returns a structured `superseded`
   error naming the new holder. That's the whole handoff protocol, no gossip
@@ -62,24 +68,32 @@ own chat -- that's what the chat link opens -- and the director translates
 intent into tasks. Manual escape hatches live in the CLI (below), which
 drives the same `/api` the callboard reads. Shows:
 
-- **Director card**: who, epoch, lease freshness, and
-  the chat link -- a self-reported `session_url` renders as a prominent
-  "open chat ↗", a `resume_hint` (no `session_url`) as click-to-copy code,
-  neither as a dim "no chat link reported".
+- **Director card**: who, epoch, lease freshness, seat provenance (how the
+  holder got the seat, when), and the chat link -- a self-reported `session_url`
+  renders as a prominent "open chat ↗", a `resume_hint` (no `session_url`) as
+  click-to-copy code, neither as a dim "no chat link reported". When there is no
+  live director (headless, or the holder's lease went stale), it shows the exact
+  copy-paste recovery prompt (`You're now the director of <show>.`) to run in a
+  session that already has the director token -- display only, no secret shown,
+  no takeover button (recovery is the human pasting that prompt).
 - **Members** (the hero card): each registered member with a staleness dot,
-  kind (claude-local, cursor-cloud, ...), role badge, what it is working on
-  right now (task title + status, not just an id), tasks done, joined/seen
-  ages, and a small ↗ when the member reported a `session_url`.
+  kind (claude-local, cursor-cloud, ...), role badge, an `invited` badge when it
+  joined via an invite, an `EVICTED` badge once the director evicted it, what it
+  is working on right now (task title + status, not just an id), tasks done,
+  joined/seen ages, and a small ↗ when the member reported a `session_url`.
+- **Rules**: the show's current server-held rules (switches shown on/off,
+  advisory policy, version) -- display only; edit via `showrunner rules set`.
 - **Task columns** (each with a count): queued / needs input / failures.
   Queued and needs-input show the full list; failures shows the latest 20.
   Queued is ordered the way `await_work` claims (priority, then age), so
   the top card is next in line unless it waits on `depends_on` or a pinned
-  assignee. Failures are what agents reported back (failed + rejected),
-  each with the agent's last journal entry and its original timestamp.
-  In-flight and done have no columns -- the members hero shows in-flight,
-  finished work just gets merged -- but their totals sit in the tasks
-  header. Click a task to expand its journal. If tasks are queued and no
-  non-stale worker members are registered, a banner asks you to open a
+  assignee; a queued task withheld by the release gate shows a PENDING RELEASE
+  badge (release it with `showrunner task release`). Failures are what agents
+  reported back (failed + rejected), each with the agent's last journal entry
+  and its original timestamp. In-flight and done have no columns -- the members
+  hero shows in-flight, finished work just gets merged -- but their totals sit
+  in the tasks header. Click a task to expand its journal. If tasks are queued
+  and no non-stale worker members are registered, a banner asks you to open a
   worker session.
 - **Escalations pulse amber in place** (there is no red banner): any
   `input-required` task, plus messages addressed to `human` from the past
@@ -89,22 +103,42 @@ drives the same `/api` the callboard reads. Shows:
 - **Activity** (collapsed by default): shared notes, task journal entries,
   and messages in one newest-first feed, last 50.
 
+The callboard is strictly a read-only window: it has no buttons that mutate
+state. Every human write action goes through the CLI/admin API -- release a task
+with `showrunner task release`, change rules with `showrunner rules set`,
+recover a dead director by pasting the director prompt into a token-bearing
+session.
+
 ## Showrunner rules
 
 Fleet rules are **server-held per-show state**, not a repo file (policy that
 governs untrusted members must not be editable by them). Each show has:
 
 - **switches** (machine-enforced): `requireTaskRelease`,
-  `requireHumanMergeApproval`, `workerNotePropagation`, `artifactTextMaxChars`,
-  `artifactDataMaxBytes`.
+  `requireHumanMergeApproval` (delivered/agent-followed; pair with repo branch
+  protection for an enforced gate), `workerNotePropagation`, `requireInvite`,
+  `artifactTextMaxChars`, `artifactDataMaxBytes`.
 - **policy** (advisory prose, delivered but never enforced).
 
 New shows seed OOTB defaults (favoring automation). The director changes rules
-with the `update_rules` tool; the human edits them on the callboard or with
-`showrunner rules set`. Every change bumps a version, is audited (`updated_by`),
-and pings the cast; `register` delivers the full rules and later polls
-re-deliver on version change. Playbook (`SHOWRUNNER.md`) stays a repo file about
-decomposing *this* project (advisory). Sessions may fan out subagents freely.
+with the `update_rules` tool; the human edits them on the callboard-adjacent CLI
+(`showrunner rules set`) or the admin API. Every change bumps a version, is
+audited (`updated_by`), and pings the cast; `register` delivers the full rules
+and later polls re-deliver on version change. Playbook (`SHOWRUNNER.md`) stays a
+repo file about decomposing *this* project (advisory). Sessions may fan out
+subagents freely.
+
+## Membership (invites and eviction)
+
+The director controls who is in the show. `mint_invite` issues a single-use,
+show-scoped invite token (expires; hash stored, plaintext once) that an outside
+agent passes to `register`. Turn on the `requireInvite` rule
+(`showrunner rules set --require-invite on`) to refuse worker-token registration
+without a valid invite; the director token is exempt. `evict_member` revokes a
+member's credential (its later calls return `unauthorized_member`), requeues its
+in-flight task, and flags it evicted on the board. `get_board` shows the director
+who is connected, what each member is doing, and invite provenance -- that is the
+eviction-decision surface. Eviction is durable only with `requireInvite` on.
 
 ## How it works
 
@@ -203,6 +237,7 @@ on the server and change with `showrunner rules set` / `update_rules`):
 | Var | Default | Seeds switch |
 |---|---|---|
 | `REQUIRE_TASK_RELEASE` | `false` | `requireTaskRelease` — withhold director tasks until a human releases them. Turn on for untrusted workers. |
+| `REQUIRE_INVITE` | `false` | `requireInvite` — refuse worker-token registration without a director-minted invite. Turn on to control who joins. |
 | `REQUIRE_HUMAN_MERGE_APPROVAL` | `false` | `requireHumanMergeApproval` — agents leave PRs for the human. |
 | `WORKER_NOTE_PROPAGATION` | `true` | `workerNotePropagation` — auto-push notes to peers' claims. |
 | `ARTIFACT_TEXT_MAX_CHARS` | `10000` | `artifactTextMaxChars` cap. |
@@ -230,7 +265,8 @@ showrunner task release --show <name> --id <task-id>   # release a task withheld
 showrunner message --show <name> --to <member-id|director|all|human> --body <text>
 showrunner rules --show <name>                         # print the show's server-held rules
 showrunner rules set --show <name> [--require-release on|off] [--merge-approval on|off] \
-                     [--note-propagation on|off] [--artifact-text-max <n>] [--artifact-data-max <n>] [--policy <text>]
+                     [--note-propagation on|off] [--require-invite on|off] \
+                     [--artifact-text-max <n>] [--artifact-data-max <n>] [--policy <text>]
 showrunner direction clear --show <name>
 showrunner show delete --show <name>        # removes the show and everything under it
 showrunner init --show <name> --url <url> --token <director> --worker-token <worker>

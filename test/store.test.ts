@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { Store } from "../src/server/store.js";
-import { SupersededError } from "../src/types.js";
+import { InviteError, SupersededError } from "../src/types.js";
 
 // Injected clock: tests advance `clock.t` directly, no sleeps, no timers.
 function makeClock(start = 1_000_000) {
@@ -1357,5 +1357,96 @@ describe("show rules (server-held policy)", () => {
     // At the cap it's accepted.
     const ok = store.updateTask(worker.id, task.id, { artifacts: [{ kind: "text", text: "x".repeat(10) }] });
     expect(ok.artifacts.length).toBe(1);
+  });
+
+  it("seeds requireInvite off by default (frictionless solo shows)", () => {
+    const { store } = newStore();
+    store.register("myshow", "claude-local");
+    expect(store.getShowRules("myshow").switches.requireInvite).toBe(false);
+  });
+});
+
+describe("invites (director-minted, single-use, show-scoped)", () => {
+  it("mint returns a token + expiry; register exchanges it and records provenance", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const inv = store.mintInvite("myshow", director.id);
+    expect(inv.token.length).toBeGreaterThanOrEqual(20);
+    expect(inv.expiresAt).toBeGreaterThan(0);
+
+    const member = store.register("myshow", "claude-local", "guest", undefined, undefined, undefined, inv.token);
+    const view = store.getBoard("myshow").members.find((m) => m.id === member.id);
+    expect(view?.invitedVia).toBe(inv.id);
+    expect(view?.invitedBy).toBe(director.id);
+    // The invite is now marked used, attributed to the new member.
+    const used = store.listInvites("myshow").find((i) => i.id === inv.id);
+    expect(used?.usedBy).toBe(member.id);
+    expect(used?.usedAt).not.toBeNull();
+  });
+
+  it("is single-use: a second register with the same token is rejected", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const inv = store.mintInvite("myshow", director.id);
+    store.register("myshow", "claude-local", undefined, undefined, undefined, undefined, inv.token);
+    expect(() => store.register("myshow", "claude-local", undefined, undefined, undefined, undefined, inv.token)).toThrow(InviteError);
+    try {
+      store.register("myshow", "claude-local", undefined, undefined, undefined, undefined, inv.token);
+    } catch (err) {
+      expect((err as InviteError).reason).toBe("used");
+    }
+  });
+
+  it("rejects an expired invite and a wrong-show / unknown token", () => {
+    const { store, clock } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const inv = store.mintInvite("myshow", director.id, 1000); // 1s ttl
+    clock.t += 1001;
+    expect(() => store.register("myshow", "claude-local", undefined, undefined, undefined, undefined, inv.token)).toThrow(/expired/);
+
+    store.register("othershow", "claude-local"); // create the other show
+    const inv2 = store.mintInvite("myshow", director.id);
+    expect(() => store.register("othershow", "claude-local", undefined, undefined, undefined, undefined, inv2.token)).toThrow(InviteError);
+    expect(() => store.register("myshow", "claude-local", undefined, undefined, undefined, undefined, "not-a-real-token")).toThrow(/not valid/);
+  });
+});
+
+describe("eviction", () => {
+  it("revokes the credential, requeues the in-flight task, and stamps the membership evicted", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    store.claimDirection(director.id, true);
+    const worker = store.register("myshow", "claude-local");
+    const secret = store.issueMemberSecret(worker.id);
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
+    store.claimNextTask(worker.id);
+    store.updateTask(worker.id, task.id, { status: "working" });
+    expect(store.verifyMemberSecret(worker.id, secret)).toBe(true);
+
+    const result = store.evictMember("myshow", worker.id, director.id);
+    expect(result?.requeuedTaskId).toBe(task.id);
+    // Credential revoked: the secret no longer authenticates.
+    expect(store.verifyMemberSecret(worker.id, secret)).toBe(false);
+    // Task requeued with attempt bumped and no assignee; journal preserved (has the evict note).
+    const requeued = store.getBoard("myshow", true).tasks.find((t) => t.id === task.id);
+    expect(requeued?.status).toBe("queued");
+    expect(requeued?.assignee).toBeNull();
+    expect(requeued?.attempt).toBe(1);
+    expect(requeued?.notes?.some((n) => /evicted/.test(n.body))).toBe(true);
+    // Membership stamped evicted on the board.
+    const view = store.getBoard("myshow").members.find((m) => m.id === worker.id);
+    expect(view?.evicted).toBe(true);
+    expect(view?.evictedBy).toBe(director.id);
+  });
+
+  it("is idempotent and returns undefined for an unknown target", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const first = store.evictMember("myshow", worker.id, director.id);
+    const second = store.evictMember("myshow", worker.id, director.id);
+    expect(first?.member.id).toBe(worker.id);
+    expect(second?.requeuedTaskId).toBeNull();
+    expect(store.evictMember("myshow", "nobody", director.id)).toBeUndefined();
   });
 });

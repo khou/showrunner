@@ -264,6 +264,7 @@ function printRules(rules: ShowRules): void {
     `  requireTaskRelease        ${s.requireTaskRelease}`,
     `  requireHumanMergeApproval ${s.requireHumanMergeApproval}`,
     `  workerNotePropagation     ${s.workerNotePropagation}`,
+    `  requireInvite             ${s.requireInvite}`,
     `  artifactTextMaxChars      ${s.artifactTextMaxChars}`,
     `  artifactDataMaxBytes      ${s.artifactDataMaxBytes}`,
     `policy (advisory prose, delivered but never enforced):`,
@@ -300,6 +301,7 @@ async function cmdRulesSet(argv: string[]): Promise<void> {
       "require-release": { type: "string" },
       "merge-approval": { type: "string" },
       "note-propagation": { type: "string" },
+      "require-invite": { type: "string" },
       "artifact-text-max": { type: "string" },
       "artifact-data-max": { type: "string" },
       policy: { type: "string" },
@@ -313,6 +315,7 @@ async function cmdRulesSet(argv: string[]): Promise<void> {
   if (values["require-release"] !== undefined) switches.requireTaskRelease = parseOnOff("--require-release", values["require-release"]);
   if (values["merge-approval"] !== undefined) switches.requireHumanMergeApproval = parseOnOff("--merge-approval", values["merge-approval"]);
   if (values["note-propagation"] !== undefined) switches.workerNotePropagation = parseOnOff("--note-propagation", values["note-propagation"]);
+  if (values["require-invite"] !== undefined) switches.requireInvite = parseOnOff("--require-invite", values["require-invite"]);
   if (values["artifact-text-max"] !== undefined) switches.artifactTextMaxChars = Number(values["artifact-text-max"]);
   if (values["artifact-data-max"] !== undefined) switches.artifactDataMaxBytes = Number(values["artifact-data-max"]);
 
@@ -637,8 +640,8 @@ Usage:
                       [--url <url>] [--token <token>]
   showrunner rules --show <name>                    # print the show's server-held rules
   showrunner rules set --show <name> [--require-release on|off] [--merge-approval on|off]
-                       [--note-propagation on|off] [--artifact-text-max <n>]
-                       [--artifact-data-max <n>] [--policy <text>]
+                       [--note-propagation on|off] [--require-invite on|off]
+                       [--artifact-text-max <n>] [--artifact-data-max <n>] [--policy <text>]
   showrunner direction clear --show <name> [--url <url>] [--token <token>]
   showrunner show delete --show <name> [--url <url>] [--token <token>]
   showrunner init --show <name> --url <url> --token <director> --worker-token <worker> [--dir <path>]

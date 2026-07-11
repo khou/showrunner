@@ -1,5 +1,5 @@
 // MCP tool surface for showrunner (DESIGN.md "MCP tool surface", PLAN.md "MCP tools"
-// + "Long-poll semantics"). The 12 pinned tools plus the "join" prompt.
+// + "Long-poll semantics"). The 14 pinned tools plus the "join" prompt.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -8,6 +8,7 @@ import type { Store } from "./store.js";
 import { INSTRUCTIONS } from "./instructions.js";
 import { directorPolicyNotice, untrustedNotice } from "./trust.js";
 import {
+  InviteError,
   SupersededError,
   type AuthLevel,
   type BoardState,
@@ -74,6 +75,7 @@ const RULES_SWITCHES = z
     requireTaskRelease: z.boolean().optional(),
     requireHumanMergeApproval: z.boolean().optional(),
     workerNotePropagation: z.boolean().optional(),
+    requireInvite: z.boolean().optional(),
     artifactTextMaxChars: z.number().int().positive().optional(),
     artifactDataMaxBytes: z.number().int().positive().optional(),
   })
@@ -390,7 +392,8 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
   server.registerTool(
     "register",
     {
-      description: "Join a show as a new member; returns member_id and the worker/director protocol.",
+      description:
+        "Join a show as a new member; returns member_id, member_secret, and the worker/director protocol. If the show's requireInvite rule is on, a worker-token registration must pass a valid `invite` (minted by the director); director-token registration is exempt.",
       inputSchema: {
         show: z.string().min(1).describe("Show name. Priority: user-named, else .showrunner file at repo root, else git origin basename, else directory name."),
         kind: MEMBER_KIND,
@@ -398,18 +401,41 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         capabilities: z.array(z.string()).optional(),
         session_url: SESSION_URL,
         resume_hint: RESUME_HINT,
+        invite: z.string().min(1).optional().describe("single-use invite token from the director; required for worker-token registration when the show's requireInvite rule is on"),
       },
     },
     async (args) => {
+      // require_invite gate: when on, a worker-token caller must present a valid invite. The
+      // director token is exempt (the director mints invites and controls membership). Checked
+      // before register so a refusal doesn't create a show/member as a side effect.
+      const requireInvite = store.getShowRules(args.show).switches.requireInvite;
+      if (requireInvite && authLevel !== "director" && !args.invite) {
+        return jsonResult(
+          {
+            status: "invite_required",
+            hint: "this show requires an invite to register with the worker token; ask the director to mint_invite one and pass it as `invite`",
+          },
+          true,
+        );
+      }
       const preexisting = store.showNames();
-      const member = store.register(
-        args.show,
-        args.kind,
-        args.display_name,
-        args.capabilities,
-        args.session_url,
-        args.resume_hint,
-      );
+      let member;
+      try {
+        member = store.register(
+          args.show,
+          args.kind,
+          args.display_name,
+          args.capabilities,
+          args.session_url,
+          args.resume_hint,
+          args.invite,
+        );
+      } catch (err) {
+        if (err instanceof InviteError) {
+          return jsonResult({ status: "invite_rejected", reason: err.reason, message: err.message }, true);
+        }
+        throw err;
+      }
       // Mint this member's auth secret and return it exactly once; the DB keeps only its hash.
       const member_secret = store.issueMemberSecret(member.id);
       const board_summary = stripBoard(store.getBoard(member.show));
@@ -772,6 +798,77 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       // also carries the new version and full text via the rules-delivery cursor.
       store.sendMessage(member.id, "all", `show rules updated to v${rules.version} by ${member.id}`);
       return jsonResult({ status: "updated", rules, rules_trust: directorPolicyNotice() });
+    },
+  );
+
+  server.registerTool(
+    "mint_invite",
+    {
+      description:
+        "Director-only: mint a single-use, show-scoped invite token so a specific outside agent can register when the show's requireInvite rule is on. Epoch-fenced. The token is returned once (the server stores only its hash) and expires. Requires the director bearer token.",
+      inputSchema: {
+        member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
+        epoch: z.number().int(),
+        ttl_seconds: z.number().int().positive().optional().describe("lifetime of the unused invite in seconds (default 24h)"),
+      },
+    },
+    async (args) => {
+      const denied = requireDirectorAuth();
+      if (denied) return denied;
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
+      if ("result" in resolved) return resolved.result;
+      const { member } = resolved;
+      try {
+        store.checkEpoch(member.show, member.id, args.epoch);
+      } catch (err) {
+        if (err instanceof SupersededError) return supersededResult(err);
+        throw err;
+      }
+      const ttlMs = args.ttl_seconds ? args.ttl_seconds * 1000 : undefined;
+      const invite = store.mintInvite(member.show, member.id, ttlMs);
+      return jsonResult({
+        status: "minted",
+        invite_id: invite.id,
+        invite_token: invite.token,
+        expires_at: invite.expiresAt,
+        notice:
+          "Give invite_token to the one agent you're inviting; it's single-use, show-scoped, expires, and is shown only now. They pass it to register as `invite`.",
+      });
+    },
+  );
+
+  server.registerTool(
+    "evict_member",
+    {
+      description:
+        "Director-only: evict a member. Revokes its credential (all later calls unauthorized), requeues its in-flight task (attempt+1, journal preserved), stamps the membership evicted (actor/time), and notifies the cast. Epoch-fenced. Requires the director bearer token.",
+      inputSchema: {
+        member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
+        epoch: z.number().int(),
+        target: z.string().min(1).describe("member_id to evict"),
+      },
+    },
+    async (args) => {
+      const denied = requireDirectorAuth();
+      if (denied) return denied;
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
+      if ("result" in resolved) return resolved.result;
+      const { member } = resolved;
+      try {
+        store.checkEpoch(member.show, member.id, args.epoch);
+      } catch (err) {
+        if (err instanceof SupersededError) return supersededResult(err);
+        throw err;
+      }
+      if (args.target === member.id) {
+        return jsonResult({ status: "error", message: "a director cannot evict itself; release_direction to stand down" }, true);
+      }
+      const result = store.evictMember(member.show, args.target, member.id);
+      if (!result) return jsonResult({ status: "error", message: `unknown member: ${args.target}` }, true);
+      store.sendMessage(member.id, "all", `${args.target} was evicted by ${member.id}`);
+      return jsonResult({ status: "evicted", member_id: args.target, requeued_task_id: result.requeuedTaskId });
     },
   );
 

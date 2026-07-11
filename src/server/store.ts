@@ -14,6 +14,9 @@ import {
   type DirectionEvent,
   type DirectionMethod,
   type DirectionProvenance,
+  type Invite,
+  InviteError,
+  type MintInviteResult,
   type Message,
   type MessageKind,
   type MessageTarget,
@@ -56,9 +59,24 @@ CREATE TABLE IF NOT EXISTS members (
   session_url TEXT,
   resume_hint TEXT,
   secret_hash TEXT,
-  rules_version_seen INTEGER NOT NULL DEFAULT 0
+  rules_version_seen INTEGER NOT NULL DEFAULT 0,
+  invite_id TEXT,
+  evicted_at INTEGER,
+  evicted_by TEXT
 );
 CREATE INDEX IF NOT EXISTS members_show_idx ON members(show);
+
+CREATE TABLE IF NOT EXISTS invites (
+  id TEXT PRIMARY KEY,
+  show TEXT NOT NULL REFERENCES shows(name),
+  token_hash TEXT NOT NULL,
+  minted_by TEXT NOT NULL,
+  minted_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at INTEGER,
+  used_by TEXT
+);
+CREATE INDEX IF NOT EXISTS invites_show_idx ON invites(show);
 
 CREATE TABLE IF NOT EXISTS show_rules (
   show TEXT PRIMARY KEY REFERENCES shows(name),
@@ -271,6 +289,20 @@ interface MemberRow {
   resume_hint: string | null;
   secret_hash: string | null;
   rules_version_seen: number;
+  invite_id: string | null;
+  evicted_at: number | null;
+  evicted_by: string | null;
+}
+
+interface InviteRow {
+  id: string;
+  show: string;
+  token_hash: string;
+  minted_by: string;
+  minted_at: number;
+  expires_at: number;
+  used_at: number | null;
+  used_by: string | null;
 }
 
 interface ShowRulesRow {
@@ -452,6 +484,7 @@ export class Store {
     this.migrateMemberSecretColumn();
     this.migrateTaskReleasedColumn();
     this.migrateMemberRulesSeenColumn();
+    this.migrateMemberInviteEvictionColumns();
     this.now = now;
     this.leases = readLeaseConfig();
     this.noteConfig = readNoteConfig();
@@ -518,6 +551,15 @@ export class Store {
     if (!cols.some((c) => c.name === "rules_version_seen")) {
       this.db.exec("ALTER TABLE members ADD COLUMN rules_version_seen INTEGER NOT NULL DEFAULT 0");
     }
+  }
+
+  /** Guarded upgrade-in-place: members predates invite provenance + eviction. All nullable, no
+   * backfill (existing members simply have no invite and aren't evicted). */
+  private migrateMemberInviteEvictionColumns(): void {
+    const cols = this.db.pragma("table_info(members)") as { name: string }[];
+    if (!cols.some((c) => c.name === "invite_id")) this.db.exec("ALTER TABLE members ADD COLUMN invite_id TEXT");
+    if (!cols.some((c) => c.name === "evicted_at")) this.db.exec("ALTER TABLE members ADD COLUMN evicted_at INTEGER");
+    if (!cols.some((c) => c.name === "evicted_by")) this.db.exec("ALTER TABLE members ADD COLUMN evicted_by TEXT");
   }
 
   private txn<T>(fn: () => T): T {
@@ -627,6 +669,7 @@ export class Store {
     _capabilities?: string[],
     sessionUrl?: string,
     resumeHint?: string,
+    invite?: string,
   ): Member {
     return this.txn(() => {
       const at = this.now();
@@ -640,16 +683,76 @@ export class Store {
       // "seeing" the current version (register returns the full rules; no re-delivery needed).
       const rules = this.ensureShowRules(show, at);
 
+      // Consume an invite (if supplied) inside the same txn as the member insert, so a single-use
+      // invite can't be double-spent by two concurrent registers. Throws InviteError on invalid.
+      const inviteId = invite ? this.consumeInvite(show, invite, at) : null;
+
       const id = this.generateMemberId();
       const leaseExpiresAt = at + this.leases.workerLeaseS * 1000;
       this.db
         .prepare(
-          `INSERT INTO members (id, show, kind, display_name, role, registered_at, last_seen_at, lease_expires_at, current_task_id, session_url, resume_hint, rules_version_seen)
-           VALUES (?, ?, ?, ?, 'worker', ?, ?, ?, NULL, ?, ?, ?)`,
+          `INSERT INTO members (id, show, kind, display_name, role, registered_at, last_seen_at, lease_expires_at, current_task_id, session_url, resume_hint, rules_version_seen, invite_id)
+           VALUES (?, ?, ?, ?, 'worker', ?, ?, ?, NULL, ?, ?, ?, ?)`,
         )
-        .run(id, show, kind, displayName ?? null, at, at, leaseExpiresAt, sessionUrl ?? null, resumeHint ?? null, rules.version);
+        .run(id, show, kind, displayName ?? null, at, at, leaseExpiresAt, sessionUrl ?? null, resumeHint ?? null, rules.version, inviteId);
+      if (inviteId) this.db.prepare("UPDATE invites SET used_by = ? WHERE id = ?").run(id, inviteId);
       return mapMember(this.getMemberRowRaw(id)!);
     });
+  }
+
+  // --- invites (director-minted, single-use, show-scoped) ---
+
+  /** Default lifetime for an unused invite when the caller doesn't specify one (24h). */
+  private static readonly DEFAULT_INVITE_TTL_MS = 24 * 60 * 60 * 1000;
+
+  private mapInvite(r: InviteRow): Invite {
+    return {
+      id: r.id,
+      show: r.show,
+      mintedBy: r.minted_by,
+      mintedAt: r.minted_at,
+      expiresAt: r.expires_at,
+      usedAt: r.used_at,
+      usedBy: r.used_by,
+    };
+  }
+
+  /**
+   * Mint a single-use, show-scoped invite. Stores only the token's SHA-256 (same discipline as
+   * member secrets); the plaintext is returned once. Callers (the director's mint_invite tool)
+   * are responsible for auth/epoch fencing.
+   */
+  mintInvite(show: string, mintedBy: string, ttlMs = Store.DEFAULT_INVITE_TTL_MS): MintInviteResult {
+    return this.txn(() => {
+      const at = this.now();
+      const token = randomBytes(24).toString("base64url");
+      let id = `inv-${randomHex(5)}`;
+      for (let i = 0; i < 10 && this.db.prepare("SELECT 1 FROM invites WHERE id = ?").get(id); i++) id = `inv-${randomHex(5)}`;
+      const expiresAt = at + ttlMs;
+      this.db
+        .prepare("INSERT INTO invites (id, show, token_hash, minted_by, minted_at, expires_at, used_at, used_by) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)")
+        .run(id, show, hashSecret(token), mintedBy, at, expiresAt);
+      return { id, token, expiresAt };
+    });
+  }
+
+  /** Validate + consume an invite for `show`. Returns the invite id on success; throws InviteError
+   * (invalid | used | expired) otherwise. Marks the invite used atomically so it's single-use. */
+  private consumeInvite(show: string, token: string, at: number): string {
+    const row = this.db.prepare("SELECT * FROM invites WHERE show = ? AND token_hash = ?").get(show, hashSecret(token)) as
+      | InviteRow
+      | undefined;
+    if (!row) throw new InviteError("invalid", "invite token is not valid for this show");
+    if (row.used_at !== null) throw new InviteError("used", "invite token has already been used");
+    if (row.expires_at <= at) throw new InviteError("expired", "invite token has expired");
+    this.db.prepare("UPDATE invites SET used_at = ? WHERE id = ?").run(at, row.id);
+    return row.id;
+  }
+
+  /** Invites for a show (director/board view); newest first. */
+  listInvites(show: string): Invite[] {
+    const rows = this.db.prepare("SELECT * FROM invites WHERE show = ? ORDER BY minted_at DESC").all(show) as InviteRow[];
+    return rows.map((r) => this.mapInvite(r));
   }
 
   /**
@@ -673,6 +776,44 @@ export class Store {
     const row = this.getMemberRowRaw(memberId);
     if (!row || !row.secret_hash) return false;
     return timingSafeEqualHex(hashSecret(secret), row.secret_hash);
+  }
+
+  /**
+   * Evict a member (director action): revoke its credential (secret_hash -> NULL, so every later
+   * call is unauthorized), requeue any in-flight task it holds (attempt+1, journal preserved), and
+   * stamp the membership evicted with actor/time (the audit trail on the row). Returns the mapped
+   * member plus the requeued task id, or undefined for an unknown target. Idempotent: re-evicting
+   * an already-evicted member is a no-op. Note: eviction ends this session's membership; whether
+   * the evicted party can rejoin is governed by the requireInvite rule (off -> they can re-register
+   * with the shared worker token; on -> they need a fresh invite the director controls).
+   */
+  evictMember(show: string, targetId: string, actor: string): { member: Member; requeuedTaskId: string | null } | undefined {
+    return this.txn(() => {
+      const row = this.getMemberRowRaw(targetId);
+      if (!row || row.show !== show) return undefined;
+      if (row.evicted_at !== null) return { member: mapMember(row), requeuedTaskId: null }; // already evicted
+
+      const at = this.now();
+      let requeuedTaskId: string | null = null;
+      if (row.current_task_id) {
+        const task = this.getTaskRowRaw(row.current_task_id);
+        if (task && !TERMINAL_STATUSES.has(task.status as TaskStatus) && task.assignee === targetId) {
+          this.db
+            .prepare("UPDATE tasks SET status = 'queued', assignee = NULL, lease_expires_at = NULL, attempt = attempt + 1, updated_at = ? WHERE id = ?")
+            .run(at, task.id);
+          this.insertNote(task.id, "system", `requeued: ${targetId} evicted by ${actor} (attempt ${task.attempt + 1})`, at);
+          requeuedTaskId = task.id;
+        }
+      }
+
+      // Revoke the credential and demote; clear current task; stamp the eviction.
+      this.db
+        .prepare("UPDATE members SET secret_hash = NULL, role = 'worker', current_task_id = NULL, evicted_at = ?, evicted_by = ? WHERE id = ?")
+        .run(at, actor, targetId);
+      this.events.emit(`wake:show:${show}`);
+      if (requeuedTaskId) this.events.emit(`wake:${targetId}`); // in case it's parked, so it re-polls and learns it's out
+      return { member: mapMember(this.getMemberRowRaw(targetId)!), requeuedTaskId };
+    });
   }
 
   // --- show rules (server-held policy; DESIGN.md "Show rules") ---
@@ -719,6 +860,7 @@ export class Store {
         if (typeof patch.switches.requireTaskRelease === "boolean") switches.requireTaskRelease = patch.switches.requireTaskRelease;
         if (typeof patch.switches.requireHumanMergeApproval === "boolean") switches.requireHumanMergeApproval = patch.switches.requireHumanMergeApproval;
         if (typeof patch.switches.workerNotePropagation === "boolean") switches.workerNotePropagation = patch.switches.workerNotePropagation;
+        if (typeof patch.switches.requireInvite === "boolean") switches.requireInvite = patch.switches.requireInvite;
         if (patch.switches.artifactTextMaxChars !== undefined) switches.artifactTextMaxChars = clampPositiveInt(patch.switches.artifactTextMaxChars, current.switches.artifactTextMaxChars);
         if (patch.switches.artifactDataMaxBytes !== undefined) switches.artifactDataMaxBytes = clampPositiveInt(patch.switches.artifactDataMaxBytes, current.switches.artifactDataMaxBytes);
       }
@@ -767,6 +909,7 @@ export class Store {
       this.db.prepare("DELETE FROM members WHERE show = ?").run(show);
       this.db.prepare("DELETE FROM direction WHERE show = ?").run(show);
       this.db.prepare("DELETE FROM direction_events WHERE show = ?").run(show);
+      this.db.prepare("DELETE FROM invites WHERE show = ?").run(show);
       this.db.prepare("DELETE FROM show_rules WHERE show = ?").run(show);
       this.db.prepare("DELETE FROM shows WHERE name = ?").run(show);
       // Parked polls of deleted members resolve on their next check with unknown_member.
@@ -816,19 +959,28 @@ export class Store {
     const memberRows = this.db
       .prepare("SELECT * FROM members WHERE show = ? ORDER BY registered_at ASC")
       .all(show) as MemberRow[];
-    const members = memberRows.map((m) => ({
-      id: m.id,
-      kind: m.kind as MemberKind,
-      displayName: m.display_name,
-      role: m.role as MemberRole,
-      registeredAt: m.registered_at,
-      lastSeenAt: m.last_seen_at,
-      leaseExpiresAt: m.lease_expires_at,
-      stale: m.lease_expires_at < now,
-      currentTaskId: m.current_task_id,
-      ...(m.session_url ? { sessionUrl: m.session_url } : {}),
-      ...(m.resume_hint ? { resumeHint: m.resume_hint } : {}),
-    }));
+    const members = memberRows.map((m) => {
+      // Invite provenance: which invite the member joined via, and who minted it (director view).
+      const invite = m.invite_id
+        ? (this.db.prepare("SELECT minted_by FROM invites WHERE id = ?").get(m.invite_id) as { minted_by: string } | undefined)
+        : undefined;
+      return {
+        id: m.id,
+        kind: m.kind as MemberKind,
+        displayName: m.display_name,
+        role: m.role as MemberRole,
+        registeredAt: m.registered_at,
+        lastSeenAt: m.last_seen_at,
+        leaseExpiresAt: m.lease_expires_at,
+        stale: m.lease_expires_at < now,
+        currentTaskId: m.current_task_id,
+        ...(m.session_url ? { sessionUrl: m.session_url } : {}),
+        ...(m.resume_hint ? { resumeHint: m.resume_hint } : {}),
+        ...(m.invite_id ? { invitedVia: m.invite_id } : {}),
+        ...(invite ? { invitedBy: invite.minted_by } : {}),
+        ...(m.evicted_at !== null ? { evicted: true, evictedBy: m.evicted_by ?? undefined, evictedAt: m.evicted_at } : {}),
+      };
+    });
 
     const taskRows = this.db.prepare("SELECT * FROM tasks WHERE show = ? ORDER BY updated_at DESC").all(show) as TaskRow[];
     const taskCounts: Record<TaskStatus, number> = {

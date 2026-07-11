@@ -216,6 +216,16 @@
     return `<span class="hint">no chat link reported</span>`;
   }
 
+  // Dead-director recovery is display-only (the callboard is read-only, and there is no takeover
+  // button by design): show the exact prompt the human pastes into a NEW session to recover the
+  // show. That session must already carry the director token (from .env) -- no secret is shown here.
+  function recoveryPromptHtml() {
+    return `<div class="recovery">
+      <div class="hint">no live director. In a session that has the director token (from your .env), paste:</div>
+      <code class="recovery-prompt">You're now the director of ${escapeHtml(state.show)}.</code>
+    </div>`;
+  }
+
   function renderDirector(director) {
     const body = el("director-body");
     if (!state.show) {
@@ -223,7 +233,7 @@
       return;
     }
     if (!director) {
-      body.innerHTML = `<span class="hint">no director -- show is headless</span>`;
+      body.innerHTML = `<span class="hint">no director -- show is headless</span>${recoveryPromptHtml()}`;
       return;
     }
     const dot = director.stale ? "stale" : "fresh";
@@ -231,11 +241,15 @@
     // seat, so showing "how/when" makes an unexpected holder easy to spot.
     const p = director.provenance;
     const prov = p ? `<div class="hint">seat: ${escapeHtml(p.method)} &middot; ${relTime(p.at)}</div>` : "";
+    // A stale holder still holds the seat (no transfer by timeout); surface the recovery prompt so
+    // the human can spin up a replacement director session that takes over.
+    const recovery = director.stale ? recoveryPromptHtml() : "";
     body.innerHTML = `
       <div><span class="dot ${dot}"></span> ${escapeHtml(director.memberId)}</div>
       <div class="hint">epoch ${director.epoch} &middot; ${director.stale ? "lease expired (still holds the seat)" : "lease active"}</div>
       ${prov}
       <div class="chat-link">${chatLinkHtml(director)}</div>
+      ${recovery}
     `;
   }
 
@@ -280,16 +294,22 @@
           ? ` <a class="chat-open-small" href="${escapeHtml(m.sessionUrl)}" target="_blank" rel="noopener" title="open chat">&#8599;</a>`
           : "";
         const desc = m.displayName ? `<span class="hint member-desc">${escapeHtml(m.displayName)}</span>` : "";
-        return `<li class="member-item">
+        // Director-visibility badges: evicted membership (credential revoked by the director) and
+        // invite provenance (joined via a director-minted invite). Display only.
+        const evictedBadge = m.evicted ? `<span class="badge badge-evicted" title="evicted by ${escapeHtml(m.evictedBy || "director")}">EVICTED</span>` : "";
+        const inviteBadge = m.invitedBy ? `<span class="badge" title="invited by ${escapeHtml(m.invitedBy)}">invited</span>` : "";
+        return `<li class="member-item${m.evicted ? " member-evicted" : ""}">
           <div class="member-row">
             <span class="dot ${dot}"></span>
             <span class="member-id">${escapeHtml(m.id)}</span>${chat}
             ${desc}
             <span class="badge">${escapeHtml(m.kind)}</span>
             <span class="badge role-${escapeHtml(m.role)}">${escapeHtml(m.role)}</span>
+            ${inviteBadge}
+            ${evictedBadge}
             <span class="hint member-seen">${m.stale ? "lease expired &middot; " : ""}seen ${relTime(m.lastSeenAt)}</span>
           </div>
-          ${memberNowHtml(m, tasksById)}
+          ${m.evicted ? "" : memberNowHtml(m, tasksById)}
           <div class="hint member-meta">${doneBy.get(m.id) || 0} done &middot; joined ${relTime(m.registeredAt)}</div>
         </li>`;
       })
