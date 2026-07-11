@@ -26,6 +26,4 @@ One SQLite file, one read-only dashboard, a small fixed MCP tool surface.
 
    > You're a showrunner worker.
 
-3. Paste into a session that holds the director token (the setup session already does):
-
-   > You're the showrunner director.
+3. Tell the director (the setup session from step 1) what you want built, and watch it happen on the callboard link it gave you.
