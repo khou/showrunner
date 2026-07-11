@@ -77,7 +77,7 @@ is 14 tools.
 ├─ Cursor (cloud) ───────┤   Authorization: Bearer <token>   │  Fly.io, 1 machine  │
 └─ anything MCP ─────────┘                                   │  SQLite on volume   │
                                                              │  /mcp  /  /api      │
-        Kevin ── browser ── callboard (/) ───────────────────┴────────────────────┘
+        human ── browser ── callboard (/) ───────────────────┴────────────────────┘
 ```
 
 One Node process. No queue infra, no websockets to agents, no A2A. In-process
@@ -404,7 +404,7 @@ repo, and any future session understands "you're a showrunner worker".
 
 A polling worker slowly burns context. The protocol tells workers to prefer
 finishing a task and letting the human recycle the session over heroics, and
-the callboard shows per-member `age`/`tasks done` so Kevin can see when a
+the callboard shows per-member `age`/`tasks done` so the human can see when a
 worker is long in the tooth. (Claude Code auto-compaction makes this mostly a
 non-issue; Cursor sessions may need manual recycling.)
 

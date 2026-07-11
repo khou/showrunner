@@ -26,11 +26,11 @@ store.updateTask(w3.id, done1.id, {
   artifacts: [{ kind: 'branch', name: 'show/' + done1.id + '-crafting-ui' }, { kind: 'text', text: 'Crafting bench pulls live inventory; drag-to-slot works; 6 new tests.' }],
 })
 // failed (agent-reported; claimed and failed by w1 before it picks up its working task)
-const fail1 = t('Upgrade physics dep to 2.x', 'Bump voxel-phys; see apps/server/package.json.', { filesHint: ['apps/server/**'] })
+const fail1 = t('Upgrade physics dep to 2.x', 'Bump cube-phys; see apps/server/package.json.', { filesHint: ['apps/server/**'] })
 store.claimNextTask(w1.id)
 store.updateTask(w1.id, fail1.id, {
   status: 'failed',
-  note: 'npm install fails: voxel-phys 2.x peer-conflicts with voxelize 3.1; needs a call on pinning or forking.',
+  note: 'npm install fails: cube-phys 2.x peer-conflicts with cubekit 3.1; needs a call on pinning or forking.',
 })
 // working
 const wk1 = t('Chunk-save batching for world server', 'Persist dirty chunks in batches of 64; see server/src/persist.rs.', { filesHint: ['apps/server/src/persist/**'], priority: 4 })
@@ -57,8 +57,8 @@ store.saveNote(director.id, {
   taskId: blocked.id,
 })
 // queued
-t('Mob pathfinding on slopes', 'A* cost tweak; vendor/voxelize notes in docs/pathing.md.', { priority: 2 })
-t('Spire floor 3 loot table', 'Balance pass per docs/economy.md section 4.', { dependsOn: [wk1.id] })
+t('Mob pathfinding on slopes', 'A* cost tweak; vendor/cubekit notes in docs/pathing.md.', { priority: 2 })
+t('Dungeon floor 3 loot table', 'Balance pass per docs/economy.md section 4.', { dependsOn: [wk1.id] })
 store.sendMessage(director.id, 'all', 'Digest: crafting UI merged, chunk batching and lighting in flight, invites blocked on a UX question. Queue has 2 more; shout if idle.')
 
 console.log('seeded show', SHOW, 'at', dataDir)

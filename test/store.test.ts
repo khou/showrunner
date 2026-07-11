@@ -21,10 +21,10 @@ function newStore() {
 describe("register / touchMember", () => {
   it("creates a show on first register and returns a member with a memorable id", () => {
     const { store } = newStore();
-    const m = store.register("myshow", "claude-local", "kevin's laptop");
+    const m = store.register("myshow", "claude-local", "demo laptop");
     expect(m.show).toBe("myshow");
     expect(m.kind).toBe("claude-local");
-    expect(m.displayName).toBe("kevin's laptop");
+    expect(m.displayName).toBe("demo laptop");
     expect(m.role).toBe("worker");
     expect(m.id).toMatch(/^[a-z]+-[a-z]+/);
   });
