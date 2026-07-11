@@ -81,6 +81,13 @@ drives the same `/api` the callboard reads. Shows:
   joined via an invite, an `EVICTED` badge once the director evicted it, what it
   is working on right now (task title + status, not just an id), tasks done,
   joined/seen ages, and a small ↗ when the member reported a `session_url`.
+  The current direction holder is not repeated here (it lives on the Director
+  card), and evicted members are hidden by default -- a `show evicted (N)`
+  button in the card header reveals them. A member whose poll lease lapsed
+  while it still holds a task with a live lease shows an amber "heads-down"
+  dot, not red: it's working quietly, and the reaper won't touch its task.
+  The synthetic `human` row (api's audit actor for CLI/HTTP writes) is not
+  listed -- it isn't a session anyone can talk to.
 - **Rules**: the show's current server-held rules (switches shown on/off,
   advisory policy, version) -- display only; edit via `showrunner rules set`.
 - **Task columns** (each with a count): queued / needs input / failures.
@@ -93,8 +100,8 @@ drives the same `/api` the callboard reads. Shows:
   and its original timestamp. In-flight and done have no columns -- the members
   hero shows in-flight, finished work just gets merged -- but their totals sit
   in the tasks header. Click a task to expand its journal. If tasks are queued
-  and no non-stale worker members are registered, a banner asks you to open a
-  worker session.
+  and no live worker members are registered (heads-down counts as live), a
+  banner asks you to open a worker session.
 - **Escalations pulse amber in place** (there is no red banner): any
   `input-required` task, plus messages addressed to `human` from the past
   24h (latest 5; there's no ack mechanism, so recency is the bound),
@@ -166,8 +173,8 @@ eviction-decision surface. Eviction is durable only with `requireInvite` on.
   holder's provenance shows on the board and callboard.
 - Workers can't receive pushes (cloud sessions are outbound-only), so
   `await_work` is a long-poll: it blocks up to `POLL_HOLD_SECONDS` (default
-  25, chosen to clear Cursor/Fly/Claude Code's independent ~60s connection
-  walls) and the worker re-polls immediately after.
+  50, chosen to clear Cursor/Fly/Claude Code's independent ~60s connection
+  walls with ~10s margin) and the worker re-polls immediately after.
 - Polls return unread-only messages and pointer-style task briefs, not
   inlined specs, to keep the coordination overhead in tokens small.
 - `register({show, kind, display_name?, session_url?, resume_hint?})` --
@@ -223,8 +230,8 @@ decisions (especially answers to `input-required`) as notes.
 | `SHOWRUNNER_WORKER_TOKEN` | *(optional)* | Worker bearer. When unset, equals director (single-token mode). |
 | `PORT` | `8080` | HTTP port. |
 | `DATA_DIR` | `/data` | Where the SQLite file lives. |
-| `POLL_HOLD_SECONDS` | `25` | Max long-poll hold for `await_work`. |
-| `WORKER_LEASE_S` | `90` | Member liveness lease; renewed by any tool call. |
+| `POLL_HOLD_SECONDS` | `50` | Max long-poll hold for `await_work`. |
+| `WORKER_LEASE_S` | `150` | Member liveness lease; renewed by any tool call. |
 | `TASK_LEASE_S` | `900` | Task ownership lease; renewed by `update_task`. |
 | `DIRECTION_LEASE_S` | `600` | Director lease; renewed by any director tool call. |
 | `SWEEP_INTERVAL_S` | `5` | How often the reclaim sweep runs. |
@@ -326,7 +333,8 @@ poll fails, retry, and reconnect once the new machine is up. In-flight leases
 just expire and requeue like any other stall.
 
 **A worker goes silent (crashed, context ran out, laptop closed)?**
-Its worker lease expires (`WORKER_LEASE_S`), the callboard marks it stale,
+Its worker lease expires (`WORKER_LEASE_S`), the callboard marks it stale
+(amber "heads-down" instead, while it still holds a task with a live lease),
 and any task it held requeues with `attempt` bumped once its task lease
 (`TASK_LEASE_S`) also expires. Nobody has to notice and reassign by hand.
 

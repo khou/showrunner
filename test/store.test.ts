@@ -216,7 +216,7 @@ describe("lease expiry requeues", () => {
   it("does not requeue an assigned/working task just because its member's poll-lease went stale", () => {
     // A worker heads-down executing (running tools, editing files) may not touch the MCP
     // server at all for long stretches -- it only has to heartbeat every ~10min, well inside
-    // the 15min task lease, but the 90s worker (poll) lease has no such guarantee. Treating a
+    // the 15min task lease, but the 150s worker (poll) lease has no such guarantee. Treating a
     // stale worker lease as task abandonment would requeue -- and duplicate -- live work.
     const { store, clock } = newStore();
     const worker = store.register("myshow", "claude-local");
@@ -224,7 +224,7 @@ describe("lease expiry requeues", () => {
     store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     const claimed = store.claimNextTask(worker.id)!;
 
-    clock.t += 90_001; // past default WORKER_LEASE_S (90s), well under the 900s task lease
+    clock.t += 150_001; // past default WORKER_LEASE_S (150s), well under the 900s task lease
     const result = store.sweep();
     expect(result.expiredMembers).toContain(worker.id); // still shown stale on the callboard
     expect(result.requeuedTasks).toEqual([]); // but the task itself is untouched
@@ -814,7 +814,7 @@ describe("saveNote: realtime push", () => {
     });
     store.claimNextTask(unrelatedWorker.id);
 
-    // Also glob-overlapping, and heads-down: its member lease (90s) goes stale because the
+    // Also glob-overlapping, and heads-down: its member lease (150s) goes stale because the
     // protocol only requires a heartbeat every ~10min while working, but its task is still
     // very much in flight (task lease is 15min) -- it must still receive the note.
     store.createTask({
@@ -827,7 +827,7 @@ describe("saveNote: realtime push", () => {
     });
     store.claimNextTask(headsDownWorker.id);
 
-    clock.t += 100_000; // past WORKER_LEASE_S (90s); renew everyone but headsDownWorker
+    clock.t += 160_000; // past WORKER_LEASE_S (150s); renew everyone but headsDownWorker
     for (const m of [author, sameTaskWorker, sameContextWorker, globWorker, unrelatedWorker, director]) {
       store.touchMember(m.id);
     }
