@@ -9,6 +9,7 @@ import { INSTRUCTIONS } from "./instructions.js";
 import {
   SupersededError,
   type AuthLevel,
+  type BoardState,
   type BoardTaskView,
   type DirectTaskAction,
   type Member,
@@ -17,6 +18,22 @@ import {
   type NoteHit,
   type Task,
 } from "../types.js";
+
+// BoardTaskView.createdAt exists for the callboard's queued-column ordering; no agent reads it,
+// so drop it before serializing boards to MCP callers (DESIGN.md "Summary by default").
+type McpTaskView = Omit<BoardTaskView, "createdAt">;
+
+function stripTaskView({ createdAt: _createdAt, ...rest }: BoardTaskView): McpTaskView {
+  return rest;
+}
+
+function stripBoard(board: BoardState) {
+  return {
+    ...board,
+    tasks: board.tasks.map(stripTaskView),
+    escalations: { ...board.escalations, inputRequired: board.escalations.inputRequired.map(stripTaskView) },
+  };
+}
 
 /** Subset of EnvConfig this module needs; a full EnvConfig satisfies it structurally. */
 export interface McpServerConfig {
@@ -101,7 +118,7 @@ function supersededResult(err: SupersededError): CallToolResult {
 export type AwaitWorkResult =
   | { status: "unknown_member"; member_id: string; hint: string }
   | { status: "messages"; messages: Message[] }
-  | { status: "review"; items: BoardTaskView[] }
+  | { status: "review"; items: McpTaskView[] }
   | { status: "task"; task: Task; relevant_notes: NoteHit[] }
   | { status: "nothing"; hint: string };
 
@@ -156,7 +173,7 @@ function seenIdsFor(store: Store, memberId: string): Set<string> {
  * -- a busy long-poll loop; here it surfaces once per updatedAt change like everything else.
  * get_board's escalations.inputRequired is unaffected: it's a pull, always shows the current set.
  */
-function computeReviewItems(store: Store, member: Member): BoardTaskView[] | null {
+function computeReviewItems(store: Store, member: Member): McpTaskView[] | null {
   const board = store.getBoard(member.show);
   const cursor = store.getReviewCursor(member.id);
   const seen = seenIdsFor(store, member.id);
@@ -176,7 +193,7 @@ function computeReviewItems(store: Store, member: Member): BoardTaskView[] | nul
     // remember them individually or they'd be re-reported on the very next poll.
     for (const t of candidates) seen.add(t.id);
   }
-  return candidates;
+  return candidates.map(stripTaskView);
 }
 
 function checkOnce(store: Store, member: Member): AwaitWorkResult | null {
@@ -317,7 +334,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         args.session_url,
         args.resume_hint,
       );
-      const board_summary = store.getBoard(member.show);
+      const board_summary = stripBoard(store.getBoard(member.show));
       const director = store.directionState(member.show).directorId ?? null;
       const result: Record<string, unknown> = {
         member_id: member.id,
@@ -420,7 +437,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     async (args) => {
       const resolved = resolveMember(store, args.member_id);
       if ("result" in resolved) return resolved.result;
-      return jsonResult(store.getBoard(resolved.member.show, args.verbose));
+      return jsonResult(stripBoard(store.getBoard(resolved.member.show, args.verbose)));
     },
   );
 
@@ -489,7 +506,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       if ("result" in resolved) return resolved.result;
       const result = store.claimDirection(resolved.member.id, args.takeover);
       if (result.ok) {
-        return jsonResult({ status: "claimed", epoch: result.epoch, board_summary: store.getBoard(resolved.member.show) });
+        return jsonResult({ status: "claimed", epoch: result.epoch, board_summary: stripBoard(store.getBoard(resolved.member.show)) });
       }
       return jsonResult({ status: "denied", holder: result.holder, epoch: result.epoch });
     },

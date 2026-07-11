@@ -62,18 +62,22 @@ own chat -- that's what the chat link opens -- and the director translates
 intent into tasks. Manual escape hatches live in the CLI (below), which
 drives the same `/api` the callboard reads. Shows:
 
-- **Director card**: who, epoch, lease freshness, last digest note, and
+- **Director card**: who, epoch, lease freshness, and
   the chat link -- a self-reported `session_url` renders as a prominent
   "open chat ↗", a `resume_hint` (no `session_url`) as click-to-copy code,
   neither as a dim "no chat link reported".
-- **Members**: kind (claude-local, cursor-cloud, ...), role, current task,
-  a staleness dot, and a small ↗ when the member reported a `session_url`.
-- **Task columns**: queued / in-flight / needs-input / done+failed. Click a
-  task to expand its journal. If tasks are queued and no non-stale workers
-  are registered, a banner asks you to open a worker session.
-- **Notes panel**: the last 10 shared notes, newest first (author, tags,
-  trimmed body, age).
-- **Activity feed**: last 50 journal entries and messages.
+- **Members** (the hero card): each registered member with a staleness dot,
+  kind (claude-local, cursor-cloud, ...), role badge, what it is working on
+  right now (task title + status, not just an id), tasks done, joined/seen
+  ages, and a small ↗ when the member reported a `session_url`.
+- **Task columns**: queued / in-flight / needs-input / done+failed. Queued
+  is ordered the way `await_work` claims (priority, then age), so the top
+  card is next in line unless it waits on `depends_on` or a pinned
+  assignee. Click a task to expand its journal. If
+  tasks are queued and no non-stale worker members are registered, a
+  banner asks you to open a worker session.
+- **Activity** (collapsed by default): shared notes, task journal entries,
+  and messages in one newest-first feed, last 50.
 - **Red escalation banner**: any `input-required` task, or any message
   addressed to `human`. This is the thing you actually watch for.
 

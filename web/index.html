@@ -26,7 +26,7 @@
   </div>
 
   <div id="banner" class="banner" hidden></div>
-  <div id="workers-banner" class="banner workers-banner" hidden></div>
+  <div id="queue-banner" class="banner queue-banner" hidden></div>
 
   <main id="board-main">
     <section id="director-card" class="card">
@@ -34,7 +34,7 @@
       <div id="director-body">no show selected</div>
     </section>
 
-    <section id="members-card" class="card">
+    <section id="members-card" class="card hero">
       <h2>members</h2>
       <ul id="members-list"><li class="hint">no show selected</li></ul>
     </section>
@@ -61,15 +61,10 @@
       </div>
     </section>
 
-    <section id="notes-card" class="card wide">
-      <h2>notes</h2>
-      <ul id="notes-list"><li class="hint">no show selected</li></ul>
-    </section>
-
-    <section id="activity-card" class="card wide">
-      <h2>activity</h2>
+    <details id="activity-card" class="card wide">
+      <summary><h2 id="activity-summary">activity</h2></summary>
       <ul id="activity-list"><li class="hint">no show selected</li></ul>
-    </section>
+    </details>
   </main>
 
   <script src="/callboard.js" defer></script>

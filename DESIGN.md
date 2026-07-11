@@ -327,16 +327,21 @@ non-issue; Cursor sessions may need manual recycling.)
 Single static HTML page served at `/`, polling `GET /api/shows/:show/state`
 every 2s. No build step, no framework — one file, fetch + DOM.
 
-- Director card: who, epoch, lease freshness, last digest note, and **the
+- Director card: who, epoch, lease freshness, and **the
   chat link**: `session_url` renders as an "open chat ↗" link,
   `resume_hint` as click-to-copy code, neither as a dim hint that the
   session didn't report one.
-- Members: kind badge, role, current task, last-seen freshness dot, ↗ when
-  a session_url was reported.
+- Members (the hero card: who is on, and on what): freshness dot, memorable
+  id, kind + role badges, the current task rendered by **title and status**
+  (joined from the task list, not an opaque id), tasks done, joined/seen
+  ages, ↗ when a session_url was reported.
 - Task columns: queued / in-flight (assigned+working) / needs-input /
-  done+failed. Click a task → journal + artifacts.
-- Notes panel: recent shared notes (author, tags, trimmed body, age).
-- Activity feed: last 50 journal notes + messages.
+  done+failed. Queued is ordered the way `await_work` claims (priority DESC,
+  age ASC), so the top card is next in line, modulo unmet `depends_on` and
+  pinned assignees, which the claim also honors. Click a task → journal
+  + artifacts.
+- Activity (one demoted feed, collapsed by default): shared notes, task
+  journal entries, and messages interleaved newest-first, last 50.
 - **Red escalation banner**: `input-required` tasks and messages addressed to
   `human`.
 

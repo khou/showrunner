@@ -188,6 +188,9 @@ export interface BoardTaskView {
   assignee: string | null;
   priority: number;
   attempt: number;
+  // createdAt lets the callboard order the queued column the way await_work claims
+  // (priority DESC, age ASC); updatedAt alone can't reconstruct that.
+  createdAt: number;
   updatedAt: number;
   notes?: TaskNote[]; // present only when verbose
 }
