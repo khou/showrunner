@@ -2,6 +2,8 @@
 // showrunner CLI: a human convenience wrapper around GET/POST /api/* (never /mcp, that's
 // the agent surface). Reads SHOWRUNNER_URL / SHOWRUNNER_TOKEN from env, overridable by flags.
 import { parseArgs } from "node:util";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { BoardState, CreateTaskInput, DirectionState, Message, MessageTarget, OverlapWarning, Task } from "../types.js";
 import { INSTRUCTIONS } from "../server/instructions.js";
 
@@ -218,6 +220,23 @@ async function cmdTaskCancel(argv: string[]): Promise<void> {
   process.stdout.write(`canceled task ${result.task.id}: "${result.task.title}" (status: ${result.task.status})\n`);
 }
 
+async function cmdShowDelete(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      show: { type: "string" },
+      url: { type: "string" },
+      token: { type: "string" },
+    },
+    allowPositionals: false,
+  });
+  const cfg = requireConfig(values);
+  if (!values.show) throw new UsageError("show delete requires --show");
+
+  await apiRequest<{ deleted: string }>(cfg, "DELETE", `/api/shows/${encodeURIComponent(values.show)}`);
+  process.stdout.write(`deleted show ${values.show} and all its members, tasks, notes, and messages\n`);
+}
+
 // --- message ---
 
 async function cmdMessage(argv: string[]): Promise<void> {
@@ -259,6 +278,93 @@ async function cmdDirectionClear(argv: string[]): Promise<void> {
 
   await apiRequest<{ direction: DirectionState }>(cfg, "POST", `/api/shows/${encodeURIComponent(values.show)}/direction/clear`);
   process.stdout.write(`cleared direction for ${values.show}; show is headless until a new claim_direction\n`);
+}
+
+// --- init ---
+
+const PLAYBOOK_TEMPLATE = `# Show playbook
+
+Read by the director right after \`claim_direction\`. Everything here overrides
+the generic protocol defaults. Keep it short; briefs should point at docs, not
+duplicate them.
+
+## What this project is
+
+<one paragraph: what the project does and where to read more (README, docs/)>
+
+## How to break down work
+
+- Task size: 5-20 minutes of agent work; one concern per task.
+- Areas and their files (keep \`files_hint\` globs inside one area per task):
+  - <area>: <globs>
+- Ordering: <what must land before what; use depends_on>
+
+## Conventions workers must follow
+
+- Branch per task: \`show/<task_id>-<slug>\` (protocol default).
+- <build/test command a task is not done without>
+- <code style, commit style, or review notes>
+
+## Escalation
+
+- Decisions the director may make alone: <...>
+- Decisions that must go to the human (\`send_message\` to \`human\`): <...>
+`;
+
+/** Writes a file unless it exists; reports either way. */
+function scaffold(path: string, content: string): void {
+  if (existsSync(path)) {
+    process.stdout.write(`  exists, left alone: ${path}\n`);
+    return;
+  }
+  writeFileSync(path, content);
+  process.stdout.write(`  wrote ${path}\n`);
+}
+
+function cmdInit(argv: string[]): void {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      show: { type: "string" },
+      url: { type: "string" },
+      dir: { type: "string" },
+    },
+    allowPositionals: false,
+  });
+  if (!values.show) throw new UsageError("init requires --show <name>");
+  const dir = values.dir ?? process.cwd();
+  const base = optionalUrl(values) ?? "https://<your-app>.fly.dev";
+  const mcpEntry = {
+    mcpServers: {
+      showrunner: {
+        type: "http",
+        url: `${base}/mcp`,
+        headers: { Authorization: "Bearer ${SHOWRUNNER_TOKEN}" },
+      },
+    },
+  };
+  const cursorEntry = {
+    mcpServers: {
+      showrunner: {
+        url: `${base}/mcp`,
+        headers: { Authorization: "Bearer ${env:SHOWRUNNER_TOKEN}" },
+      },
+    },
+  };
+
+  process.stdout.write(`initializing showrunner for show "${values.show}" in ${dir}\n`);
+  scaffold(join(dir, ".showrunner"), values.show + "\n");
+  scaffold(join(dir, "SHOWRUNNER.md"), PLAYBOOK_TEMPLATE);
+  scaffold(join(dir, ".mcp.json"), JSON.stringify(mcpEntry, null, 2) + "\n");
+  mkdirSync(join(dir, ".cursor"), { recursive: true });
+  scaffold(join(dir, ".cursor", "mcp.json"), JSON.stringify(cursorEntry, null, 2) + "\n");
+  process.stdout.write(`
+next steps:
+  1. Fill in SHOWRUNNER.md (the director's playbook for this show) and commit all four files.
+  2. Make sure SHOWRUNNER_TOKEN is set in the environment of every client
+     (shell env for local sessions, environment settings for cloud sessions).
+  3. In any session in this repo: "You're a showrunner worker." / "You're the showrunner director."
+`);
 }
 
 // --- instructions ---
@@ -348,6 +454,8 @@ Usage:
   showrunner message --show <name> --to <member-id|director|all|human> --body <text>
                       [--url <url>] [--token <token>]
   showrunner direction clear --show <name> [--url <url>] [--token <token>]
+  showrunner show delete --show <name> [--url <url>] [--token <token>]
+  showrunner init --show <name> [--url <url>] [--dir <path>]
   showrunner instructions
   showrunner snippets [--url <url>]
 
@@ -375,6 +483,13 @@ async function main(): Promise<void> {
       case "direction":
         if (rest[0] !== "clear") throw new UsageError(`unknown "direction" subcommand: ${rest[0] ?? "(none)"} (expected: direction clear)`);
         await cmdDirectionClear(rest.slice(1));
+        break;
+      case "show":
+        if (rest[0] !== "delete") throw new UsageError(`unknown "show" subcommand: ${rest[0] ?? "(none)"} (expected: show delete)`);
+        await cmdShowDelete(rest.slice(1));
+        break;
+      case "init":
+        cmdInit(rest);
         break;
       case "instructions":
         cmdInstructions();

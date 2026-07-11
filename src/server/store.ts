@@ -527,6 +527,28 @@ export class Store {
     });
   }
 
+  /** Deletes a show and every record under it. Returns false if the show doesn't exist. */
+  deleteShow(show: string): boolean {
+    return this.txn(() => {
+      const exists = this.db.prepare("SELECT 1 FROM shows WHERE name = ?").get(show);
+      if (!exists) return false;
+      this.db
+        .prepare("DELETE FROM message_reads WHERE message_id IN (SELECT id FROM messages WHERE show = ?)")
+        .run(show);
+      this.db.prepare("DELETE FROM messages WHERE show = ?").run(show);
+      this.db.prepare("DELETE FROM task_notes WHERE task_id IN (SELECT id FROM tasks WHERE show = ?)").run(show);
+      this.db.prepare("DELETE FROM notes_fts WHERE show = ?").run(show);
+      this.db.prepare("DELETE FROM notes WHERE show = ?").run(show);
+      this.db.prepare("DELETE FROM tasks WHERE show = ?").run(show);
+      this.db.prepare("DELETE FROM members WHERE show = ?").run(show);
+      this.db.prepare("DELETE FROM direction WHERE show = ?").run(show);
+      this.db.prepare("DELETE FROM shows WHERE name = ?").run(show);
+      // Parked polls of deleted members resolve on their next check with unknown_member.
+      this.events.emit(`wake:show:${show}`);
+      return true;
+    });
+  }
+
   showNames(): string[] {
     return this.db
       .prepare("SELECT name FROM shows ORDER BY name")

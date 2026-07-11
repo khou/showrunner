@@ -169,6 +169,18 @@ One row per show: `{director_id, epoch, lease_expires_at}`.
   protocol needed. The server is the sole arbiter, so fencing is one integer
   compare.
 
+### The show playbook (SHOWRUNNER.md)
+
+Generic protocol tells a director *how to direct*; it can't know how to
+decompose *this* project. That knowledge lives in the repo, next to the code
+it describes: `showrunner init` scaffolds `SHOWRUNNER.md` (area/file map,
+task-granularity guidance, conventions, escalation rules) alongside
+`.showrunner`, and the director protocol reads it immediately after
+`claim_direction`, treating it as an override of the generic defaults. Repo
+placement means it travels with every clone, worktree, and cloud checkout,
+and a takeover director in a brand-new session picks it up with zero server
+machinery. The server never stores or parses it.
+
 ## Shared notes: realtime memory
 
 Agents working in parallel learn things the others need *now*, not on their

@@ -54,9 +54,12 @@ Open a second one and say:
 
 > "You're the showrunner director."
 
-The show name comes from the repo: a committed one-line `.showrunner` file
-if present, else the git remote or directory name. If your checkouts carry
-suffixed names (`mygame-w2`, worktrees), pin it: `echo mygame > .showrunner`.
+To make a repo a first-class show, run `showrunner init --show mygame --url
+https://<your-app>.fly.dev` in it (CLI setup in the docs). That scaffolds
+`.showrunner` (pins the show name for every clone and worktree),
+`SHOWRUNNER.md` (the show playbook: how the director should break down THIS
+project; directors read it right after taking direction), and the two MCP
+config files. Fill in the playbook, commit.
 
 See [DESIGN.md](DESIGN.md) for why it's built this way, and
 [docs/OPERATING.md](docs/OPERATING.md) for everything operational: client

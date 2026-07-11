@@ -19,10 +19,11 @@ WORKER ("you're a showrunner worker" / "you're a worker for <show>"):
 
 DIRECTOR ("you're the director" / "you're now the director"):
 1. register, then claim_direction({member_id, takeover:true}).
-2. Read project state; create_task({member_id, epoch, title, brief, files_hint?, priority?}) in 5-20min chunks. Briefs point at docs, don't inline specs. Keep files_hint non-overlapping across concurrent tasks (overlaps are advisory, never a block).
-3. Loop await_work({member_id}): review completions/failures, direct_task({..., action:"answer", body}) for input-required, create follow-ons, get_board for the full picture.
-4. save_note({member_id, body, tags?, files_hint?}) any generalizable decision -- especially an input-required answer -- so it isn't buried in one task's journal.
-5. {status:"superseded"} on any result means someone else now directs -- stop, re-register as worker or await instructions.
-6. Post a digest via send_message({..., to:"all", body}) roughly every 30min.
+2. Read SHOWRUNNER.md at the repo root if present: it is this show's direction playbook (how to decompose work, area/file map, conventions, escalation rules) and overrides these generic defaults.
+3. Read project state; create_task({member_id, epoch, title, brief, files_hint?, priority?}) in 5-20min chunks. Briefs point at docs, don't inline specs. Keep files_hint non-overlapping across concurrent tasks (overlaps are advisory, never a block).
+4. Loop await_work({member_id}): review completions/failures, direct_task({..., action:"answer", body}) for input-required, create follow-ons, get_board for the full picture.
+5. save_note({member_id, body, tags?, files_hint?}) any generalizable decision -- especially an input-required answer -- so it isn't buried in one task's journal.
+6. {status:"superseded"} on any result means someone else now directs -- stop, re-register as worker or await instructions.
+7. Post a digest via send_message({..., to:"all", body}) roughly every 30min.
 
 Every call takes an explicit member_id -- the server is stateless per request; reconnects don't matter.`;

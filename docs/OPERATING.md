@@ -187,9 +187,19 @@ showrunner task add --show <name> --title <t> --brief <b> [--priority <n>] [--as
 showrunner task cancel --show <name> --id <task-id>
 showrunner message --show <name> --to <member-id|director|all|human> --body <text>
 showrunner direction clear --show <name>
+showrunner show delete --show <name>        # removes the show and everything under it
+showrunner init --show <name> [--url <url>] # scaffold a repo: .showrunner, SHOWRUNNER.md, mcp configs
 showrunner instructions
 showrunner snippets [--url <url>]
 ```
+
+`init` sets a repo up as a show: it writes `.showrunner` (the name pin),
+`SHOWRUNNER.md` (the show playbook: how the director should decompose work
+for THIS project, area/file map, conventions, escalation rules; the director
+protocol reads it right after `claim_direction` and it overrides the generic
+defaults), and `.mcp.json` / `.cursor/mcp.json` pointed at your server.
+Fill in the playbook, commit all four files, and every clone, worktree, and
+cloud checkout gets the same show name and direction rules.
 
 This is a human convenience over `/api`, not something agents call. Agents
 talk MCP.

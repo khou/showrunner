@@ -95,6 +95,12 @@ export function createApiRoutes(store: Store, dbPath: string): Hono {
     }
   });
 
+  api.delete("/shows/:show", (c) => {
+    const show = c.req.param("show");
+    if (!store.deleteShow(show)) return c.json({ error: `no such show: ${show}` }, 404);
+    return c.json({ deleted: show });
+  });
+
   api.post("/shows/:show/direction/clear", (c) => {
     const show = c.req.param("show");
     store.clearDirection(show);

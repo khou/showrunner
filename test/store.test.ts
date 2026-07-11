@@ -1076,3 +1076,40 @@ describe("members.session_url/resume_hint migration", () => {
     }
   });
 });
+
+describe("deleteShow", () => {
+  it("removes the show and every record under it, including FTS rows", () => {
+    const { store } = newStore();
+    const worker = store.register("myshow", "claude-local");
+    const director = store.register("myshow", "claude-local");
+    store.claimDirection(director.id, true);
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
+    store.claimNextTask(worker.id);
+    store.updateTask(worker.id, task.id, { status: "working", note: "n" });
+    store.sendMessage(director.id, "all", "hello");
+    store.saveNote(worker.id, { body: "distinctive gotcha zanzibar", tags: ["gotcha"] });
+
+    expect(store.deleteShow("myshow")).toBe(true);
+    expect(store.showNames()).not.toContain("myshow");
+    expect(store.touchMember(worker.id)).toBeUndefined();
+    expect(store.directionState("myshow").directorId).toBeUndefined();
+    expect(store.searchNotes("myshow", "zanzibar")).toEqual([]);
+    const counts = store.getBoard("myshow").taskCounts;
+    expect(Object.values(counts).reduce((a, b) => a + b, 0)).toBe(0);
+  });
+
+  it("returns false for a show that does not exist", () => {
+    const { store } = newStore();
+    expect(store.deleteShow("ghost")).toBe(false);
+  });
+
+  it("does not touch other shows", () => {
+    const { store } = newStore();
+    const a = store.register("keep", "claude-local");
+    store.createTask({ show: "keep", title: "t", brief: "b", createdBy: a.id });
+    store.register("drop", "claude-local");
+    store.deleteShow("drop");
+    expect(store.showNames()).toEqual(["keep"]);
+    expect(store.getBoard("keep").taskCounts.queued).toBe(1);
+  });
+});
