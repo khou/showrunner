@@ -14,68 +14,18 @@ One SQLite file, one read-only dashboard, a small fixed MCP tool surface.
 
 ## Get started
 
-Paste this into any coding agent with shell access (Claude Code, Cursor),
-from inside the project repo you want coordinated:
+1. Paste into any coding agent with shell access (Claude Code, Cursor), from inside the project repo you want coordinated:
 
-> Set up showrunner for me. Fetch
-> https://raw.githubusercontent.com/khou/showrunner/main/docs/SETUP.md
-> and follow it: deploy the server to my Fly account, verify it, initialize
-> this repo as a show, and become the idle director. Ask me before anything
-> that costs money or edits config outside this repo.
+   > Set up showrunner for me. Fetch
+   > https://raw.githubusercontent.com/khou/showrunner/main/docs/SETUP.md
+   > and follow it: deploy the server to my Fly account, verify it, initialize
+   > this repo as a show, and become the idle director. Ask me before anything
+   > that costs money or edits config outside this repo.
 
-You bring a [Fly.io](https://fly.io) account (the agent will prompt you to
-`fly auth login` if needed; login and billing stay in your hands). The agent
-deploys one small always-on machine (~$3/mo), runs `showrunner init` in this
-repo, and finishes as the show's director with your callboard link. Prefer
-doing it by hand? [docs/SETUP.md](docs/SETUP.md) is the same runbook.
+2. Paste into each session opened in this repo that you want doing work:
 
-### After setup: two tokens, two prompts
+   > You're a showrunner worker.
 
-`init` writes:
+3. Paste into a session that holds the director token (the setup session already does):
 
-| Piece | Where | Who uses it |
-|---|---|---|
-| **Worker** bearer | committed in `.mcp.json` / `.cursor/mcp.json` under `showrunner` | any clone / cloud worker (no secrets setup) |
-| **Director** bearer | gitignored `.env` as `SHOWRUNNER_TOKEN`; MCP entry `showrunner-director` | trusted director sessions only |
-
-Only the director token can `claim_direction`, create tasks, change the show's
-rules, or control membership (mint invites, evict members). Each session also
-gets a per-member secret at `register`, so one member can't act as another.
-
-In a worker session (MCP already configured from the repo):
-
-> You're a showrunner worker.
-
-In a director session (`showrunner-director` MCP + `SHOWRUNNER_TOKEN` in env):
-
-> You're the showrunner director.
-
-### Ways to run
-
-- **A. Simple fleet** — one director + N general workers (default).
-- **B. Dedicated lanes (optional)** — open role-focused sessions (e.g. art /
-  verify) with a clear `display_name` and pin matching tasks with `assignee`
-  (note the preference in `SHOWRUNNER.md`). Useful when some sessions have tools
-  others lack (laptop secrets, GPU, browser, local stack vs cloud).
-
-Fleet rules (release gate, merge approval, note propagation, artifact caps,
-invite requirement, advisory policy) are **server-held show state**, not a repo
-file, so policy that governs untrusted members isn't editable by them. Change
-them with `showrunner rules set` or the director's `update_rules`.
-
-**Adding someone else's agent:** turn on `requireInvite`
-(`showrunner rules set --require-invite on`), have the director `mint_invite` a
-single-use token, and the guest passes it to register. `evict_member` removes
-one. The **callboard is a read-only window** -- every write goes through the CLI
-or the director agent; a dead director is recovered by pasting
-`You're now the director of <show>.` into a session that holds the director
-token (the callboard shows this prompt when the seat is stale).
-
-If the show includes agents run by other people, read
-[docs/SECURITY.md](docs/SECURITY.md) first. See [DESIGN.md](DESIGN.md) for why
-it's built this way, and [docs/OPERATING.md](docs/OPERATING.md) for client
-setup, callboard, membership, notes, rules, env knobs, CLI, FAQ, and security.
-
-## License
-
-MIT, see [LICENSE](LICENSE).
+   > You're the showrunner director.
