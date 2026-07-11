@@ -203,6 +203,44 @@ export interface BoardMemberView {
   currentTaskId: string | null;
   sessionUrl?: string;
   resumeHint?: string;
+  // Invite provenance (present when the member joined via an invite): which invite, minted by whom.
+  invitedVia?: string;
+  invitedBy?: string;
+  // Eviction: set once the director evicts this member (credential revoked). The row stays on the
+  // board so the director can see who was removed and by whom.
+  evicted?: boolean;
+  evictedBy?: string;
+  evictedAt?: number;
+}
+
+/** A single-use, show-scoped invite the director mints so a specific outside agent can register
+ * when `requireInvite` is on. The DB stores only the token's hash; the plaintext is returned once
+ * at mint time (same discipline as member secrets). */
+export interface Invite {
+  id: string;
+  show: string;
+  mintedBy: string;
+  mintedAt: number;
+  expiresAt: number;
+  usedAt: number | null;
+  usedBy: string | null;
+}
+
+export interface MintInviteResult {
+  id: string;
+  token: string; // plaintext, shown once
+  expiresAt: number;
+}
+
+/** Thrown by Store.register when an invite token is required/supplied but invalid (unknown,
+ * already used, expired, or wrong show). The MCP layer turns it into a structured tool result. */
+export class InviteError extends Error {
+  readonly reason: "invalid" | "used" | "expired";
+  constructor(reason: "invalid" | "used" | "expired", message: string) {
+    super(message);
+    this.name = "InviteError";
+    this.reason = reason;
+  }
 }
 
 export interface BoardTaskView {
@@ -292,6 +330,10 @@ export interface ShowRuleSwitches {
   artifactTextMaxChars: number;
   /** Max serialized-JSON bytes for a `data` artifact; enforced in updateTask. */
   artifactDataMaxBytes: number;
+  /** When on, worker-token registration is refused without a valid single-use invite (minted by
+   * the director). Default off so solo shows keep the frictionless shared worker token. Enforced
+   * in the register tool. Director-token registration is always exempt. */
+  requireInvite: boolean;
 }
 
 /**
@@ -390,6 +432,7 @@ export function readRulesDefaults(env: NodeJS.ProcessEnv = process.env): ShowRul
     workerNotePropagation: parseBool(env.WORKER_NOTE_PROPAGATION, true),
     artifactTextMaxChars: parsePositiveInt(env.ARTIFACT_TEXT_MAX_CHARS, DEFAULT_ARTIFACT_TEXT_MAX),
     artifactDataMaxBytes: parsePositiveInt(env.ARTIFACT_DATA_MAX_BYTES, DEFAULT_ARTIFACT_DATA_MAX),
+    requireInvite: parseBool(env.REQUIRE_INVITE, false),
   };
 }
 

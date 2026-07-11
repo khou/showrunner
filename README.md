@@ -8,7 +8,7 @@ back; tell a second session "you're the showrunner director" and it takes
 over planning: breaking work into tasks, reviewing results, answering
 blockers. State lives on the server, not in any session, so sessions are
 cattle: kill one anytime and a new one picks up exactly where it left off.
-One SQLite file, one static dashboard, ten MCP tools.
+One SQLite file, one read-only dashboard, a small fixed MCP tool surface.
 
 ![The callboard: a director and three workers across Claude Code and Cursor, tasks moving through the columns, and a blocker escalated to the human](assets/callboard.png)
 
@@ -38,9 +38,9 @@ doing it by hand? [docs/SETUP.md](docs/SETUP.md) is the same runbook.
 | **Worker** bearer | committed in `.mcp.json` / `.cursor/mcp.json` under `showrunner` | any clone / cloud worker (no secrets setup) |
 | **Director** bearer | gitignored `.env` as `SHOWRUNNER_TOKEN`; MCP entry `showrunner-director` | trusted director sessions only |
 
-Only the director token can `claim_direction`, create tasks, mutate the
-callboard API, or change the show's rules. Each session also gets a per-member
-secret at `register`, so one member can't act as another.
+Only the director token can `claim_direction`, create tasks, change the show's
+rules, or control membership (mint invites, evict members). Each session also
+gets a per-member secret at `register`, so one member can't act as another.
 
 In a worker session (MCP already configured from the repo):
 
@@ -59,14 +59,22 @@ In a director session (`showrunner-director` MCP + `SHOWRUNNER_TOKEN` in env):
   others lack (laptop secrets, GPU, browser, local stack vs cloud).
 
 Fleet rules (release gate, merge approval, note propagation, artifact caps,
-advisory policy) are **server-held show state**, not a repo file, so policy that
-governs untrusted members isn't editable by them. Change them with
-`showrunner rules set` or on the callboard.
+invite requirement, advisory policy) are **server-held show state**, not a repo
+file, so policy that governs untrusted members isn't editable by them. Change
+them with `showrunner rules set` or the director's `update_rules`.
+
+**Adding someone else's agent:** turn on `requireInvite`
+(`showrunner rules set --require-invite on`), have the director `mint_invite` a
+single-use token, and the guest passes it to register. `evict_member` removes
+one. The **callboard is a read-only window** -- every write goes through the CLI
+or the director agent; a dead director is recovered by pasting
+`You're now the director of <show>.` into a session that holds the director
+token (the callboard shows this prompt when the seat is stale).
 
 If the show includes agents run by other people, read
 [docs/SECURITY.md](docs/SECURITY.md) first. See [DESIGN.md](DESIGN.md) for why
 it's built this way, and [docs/OPERATING.md](docs/OPERATING.md) for client
-setup, callboard, notes, rules, env knobs, CLI, FAQ, and security.
+setup, callboard, membership, notes, rules, env knobs, CLI, FAQ, and security.
 
 ## License
 

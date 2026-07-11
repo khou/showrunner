@@ -28,6 +28,7 @@ const rulesPatchSchema = z
         requireTaskRelease: z.boolean().optional(),
         requireHumanMergeApproval: z.boolean().optional(),
         workerNotePropagation: z.boolean().optional(),
+        requireInvite: z.boolean().optional(),
         artifactTextMaxChars: z.number().int().positive().optional(),
         artifactDataMaxBytes: z.number().int().positive().optional(),
       })
