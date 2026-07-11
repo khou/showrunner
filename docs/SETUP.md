@@ -153,13 +153,37 @@ gitignored `.env`. Then:
 2. Commit `.showrunner`, `SHOWRUNNER.md`, `.mcp.json`,
    `.cursor/mcp.json` (never `.env`).
 
-## 6. Final report
+## 6. Take direction
+
+You, the setup agent, become the show's first director: call `register`
+(with `session_url`/`resume_hint` if you can determine them) and
+`claim_direction({takeover: true})`, and read the playbook per protocol.
+**Create no tasks.** Planning starts when the user tells you what they
+want; setup ends with a healthy, idle show.
+
+## 7. Final report and hand-off
 
 Tell the user, concretely:
-- The callboard link: `https://<APP>.fly.dev/?token=<token>` (opening it
-  once signs the browser in; the URL cleans itself).
-- The two sentences that make any session join:
-  "You're a showrunner worker." / "You're the showrunner director."
+
+- **The callboard link**, without pasting the raw secret into the
+  transcript:
+  ```bash
+  open "https://<APP>.fly.dev/?token=$(cat <token file>)"
+  ```
+  Opening it once signs the browser in; the URL cleans itself. The board
+  should show this session as director, no tasks, no escalations.
+- **The status check** they can run anytime to confirm everything is
+  healthy:
+  ```bash
+  curl -s https://<APP>.fly.dev/healthz
+  node ~/showrunner/dist/cli/index.js status --show <show> --url https://<APP>.fly.dev --token $(cat <token file>)
+  ```
+  Healthy means: `{"ok":true}`, the status shows a live director (this
+  session), and zero stale members.
+- **The suggested next step**: open another agent session in this repo
+  and say "You're a showrunner worker." It appears on the callboard
+  within seconds. Then tell THIS session what to build; as director it
+  turns intent into tasks and the workers pick them up.
 - Where things live: token file, server app name, the clone path (CLI:
   `node ~/showrunner/dist/cli/index.js`, alias suggestion in
   docs/OPERATING.md).
