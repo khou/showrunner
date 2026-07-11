@@ -153,14 +153,15 @@ showrunner MCP that hardcodes the director token for everyone.
   **director** token separately. Point the user at the dashboard; do not
   handle tokens in a browser for them.
 - **Claude Code cloud directors:** add `SHOWRUNNER_TOKEN` to cloud env and
-  allowlist `<APP>.fly.dev`. Workers need neither.
+  allowlist `$APP.fly.dev`. Workers need neither.
 
 ## 6. Take direction
 
 You, the setup agent, become the show's first director: use the
 **showrunner-director** tools, call `register` (with `session_url` /
-`resume_hint` if you can determine them) and
-`claim_direction({takeover: true})`, and read the playbook per protocol.
+`resume_hint` if you can determine them) and then `claim_direction` with
+`takeover: true` plus the `member_id` and `member_secret` register
+returned, and read the playbook per protocol.
 **Create no tasks.** Planning starts when the user tells you what they
 want; setup ends with a healthy, idle show.
 

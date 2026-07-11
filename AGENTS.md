@@ -11,5 +11,5 @@
 ## Learned Workspace Facts
 
 - Auth uses `SHOWRUNNER_TOKEN` (director) and `SHOWRUNNER_WORKER_TOKEN` (worker); the worker token is intended to be shareable/committable for remote agents.
-- Production Fly app is `showrunner-kh` (MCP at `https://showrunner-kh.fly.dev/mcp`); it does not collide with consumer project Fly apps.
+- The maintainer's production Fly app is separate from consumer project Fly apps; names and secrets do not collide.
 - Worker role specialization is expressed through show rules, not by showrunner owning or routing subagents.

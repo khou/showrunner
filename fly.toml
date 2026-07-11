@@ -1,4 +1,4 @@
-app = "showrunner-kh"
+app = "showrunner-CHANGEME" # pick a globally-unique name (SETUP.md step 2 rewrites this)
 primary_region = "sjc" # change to whatever `fly launch` suggests as closest to you
 
 [build]
