@@ -61,6 +61,9 @@ export interface Task {
   createdBy: string;
   leaseExpiresAt: number | null;
   artifacts: TaskArtifact[];
+  // False only while withheld by the human release gate (REQUIRE_TASK_RELEASE); an unreleased
+  // task is queued but not claimable until a human releases it. Defaults true everywhere else.
+  released: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -84,6 +87,9 @@ export interface CreateTaskInput {
   filesHint?: string[];
   priority?: number;
   assignee?: string;
+  // When false, the task is created withheld (not claimable) until a human releases it. Set by
+  // the create_task tool when REQUIRE_TASK_RELEASE is on. Defaults to released.
+  released?: boolean;
 }
 
 // Advisory-only: files_hint globs on the new task intersect an in-flight task's globs.
@@ -192,6 +198,9 @@ export interface BoardTaskView {
   // (priority DESC, age ASC); updatedAt alone can't reconstruct that.
   createdAt: number;
   updatedAt: number;
+  // False when withheld by the human release gate: a queued task that no worker can claim until
+  // a human releases it. The callboard surfaces these as a distinct "pending release" state.
+  released: boolean;
   notes?: TaskNote[]; // present only when verbose
 }
 
@@ -258,6 +267,10 @@ export interface EnvConfig extends LeaseConfig, NoteConfig {
   dataDir: string;
   pollHoldSeconds: number;
   sweepIntervalS: number;
+  /** When true, director-created tasks are withheld until a human releases them on the callboard
+   * (REQUIRE_TASK_RELEASE). Off by default to preserve OOTB automation; turn on when admitting
+   * workers you do not fully trust, so a malicious director can't dispatch work unreviewed. */
+  requireTaskRelease: boolean;
 }
 
 const DEFAULT_LEASES: LeaseConfig = { workerLeaseS: 90, taskLeaseS: 900, directionLeaseS: 600 };
@@ -267,6 +280,11 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
   if (raw === undefined || raw === "") return fallback;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+function parseBool(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined || raw === "") return fallback;
+  return /^(1|true|yes|on)$/i.test(raw.trim());
 }
 
 /** Lease TTLs only; no required vars, safe to call from the store without a token configured. */
@@ -310,6 +328,7 @@ export function readEnvConfig(env: NodeJS.ProcessEnv = process.env): EnvConfig {
     dataDir: env.DATA_DIR && env.DATA_DIR.length > 0 ? env.DATA_DIR : "/data",
     pollHoldSeconds: parsePositiveInt(env.POLL_HOLD_SECONDS, 25),
     sweepIntervalS: parsePositiveInt(env.SWEEP_INTERVAL_S, 5),
+    requireTaskRelease: parseBool(env.REQUIRE_TASK_RELEASE, false),
     ...readLeaseConfig(env),
     ...readNoteConfig(env),
   };

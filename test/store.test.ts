@@ -1113,3 +1113,97 @@ describe("deleteShow", () => {
     expect(store.getBoard("keep").taskCounts.queued).toBe(1);
   });
 });
+
+describe("member secrets (per-member auth)", () => {
+  it("issueMemberSecret returns a high-entropy secret that verifies, and a wrong one does not", () => {
+    const { store } = newStore();
+    const m = store.register("myshow", "claude-local");
+    const secret = store.issueMemberSecret(m.id);
+    expect(secret.length).toBeGreaterThanOrEqual(20);
+    expect(store.verifyMemberSecret(m.id, secret)).toBe(true);
+    expect(store.verifyMemberSecret(m.id, secret + "x")).toBe(false);
+    expect(store.verifyMemberSecret(m.id, "")).toBe(false);
+  });
+
+  it("a member with no issued secret (e.g. the human pseudo-member) verifies nothing", () => {
+    const { store } = newStore();
+    const m = store.register("myshow", "claude-local");
+    // No issueMemberSecret call: the stored hash is NULL, so nothing authenticates as this member.
+    expect(store.verifyMemberSecret(m.id, "")).toBe(false);
+    expect(store.verifyMemberSecret(m.id, "anything")).toBe(false);
+  });
+
+  it("an unknown member id verifies nothing (no oracle) and re-issuing rotates the secret", () => {
+    const { store } = newStore();
+    expect(store.verifyMemberSecret("nobody", "x")).toBe(false);
+    const m = store.register("myshow", "claude-local");
+    const first = store.issueMemberSecret(m.id);
+    const second = store.issueMemberSecret(m.id);
+    expect(second).not.toBe(first);
+    expect(store.verifyMemberSecret(m.id, first)).toBe(false); // old secret no longer valid
+    expect(store.verifyMemberSecret(m.id, second)).toBe(true);
+  });
+
+  it("secrets survive a reopen (hash persisted, not just in memory)", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "showrunner-secret-"));
+    try {
+      const dbPath = path.join(dir, "s.db");
+      let store = new Store(dbPath);
+      const m = store.register("myshow", "claude-local");
+      const secret = store.issueMemberSecret(m.id);
+      store = new Store(dbPath);
+      expect(store.verifyMemberSecret(m.id, secret)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("human release gate (released column)", () => {
+  it("a released task is claimable; a withheld one is not until released", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+
+    const { task: held } = store.createTask({ show: "myshow", title: "held", brief: "b", createdBy: director.id, released: false });
+    expect(held.released).toBe(false);
+    // Nothing claimable while withheld.
+    expect(store.claimNextTask(worker.id)).toBeUndefined();
+
+    const released = store.releaseTask(held.id, "human");
+    expect(released?.released).toBe(true);
+    const claimed = store.claimNextTask(worker.id);
+    expect(claimed?.id).toBe(held.id);
+  });
+
+  it("tasks default to released (backward compatible) and the board exposes the flag", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
+    expect(task.released).toBe(true);
+    const view = store.getBoard("myshow").tasks.find((t) => t.id === task.id);
+    expect(view?.released).toBe(true);
+  });
+
+  it("releaseTask is idempotent and returns undefined for an unknown task", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, released: false });
+    const first = store.releaseTask(task.id, "human");
+    const second = store.releaseTask(task.id, "human");
+    expect(first?.released).toBe(true);
+    expect(second?.released).toBe(true);
+    expect(store.releaseTask("no-such-task", "human")).toBeUndefined();
+  });
+
+  it("a withheld task is skipped in favor of a released one, regardless of priority", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    // Higher-priority task is withheld; lower-priority one is released. The released one wins.
+    store.createTask({ show: "myshow", title: "held-high", brief: "b", createdBy: director.id, priority: 10, released: false });
+    const { task: open } = store.createTask({ show: "myshow", title: "open-low", brief: "b", createdBy: director.id, priority: 1 });
+    const claimed = store.claimNextTask(worker.id);
+    expect(claimed?.id).toBe(open.id);
+  });
+});

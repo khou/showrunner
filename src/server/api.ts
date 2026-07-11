@@ -96,6 +96,15 @@ export function createApiRoutes(store: Store, dbPath: string): Hono {
     }
   });
 
+  // Human release of a task withheld by the REQUIRE_TASK_RELEASE gate. Director-token gated (like
+  // every mutating /api route), so this is a genuine human-in-the-loop checkpoint on a brief
+  // before any worker can claim it, not something a registered agent can trigger for itself.
+  api.post("/shows/:show/tasks/:id/release", (c) => {
+    const task = store.releaseTask(c.req.param("id"), "human");
+    if (!task) return c.json({ error: `no such task: ${c.req.param("id")}` }, 404);
+    return c.json({ task });
+  });
+
   api.delete("/shows/:show", (c) => {
     const show = c.req.param("show");
     if (!store.deleteShow(show)) return c.json({ error: `no such show: ${show}` }, 404);

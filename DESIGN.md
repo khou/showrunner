@@ -92,11 +92,12 @@ SQLite (better-sqlite3, WAL). All rows plain JSON-friendly; `sqlite3` CLI or
 ```
 shows      { name PK, created_at, config_json }
 members    { id PK, show, kind, display_name, role, registered_at,
-             last_seen_at, lease_expires_at, current_task_id }
+             last_seen_at, lease_expires_at, current_task_id, secret_hash }
 direction  { show PK, director_id, epoch, lease_expires_at }   -- one row per show
 tasks      { id PK, show, context_id, title, brief, files_hint_json,
              depends_on_json, priority, status, assignee, attempt,
-             created_by, lease_expires_at, artifacts_json, created_at, updated_at }
+             created_by, lease_expires_at, artifacts_json, released,
+             created_at, updated_at }
 task_notes { id PK, task_id, author, body, created_at }         -- append-only journal
 messages   { id PK, show, from_id, to_id, task_id, body, kind, created_at }
 message_reads { message_id, member_id }                         -- unread-only delivery
@@ -125,8 +126,13 @@ queued ──▶ assigned ──▶ working ──▶ completed
 ```
 
 - `queued → assigned` happens inside `await_work` (atomic claim in a SQLite
-  transaction; dependency-unblocked, priority DESC, age ASC; honors a pinned
-  `assignee` if the director set one).
+  transaction; dependency-unblocked, `released = 1`, priority DESC, age ASC;
+  honors a pinned `assignee` if the director set one).
+- **Release gate:** with `REQUIRE_TASK_RELEASE` on, `create_task` inserts the
+  task with `released = 0`; it stays `queued` but is not claimable until a human
+  releases it (`POST /api/.../release`, or the callboard Release button). Off by
+  default, so OOTB automation is unchanged; the security lever for untrusted
+  workers (see Security posture).
 - `input-required` is distinct from `failed` on purpose: it means "a decision
   is needed", pings the director's poll, and pulses amber on the callboard.
 - Terminal statuses are idempotent by task id: a worker whose lease was
@@ -247,8 +253,10 @@ matter).
 **Shared:**
 
 1. `register({show, kind, display_name?, capabilities?, session_url?,
-   resume_hint?})` → `{member_id, show, director, board_summary, protocol}`
-   — creates the show if new; `protocol` is the full worker/director loop
+   resume_hint?})` → `{member_id, member_secret, show, director,
+   board_summary, protocol}` — creates the show if new; `member_secret` is
+   issued once and must accompany `member_id` on every later call (per-member
+   auth); `protocol` is the full worker/director loop
    contract in ~600 tokens, so even a client that ignored the server
    instructions knows what to do next. `session_url`/`resume_hint` are how
    a human opens this session's chat: only the session knows this, so it
@@ -376,9 +384,9 @@ Auth: `Authorization: Bearer` (or `?token=` once → cookie). Two tokens:
   (autostop + long-poll is exactly the wrong pair), 1GB volume mounted at
   `/data` for SQLite. `fly secrets set SHOWRUNNER_TOKEN=... SHOWRUNNER_WORKER_TOKEN=...`.
 - **Env knobs:** `SHOWRUNNER_TOKEN` (required), `SHOWRUNNER_WORKER_TOKEN`
-  (optional), `PORT`, `DATA_DIR`, `POLL_HOLD_SECONDS=25`, `WORKER_LEASE_S=90`,
-  `TASK_LEASE_S=900`, `DIRECTION_LEASE_S=600`, `NOTE_MAX_CHARS=2000`,
-  `NOTES_PER_TASK=4`.
+  (optional), `REQUIRE_TASK_RELEASE=false`, `PORT`, `DATA_DIR`,
+  `POLL_HOLD_SECONDS=25`, `WORKER_LEASE_S=90`, `TASK_LEASE_S=900`,
+  `DIRECTION_LEASE_S=600`, `NOTE_MAX_CHARS=2000`, `NOTES_PER_TASK=4`.
 - **Reclaim sweep:** one `setInterval` (5s) expires leases, requeues tasks,
   wakes relevant waiters. Restart-safe because all state is in SQLite.
 
@@ -392,13 +400,41 @@ Auth: `Authorization: Bearer` (or `?token=` once → cookie). Two tokens:
 
 ## Security posture
 
-Dual bearer tokens. The worker token is intended to be committed so remote
-agents can join; anyone with it can register, pull tasks, and write notes on
-every show on the deployment, but cannot claim direction or mutate admin API.
-Keep the director token secret (`.env` / Fly secret / cloud Runtime Secret)
-and rotate via `fly secrets set`. Non-goals: per-member tokens, show-level
-ACLs, task-content encryption. Keep secrets out of task briefs; point at
-repo files instead.
+A show may include agents run by other people, so directors and workers do not
+trust each other. The design goal is not "no agent is ever fooled" (prompt
+injection makes that unreachable for any system that feeds an LLM
+attacker-controlled text); it is that a fooled agent still can't cause harm,
+because the capabilities that would let it aren't reachable through showrunner.
+See [SECURITY.md](docs/SECURITY.md) for the threat model and the full layering.
+The four controls, strongest first:
+
+1. **Per-member auth (real boundary).** `register` issues a per-member secret;
+   the DB stores only its SHA-256; every later tool call must present it
+   (constant-time check). `member_id` is a board-visible handle, not a
+   credential -- without this, anyone holding the shared worker bearer could
+   pass any `member_id` and act as that member (impersonate a peer, speak as the
+   director, complete/poison another worker's task). Unknown member and wrong
+   secret return the same `unauthorized_member` result, so there's no member-id
+   oracle.
+2. **Human release gate (real boundary, opt-in).** With `REQUIRE_TASK_RELEASE`
+   on, a director-created task is withheld (not claimable) until a human
+   releases it on the callboard -- the deterministic check against a malicious
+   or compromised director admitting work no human vetted.
+3. **Runtime containment (the real host boundary, not ours).** showrunner
+   cannot stop a worker's host from running `curl`; only the agent runtime's
+   own permissions can. So "can't upload host files" is enforced by running
+   workers under a locked-down runtime (repo-scoped FS, network allowlist, no
+   host-secret access) and by never handing out work that needs more. SECURITY.md
+   states this as a precondition.
+4. **Dual bearer tokens + untrusted-content annotation (defense in depth).**
+   The committable worker token can register/pull/write but not direct; keep the
+   director token secret and rotate via `fly secrets set`. On delivery, every
+   peer-authored field (brief, note, message, artifact) is tagged
+   `trust:"untrusted_peer"` with fixed guidance. This is a mitigation, not a
+   boundary: it labels data as data, it does not sanitize it.
+
+Non-goals (v1): show-level ACLs, task-content encryption, and server-side
+content classification. Keep secrets out of task briefs; point at repo files.
 
 ## What v1 explicitly skips
 

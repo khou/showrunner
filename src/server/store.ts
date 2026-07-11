@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { EventEmitter } from "node:events";
 import Database from "better-sqlite3";
 import {
@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS members (
   current_task_id TEXT,
   review_cursor INTEGER NOT NULL DEFAULT 0,
   session_url TEXT,
-  resume_hint TEXT
+  resume_hint TEXT,
+  secret_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS members_show_idx ON members(show);
 
@@ -73,6 +74,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_by TEXT NOT NULL,
   lease_expires_at INTEGER,
   artifacts_json TEXT NOT NULL DEFAULT '[]',
+  released INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -161,6 +163,24 @@ function randomHex(bytes: number): string {
   return randomBytes(bytes).toString("hex");
 }
 
+// Per-member auth (the hard identity line): register issues a high-entropy secret, the DB stores
+// only its SHA-256, and every later tool call must present the secret. member_id is a memorable,
+// board-visible handle (addressing), NOT a credential -- without this a caller holding the shared
+// worker bearer could pass ANY member_id and act as that member (impersonate a peer worker, speak
+// as the director on non-director-gated tools, complete/poison another worker's task). A single
+// SHA-256 is the right hash here: the secret is 32 bytes of CSPRNG output, so it has no low-entropy
+// structure for an offline attacker to grind the way a human password would.
+function hashSecret(secret: string): string {
+  return createHash("sha256").update(secret).digest("hex");
+}
+
+function timingSafeEqualHex(a: string, b: string): boolean {
+  const abuf = Buffer.from(a, "hex");
+  const bbuf = Buffer.from(b, "hex");
+  if (abuf.length !== bbuf.length || abuf.length === 0) return false;
+  return timingSafeEqual(abuf, bbuf);
+}
+
 /** Longest literal prefix before the first glob metacharacter. */
 function globPrefix(glob: string): string {
   const idx = glob.search(/[*?[]/);
@@ -216,6 +236,7 @@ interface MemberRow {
   review_cursor: number;
   session_url: string | null;
   resume_hint: string | null;
+  secret_hash: string | null;
 }
 
 interface TaskRow {
@@ -233,6 +254,7 @@ interface TaskRow {
   created_by: string;
   lease_expires_at: number | null;
   artifacts_json: string;
+  released: number;
   created_at: number;
   updated_at: number;
 }
@@ -309,6 +331,7 @@ function mapTask(r: TaskRow): Task {
     createdBy: r.created_by,
     leaseExpiresAt: r.lease_expires_at,
     artifacts: JSON.parse(r.artifacts_json) as TaskArtifact[],
+    released: r.released !== 0,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -363,6 +386,8 @@ export class Store {
     this.db.exec(SCHEMA_SQL);
     this.migrateMessagesKindColumn();
     this.migrateMemberSessionColumns();
+    this.migrateMemberSecretColumn();
+    this.migrateTaskReleasedColumn();
     this.now = now;
     this.leases = readLeaseConfig();
     this.noteConfig = readNoteConfig();
@@ -395,6 +420,29 @@ export class Store {
     }
     if (!cols.some((c) => c.name === "resume_hint")) {
       this.db.exec("ALTER TABLE members ADD COLUMN resume_hint TEXT");
+    }
+  }
+
+  /** Guarded upgrade-in-place: members predates per-member secrets. A deployed DB gets the
+   * nullable column added; every pre-existing row keeps a NULL hash, which authenticates NOTHING
+   * through the MCP boundary (verifyMemberSecret rejects a NULL hash), so those sessions must
+   * re-register to get a secret. That one-time disruption on upgrade is the price of closing the
+   * impersonation hole; there is deliberately no "no secret presented == allowed" grandfather,
+   * because an attacker would just omit the secret. */
+  private migrateMemberSecretColumn(): void {
+    const cols = this.db.pragma("table_info(members)") as { name: string }[];
+    if (!cols.some((c) => c.name === "secret_hash")) {
+      this.db.exec("ALTER TABLE members ADD COLUMN secret_hash TEXT");
+    }
+  }
+
+  /** Guarded upgrade-in-place: tasks predates the human release gate. Existing tasks backfill to
+   * released=1 (the column default), preserving current behavior; only tasks created while
+   * REQUIRE_TASK_RELEASE is on are withheld. */
+  private migrateTaskReleasedColumn(): void {
+    const cols = this.db.pragma("table_info(tasks)") as { name: string }[];
+    if (!cols.some((c) => c.name === "released")) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN released INTEGER NOT NULL DEFAULT 1");
     }
   }
 
@@ -527,6 +575,29 @@ export class Store {
     });
   }
 
+  /**
+   * Mint (or re-mint) this member's auth secret, store only its hash, and return the plaintext
+   * once. The MCP `register` tool calls this and hands the secret back to the session; the human
+   * pseudo-member (created by the /api layer) never calls it, so it keeps a NULL hash and cannot
+   * authenticate through the agent tool surface -- it only ever acts via the bearer-gated /api.
+   */
+  issueMemberSecret(memberId: string): string {
+    const secret = randomBytes(24).toString("base64url");
+    this.db.prepare("UPDATE members SET secret_hash = ? WHERE id = ?").run(hashSecret(secret), memberId);
+    return secret;
+  }
+
+  /**
+   * Constant-time check that `secret` matches the stored hash for `memberId`. Returns false for an
+   * unknown member and for any member whose hash is NULL (legacy/human pseudo-member): there is no
+   * bypass for "no secret on file", so a caller cannot authenticate as an unprovisioned member.
+   */
+  verifyMemberSecret(memberId: string, secret: string): boolean {
+    const row = this.getMemberRowRaw(memberId);
+    if (!row || !row.secret_hash) return false;
+    return timingSafeEqualHex(hashSecret(secret), row.secret_hash);
+  }
+
   /** Deletes a show and every record under it. Returns false if the show doesn't exist. */
   deleteShow(show: string): boolean {
     return this.txn(() => {
@@ -628,6 +699,7 @@ export class Store {
         attempt: t.attempt,
         createdAt: t.created_at,
         updatedAt: t.updated_at,
+        released: t.released !== 0,
       };
       if (verbose) view.notes = this.getNotes(t.id);
       return view;
@@ -771,12 +843,15 @@ export class Store {
       const dependsOn = input.dependsOn ?? [];
       const priority = input.priority ?? 0;
 
+      // released defaults true; a caller (the create_task tool under REQUIRE_TASK_RELEASE) passes
+      // false to withhold the task from workers until a human releases it on the callboard.
+      const released = input.released === false ? 0 : 1;
       this.db
         .prepare(
           `INSERT INTO tasks
              (id, show, context_id, title, brief, files_hint_json, depends_on_json, priority,
-              status, assignee, attempt, created_by, lease_expires_at, artifacts_json, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, NULL, '[]', ?, ?)`,
+              status, assignee, attempt, created_by, lease_expires_at, artifacts_json, released, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, NULL, '[]', ?, ?, ?)`,
         )
         .run(
           id,
@@ -789,17 +864,47 @@ export class Store {
           priority,
           input.assignee ?? null,
           input.createdBy,
+          released,
           at,
           at,
         );
 
       const overlaps = this.computeOverlaps(input.show, id, filesHint);
-      if (input.assignee) {
+      // An unreleased task is not claimable, so waking workers would only make them re-poll and
+      // find nothing. Wake the show so the callboard/human sees the pending-release item instead.
+      if (!released) {
+        this.events.emit(`wake:show:${input.show}`);
+      } else if (input.assignee) {
         this.events.emit(`wake:${input.assignee}`);
       } else {
         this.events.emit(`wake:show:${input.show}`);
       }
       return { task: mapTask(this.getTaskRowRaw(id)!), overlaps };
+    });
+  }
+
+  /**
+   * Human release of a withheld task (REQUIRE_TASK_RELEASE gate): flips released=1 and wakes
+   * workers to claim it. Idempotent. Bearer-gated at the /api layer (director/admin token), so
+   * this is the one point where a human vets a director-authored brief before any worker can see
+   * it -- the deterministic check against a malicious or compromised director. Returns undefined
+   * for an unknown task.
+   */
+  releaseTask(taskId: string, actor: string): Task | undefined {
+    return this.txn(() => {
+      const row = this.getTaskRowRaw(taskId);
+      if (!row) return undefined;
+      if (row.released === 0) {
+        const at = this.now();
+        this.db.prepare("UPDATE tasks SET released = 1, updated_at = ? WHERE id = ?").run(at, taskId);
+        this.insertNote(taskId, actor, "released by human", at);
+        if (row.assignee) {
+          this.events.emit(`wake:${row.assignee}`);
+        } else {
+          this.events.emit(`wake:show:${row.show}`);
+        }
+      }
+      return mapTask(this.getTaskRowRaw(taskId)!);
     });
   }
 
@@ -820,9 +925,10 @@ export class Store {
       }
 
       const now = this.now();
+      // released = 1 excludes tasks a human hasn't yet vetted under the REQUIRE_TASK_RELEASE gate.
       const candidates = this.db
         .prepare(
-          "SELECT * FROM tasks WHERE show = ? AND status = 'queued' AND (assignee IS NULL OR assignee = ?) ORDER BY priority DESC, created_at ASC",
+          "SELECT * FROM tasks WHERE show = ? AND status = 'queued' AND released = 1 AND (assignee IS NULL OR assignee = ?) ORDER BY priority DESC, created_at ASC",
         )
         .all(member.show, memberId) as TaskRow[];
 

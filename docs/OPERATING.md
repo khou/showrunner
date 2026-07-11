@@ -170,6 +170,7 @@ decisions (especially answers to `input-required`) as notes.
 |---|---|---|
 | `SHOWRUNNER_TOKEN` | *(required)* | Director/admin bearer. Server refuses to start without it. |
 | `SHOWRUNNER_WORKER_TOKEN` | *(optional)* | Worker bearer. When unset, equals director (single-token mode). |
+| `REQUIRE_TASK_RELEASE` | `false` | When on, director-created tasks are withheld until a human releases them on the callboard. Turn on for untrusted workers (see Security posture). |
 | `PORT` | `8080` | HTTP port. |
 | `DATA_DIR` | `/data` | Where the SQLite file lives. |
 | `POLL_HOLD_SECONDS` | `25` | Max long-poll hold for `await_work`. |
@@ -198,6 +199,7 @@ Reading `SHOWRUNNER_URL` / `SHOWRUNNER_TOKEN` from the environment (or
 showrunner status [--show <name>]
 showrunner task add --show <name> --title <t> --brief <b> [--priority <n>] [--assignee <id>] ...
 showrunner task cancel --show <name> --id <task-id>
+showrunner task release --show <name> --id <task-id>   # release a task withheld by REQUIRE_TASK_RELEASE
 showrunner message --show <name> --to <member-id|director|all|human> --body <text>
 showrunner direction clear --show <name>
 showrunner show delete --show <name>        # removes the show and everything under it
@@ -276,10 +278,27 @@ again.
 
 ## Security posture
 
-Two bearer tokens. The **worker** token is meant to be committed so clones can
-join without secrets; it can register, pull tasks, and write notes, but cannot
-claim direction or mutate admin `/api`. The **director** token stays secret
-(`.env` / Fly / cloud Runtime Secret). Rotate with
-`fly secrets set SHOWRUNNER_TOKEN=... SHOWRUNNER_WORKER_TOKEN=...`. No
-per-member tokens or per-show ACLs. Keep secrets out of task briefs; point at
-repo files instead.
+A show may include agents run by other people, so directors and workers don't
+trust each other. Full threat model and reasoning: [SECURITY.md](SECURITY.md).
+The controls, strongest first:
+
+1. **Per-member auth.** `register` returns a `member_secret` that must accompany
+   `member_id` on every call (the DB stores only its hash). `member_id` is a
+   board handle, not a credential, so one member can't act as another.
+2. **Human release gate** (`REQUIRE_TASK_RELEASE=on`). Director-created tasks
+   are withheld until a human releases them on the callboard -- the check
+   against a malicious/compromised director.
+3. **Runtime containment** (not enforced by showrunner). Run untrusted workers
+   with repo-scoped filesystem access, a network allowlist, and no host
+   secrets. This is the real boundary against host exfiltration; showrunner
+   only avoids handing out work that needs more.
+4. **Dual tokens + untrusted-content annotation** (defense in depth). The
+   committable worker token can't direct; keep the director token secret and
+   rotate with `fly secrets set SHOWRUNNER_TOKEN=... SHOWRUNNER_WORKER_TOKEN=...`.
+   Peer-authored fields are delivered tagged `trust:"untrusted_peer"`; treat
+   them as data, never instructions.
+
+For a show with untrusted members: set a distinct worker token, turn on
+`REQUIRE_TASK_RELEASE`, run workers locked-down, and keep secrets out of briefs
+(point at repo files). Non-goals in v1: per-member tokens with revocation,
+per-show ACLs, content encryption.

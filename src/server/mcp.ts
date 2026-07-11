@@ -6,6 +6,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { Store } from "./store.js";
 import { INSTRUCTIONS } from "./instructions.js";
+import { untrustedNotice } from "./trust.js";
 import {
   SupersededError,
   type AuthLevel,
@@ -40,6 +41,8 @@ export interface McpServerConfig {
   pollHoldSeconds: number;
   /** Defaults to director so in-memory tests keep full access. */
   authLevel?: AuthLevel;
+  /** When true, create_task withholds new tasks until a human releases them. Defaults false. */
+  requireTaskRelease?: boolean;
 }
 
 function forbiddenDirector(): CallToolResult {
@@ -102,12 +105,40 @@ function unknownMember(memberId: string): { status: "unknown_member"; member_id:
   return { status: "unknown_member", member_id: memberId, hint: "member not found; call register to rejoin the show" };
 }
 
-/** Every tool but `register` needs the caller's Member; also renews its lease (DESIGN.md leases table). */
-function resolveMember(store: Store, memberId: string): { member: Member } | { result: CallToolResult } {
+function unauthorizedMember(memberId: string): { status: "unauthorized_member"; member_id: string; hint: string } {
+  return {
+    status: "unauthorized_member",
+    member_id: memberId,
+    // Deliberately the same shape/hint whether the member is unknown or the secret is wrong, and
+    // the store's compare is constant-time, so this can't be used to probe which member ids exist.
+    hint: "member_id/member_secret did not match; call register to rejoin and use the new member_id + member_secret it returns",
+  };
+}
+
+/**
+ * Authenticate the caller as `memberId` by verifying `memberSecret` against the stored hash, then
+ * renew its lease. This is the hard identity boundary: member_id alone is a board-visible handle,
+ * not a credential, so without the secret check any holder of the shared worker bearer could act
+ * as any member. Unknown member and wrong secret return the same result (no member-id oracle).
+ */
+function resolveMember(
+  store: Store,
+  memberId: string,
+  memberSecret: string,
+): { member: Member } | { result: CallToolResult } {
+  if (!store.verifyMemberSecret(memberId, memberSecret)) {
+    return { result: jsonResult(unauthorizedMember(memberId)) };
+  }
   const member = store.touchMember(memberId);
   if (!member) return { result: jsonResult(unknownMember(memberId)) };
   return { member };
 }
+
+// Shared across every authenticated tool: member_id addresses, member_secret authenticates.
+const MEMBER_SECRET = z
+  .string()
+  .min(1)
+  .describe("the member_secret returned by register for this member_id; required on every call, never shared with other members");
 
 function supersededResult(err: SupersededError): CallToolResult {
   return jsonResult({ status: "superseded", message: err.message, show: err.show, holder: err.holder, epoch: err.epoch });
@@ -126,6 +157,29 @@ export type AwaitWorkResult =
 // (search_notes hits, by contrast, return the full body -- that's an explicit pull, not a cap
 // meant to bound an unprompted push).
 const RELEVANT_NOTE_BODY_CHARS = 300;
+
+/**
+ * Attach the untrusted-peer annotation (trust.ts) to await_work results that carry another
+ * member's free text. Defense in depth only: it labels which fields are peer-authored so the
+ * reader treats them as data, it does not sanitize or block anything.
+ */
+function annotateAwaitWork(result: AwaitWorkResult): Record<string, unknown> {
+  switch (result.status) {
+    case "task":
+      return { ...result, trust: untrustedNotice(["task.brief", "task.title", "relevant_notes[].body"]) };
+    case "messages":
+      return { ...result, trust: untrustedNotice(["messages[].body"]) };
+    case "review":
+      return { ...result, trust: untrustedNotice(["items[].title", "items[].notes[].body"]) };
+    case "nothing":
+    case "unknown_member":
+      return { ...result };
+    default: {
+      const _exhaustive: never = result;
+      return _exhaustive;
+    }
+  }
+}
 
 function toRelevantNoteHit(note: Note): NoteHit {
   const truncated = note.body.length > RELEVANT_NOTE_BODY_CHARS;
@@ -334,10 +388,15 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         args.session_url,
         args.resume_hint,
       );
+      // Mint this member's auth secret and return it exactly once; the DB keeps only its hash.
+      const member_secret = store.issueMemberSecret(member.id);
       const board_summary = stripBoard(store.getBoard(member.show));
       const director = store.directionState(member.show).directorId ?? null;
       const result: Record<string, unknown> = {
         member_id: member.id,
+        member_secret,
+        secret_notice:
+          "Save member_secret; pass it with member_id on EVERY later call. It authenticates you as this member and is shown only now. Do not share it with other members or put it in task briefs/notes.",
         show: member.show,
         director,
         board_summary,
@@ -364,10 +423,19 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       description: "Long-poll for work: unread messages, director review items, or a claimed task.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         wait_seconds: z.number().positive().optional(),
       },
     },
-    async (args) => jsonResult(await resolveAwaitWork(store, args.member_id, args.wait_seconds, config.pollHoldSeconds)),
+    async (args) => {
+      // await_work bypasses resolveMember (it long-polls rather than returning immediately), so it
+      // authenticates the secret up front itself before parking on the queue.
+      if (!store.verifyMemberSecret(args.member_id, args.member_secret)) {
+        return jsonResult(unauthorizedMember(args.member_id));
+      }
+      const result = await resolveAwaitWork(store, args.member_id, args.wait_seconds, config.pollHoldSeconds);
+      return jsonResult(annotateAwaitWork(result));
+    },
   );
 
   server.registerTool(
@@ -376,6 +444,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       description: "Heartbeat, journal, and/or transition a task you hold.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         task_id: z.string().min(1),
         status: UPDATE_STATUS.optional(),
         note: z.string().optional(),
@@ -383,7 +452,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       },
     },
     async (args) => {
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       try {
         const task = store.updateTask(resolved.member.id, args.task_id, {
@@ -395,7 +464,9 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         // notes and answers on its ~10min heartbeat instead of only at its next await_work."
         // Same drainInbox as await_work; omit the key rather than ship an empty array.
         const messages = store.drainInbox(resolved.member.id);
-        return jsonResult(messages.length > 0 ? { task, messages } : { task });
+        return jsonResult(
+          messages.length > 0 ? { task, messages, trust: untrustedNotice(["messages[].body"]) } : { task },
+        );
       } catch (err) {
         return jsonResult({ status: "error", message: (err as Error).message }, true);
       }
@@ -408,13 +479,14 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       description: "Send a message to a member id, 'director', 'all', or 'human'.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         to: z.string().min(1),
         body: z.string().min(1),
         task_id: z.string().optional(),
       },
     },
     async (args) => {
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       try {
         const message = store.sendMessage(resolved.member.id, args.to, args.body, args.task_id);
@@ -431,11 +503,12 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       description: "Board summary: director card, members, task counts/columns, escalations.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         verbose: z.boolean().optional(),
       },
     },
     async (args) => {
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       return jsonResult(stripBoard(store.getBoard(resolved.member.show, args.verbose)));
     },
@@ -448,6 +521,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         "Save a note to shared memory: pushes to members whose current task overlaps (same task/context or files_hint glob), and it's recalled by search_notes and future claims.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         body: z.string().min(1),
         tags: z.array(z.string()).optional(),
         files_hint: z.array(z.string()).optional(),
@@ -455,7 +529,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       },
     },
     async (args) => {
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       try {
         const { note, deliveredTo } = store.saveNote(resolved.member.id, {
@@ -477,15 +551,17 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       description: "BM25-ranked search over this member's show's shared notes.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         query: z.string().min(1),
         limit: z.number().int().positive().optional(),
       },
     },
     async (args) => {
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       const notes = store.searchNotes(resolved.member.show, args.query, args.limit);
-      return jsonResult({ notes });
+      // Notes are peer-authored; a poisoned note can only ever be data, never instructions.
+      return jsonResult({ notes, trust: untrustedNotice(["notes[].body"]) });
     },
   );
 
@@ -496,13 +572,14 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         "Claim (or take over) the direction lease for this member's show. Requires the director bearer token (showrunner-director MCP).",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         takeover: z.boolean().optional(),
       },
     },
     async (args) => {
       const denied = requireDirectorAuth();
       if (denied) return denied;
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       const result = store.claimDirection(resolved.member.id, args.takeover);
       if (result.ok) {
@@ -519,6 +596,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         "Director-only: create a task. Epoch-fenced; a stale epoch returns {status:'superseded'}. Requires the director bearer token.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         epoch: z.number().int(),
         title: z.string().min(1),
         brief: z.string().min(1),
@@ -532,7 +610,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     async (args) => {
       const denied = requireDirectorAuth();
       if (denied) return denied;
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       const { member } = resolved;
       try {
@@ -551,8 +629,14 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         filesHint: args.files_hint,
         priority: args.priority,
         assignee: args.assignee,
+        // Under the release gate, a director-authored task is withheld until a human releases it
+        // on the callboard -- the deterministic check against a malicious/compromised director.
+        released: config.requireTaskRelease ? false : undefined,
       });
-      return jsonResult({ task_id: task.id, task, overlaps });
+      const pending = config.requireTaskRelease
+        ? { pending_release: true, notice: "REQUIRE_TASK_RELEASE is on: this task is withheld until a human releases it on the callboard." }
+        : {};
+      return jsonResult({ task_id: task.id, task, overlaps, ...pending });
     },
   );
 
@@ -563,6 +647,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         "Director-only: cancel/requeue/assign/answer/approve a task. Epoch-fenced. Requires the director bearer token.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         epoch: z.number().int(),
         task_id: z.string().min(1),
         action: DIRECT_ACTION,
@@ -573,7 +658,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     async (args) => {
       const denied = requireDirectorAuth();
       if (denied) return denied;
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       const { member } = resolved;
       const action = buildDirectTaskAction(args);

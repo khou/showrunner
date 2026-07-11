@@ -170,6 +170,11 @@ main[hidden] { display: none; }
 .badge.status-working, .badge.status-completed { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
 .badge.status-assigned { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 45%, var(--border)); }
 .badge.status-failed, .badge.status-rejected { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, var(--border)); }
+.badge-hold {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+.task-hold { border-left: 2px solid var(--amber); padding-left: 6px; }
 
 .tasks-header { display: flex; align-items: baseline; gap: 10px; }
 .tasks-header #task-totals { margin-left: auto; }

@@ -140,8 +140,8 @@ describe("showrunner e2e (real server, real MCP client, streamable HTTP)", () =>
 
     const worker = await connectClient(baseUrl, "e2e-dual-worker", WORKER_TOKEN);
     const reg = await callTool(worker, "register", { show: "e2e-dual", kind: "claude-local" });
-    const memberId = (reg.data as { member_id: string }).member_id;
-    const claim = await callTool(worker, "claim_direction", { member_id: memberId, takeover: true });
+    const { member_id: memberId, member_secret: secret } = reg.data as { member_id: string; member_secret: string };
+    const claim = await callTool(worker, "claim_direction", { member_id: memberId, member_secret: secret, takeover: true });
     expect(claim.isError).toBe(true);
     expect(claim.data).toMatchObject({ status: "forbidden" });
     await worker.close();
@@ -154,16 +154,17 @@ describe("showrunner e2e (real server, real MCP client, streamable HTTP)", () =>
       const worker = await connectClient(baseUrl, "e2e-worker");
 
       const regDirector = await callTool(director1, "register", { show: "myshow", kind: "claude-local", display_name: "director-one" });
-      const directorId = (regDirector.data as { member_id: string }).member_id;
+      const { member_id: directorId, member_secret: directorSecret } = regDirector.data as { member_id: string; member_secret: string };
 
       const regWorker = await callTool(worker, "register", { show: "myshow", kind: "claude-local", display_name: "worker-one" });
-      const workerId = (regWorker.data as { member_id: string }).member_id;
+      const { member_id: workerId, member_secret: workerSecret } = regWorker.data as { member_id: string; member_secret: string };
 
-      const claim = await callTool(director1, "claim_direction", { member_id: directorId });
+      const claim = await callTool(director1, "claim_direction", { member_id: directorId, member_secret: directorSecret });
       expect(claim.data).toMatchObject({ status: "claimed", epoch: 1 });
 
       const created = await callTool(director1, "create_task", {
         member_id: directorId,
+        member_secret: directorSecret,
         epoch: 1,
         title: "write a haiku",
         brief: "see README.md",
@@ -172,11 +173,12 @@ describe("showrunner e2e (real server, real MCP client, streamable HTTP)", () =>
       const taskId = (created.data as { task_id: string }).task_id;
       expect(taskId).toBeTruthy();
 
-      const claimed = await callTool(worker, "await_work", { member_id: workerId });
+      const claimed = await callTool(worker, "await_work", { member_id: workerId, member_secret: workerSecret });
       expect(claimed.data).toMatchObject({ status: "task", task: { id: taskId } });
 
       const completed = await callTool(worker, "update_task", {
         member_id: workerId,
+        member_secret: workerSecret,
         task_id: taskId,
         status: "completed",
         note: "done",
@@ -185,21 +187,21 @@ describe("showrunner e2e (real server, real MCP client, streamable HTTP)", () =>
       expect(completed.isError).toBe(false);
       expect((completed.data as { task: { status: string } }).task.status).toBe("completed");
 
-      const review = await callTool(director1, "await_work", { member_id: directorId });
+      const review = await callTool(director1, "await_work", { member_id: directorId, member_secret: directorSecret });
       expect(review.data).toMatchObject({ status: "review" });
       expect((review.data as { items: { id: string }[] }).items.map((i) => i.id)).toContain(taskId);
 
       // A second director takes over: the human said "you're now the director".
       const director2 = await connectClient(baseUrl, "e2e-director-2");
       const regDirector2 = await callTool(director2, "register", { show: "myshow", kind: "claude-local", display_name: "director-two" });
-      const director2Id = (regDirector2.data as { member_id: string }).member_id;
+      const { member_id: director2Id, member_secret: director2Secret } = regDirector2.data as { member_id: string; member_secret: string };
 
-      const takeover = await callTool(director2, "claim_direction", { member_id: director2Id, takeover: true });
+      const takeover = await callTool(director2, "claim_direction", { member_id: director2Id, member_secret: director2Secret, takeover: true });
       expect(takeover.data).toMatchObject({ status: "claimed", epoch: 2 });
 
       // director1 still believes it holds epoch 1; the server fences it as a structured result,
       // not a protocol error, so the old director can read it and stand down.
-      const stale = await callTool(director1, "create_task", { member_id: directorId, epoch: 1, title: "t2", brief: "b2" });
+      const stale = await callTool(director1, "create_task", { member_id: directorId, member_secret: directorSecret, epoch: 1, title: "t2", brief: "b2" });
       expect(stale.isError).toBe(false);
       expect(stale.data).toMatchObject({ status: "superseded", epoch: 2, holder: { id: director2Id } });
 
@@ -218,17 +220,17 @@ describe("showrunner e2e (real server, real MCP client, streamable HTTP)", () =>
       const worker = await connectClient(baseUrl, "e2e-poll-worker");
 
       const regDirector = await callTool(director, "register", { show, kind: "claude-local" });
-      const directorId = (regDirector.data as { member_id: string }).member_id;
-      await callTool(director, "claim_direction", { member_id: directorId });
+      const { member_id: directorId, member_secret: directorSecret } = regDirector.data as { member_id: string; member_secret: string };
+      await callTool(director, "claim_direction", { member_id: directorId, member_secret: directorSecret });
 
       const regWorker = await callTool(worker, "register", { show, kind: "claude-local" });
-      const workerId = (regWorker.data as { member_id: string }).member_id;
+      const { member_id: workerId, member_secret: workerSecret } = regWorker.data as { member_id: string; member_secret: string };
 
       const started = Date.now();
-      const pending = callTool(worker, "await_work", { member_id: workerId });
+      const pending = callTool(worker, "await_work", { member_id: workerId, member_secret: workerSecret });
 
       await new Promise((r) => setTimeout(r, 1000));
-      await callTool(director, "create_task", { member_id: directorId, epoch: 1, title: "late task", brief: "b" });
+      await callTool(director, "create_task", { member_id: directorId, member_secret: directorSecret, epoch: 1, title: "late task", brief: "b" });
 
       const result = await pending;
       const elapsed = Date.now() - started;
