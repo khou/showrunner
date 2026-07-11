@@ -42,7 +42,8 @@ cd ~/showrunner && git pull --ff-only && npm install && npm run build
 
 Pick an app name (must be globally unique on Fly; `showrunner-<something>`)
 and a region near the user (`fly platform regions`; the repo default is
-`sjc`).
+`sjc`). This is a separate Fly app from any other project the user already
+runs on Fly (e.g. a game world); names and secrets do not collide.
 
 ```bash
 cd ~/showrunner
@@ -54,8 +55,12 @@ sed -i '' "s/^primary_region = .*/primary_region = \"$REGION\"/" fly.toml
 fly volumes create showrunner_data --size 1 --region "$REGION" -a "$APP" --yes
 ```
 
-Generate two tokens. Director stays private (`~/.showrunner-token`); worker
-may be committed into project MCP configs after init.
+Generate **two** tokens and store them on the machine (not in git):
+
+| File | Env on Fly | Role |
+|---|---|---|
+| `~/.showrunner-token` | `SHOWRUNNER_TOKEN` | director / admin (secret) |
+| `~/.showrunner-worker-token` | `SHOWRUNNER_WORKER_TOKEN` | worker (safe to commit into MCP later) |
 
 ```bash
 TOKEN_FILE=~/.showrunner-token
@@ -85,29 +90,16 @@ SR_URL=$URL SR_TOKEN=$(cat $TOKEN_FILE) \
 ```
 
 live-verify drives the full lifecycle (register, direction, long-poll
-wake, notes, takeover) with the real MCP client; when `SR_WORKER_TOKEN` is
-set it also asserts the worker bearer cannot claim direction. All checks
-must PASS. It creates a throwaway `verify-*` show; clean it up:
+wake, notes, takeover) with the real MCP client; with `SR_WORKER_TOKEN` set
+it also asserts the worker bearer cannot claim direction or mutate `/api`.
+All checks must PASS. It creates a throwaway `verify-*` show; clean it up:
 
 ```bash
-node dist/cli/index.js show delete --show <the verify-* show it printed> --url $URL --token $(cat $TOKEN_FILE)
+node dist/cli/index.js show delete --show <the verify-* show it printed> \
+  --url $URL --token $(cat $TOKEN_FILE)
 ```
 
-## 4. Connect the user's agent clients
-
-Prefer repo-committed MCP from step 5 (`init`) over user-global MCP adds.
-Workers use the hardcoded worker token in `.mcp.json` / `.cursor/mcp.json`.
-Director sessions need `SHOWRUNNER_TOKEN` (director) in the local/cloud env
-for the `showrunner-director` entry.
-
-**Cursor cloud agents:** dashboard-only as of 3.8 — paste URL + literal
-**worker** token for workers; director sessions need the director token
-separately. Point the user at it; do not handle tokens in a browser for them.
-
-**Claude Code cloud:** committed `.mcp.json` is enough for workers. Director
-sessions add `SHOWRUNNER_TOKEN` to cloud env and allowlist `<APP>.fly.dev`.
-
-## 5. Initialize the project repo as a show
+## 4. Initialize the project repo as a show
 
 In the repo the user wants coordinated (show name defaults to the repo
 name; keep it):
@@ -121,21 +113,53 @@ node ~/showrunner/dist/cli/index.js init \
   --worker-token "$(cat $WORKER_TOKEN_FILE)"
 ```
 
-This scaffolds `.showrunner`, `SHOWRUNNER.md`, `SHOWRUNNER.rules.md`,
-committed dual-token MCP configs (worker Bearer hardcoded), and a gitignored
-`.env` with the director token. It prints the callboard link and ways-to-run.
+`init` requires both tokens (fails loudly if either is missing or they are
+equal). It writes:
+
+| Path | Committed? | Contents |
+|---|---|---|
+| `.showrunner` | yes | show name pin |
+| `SHOWRUNNER.md` | yes | director playbook template |
+| `SHOWRUNNER.rules.md` | yes | fleet rules (merge defaults, optional dedicated workers) |
+| `.mcp.json` / `.cursor/mcp.json` | yes | `showrunner` = hardcoded **worker** Bearer; `showrunner-director` = `${SHOWRUNNER_TOKEN}` / `${env:SHOWRUNNER_TOKEN}` |
+| `.env` | **no** | `SHOWRUNNER_TOKEN` (director) + `SHOWRUNNER_URL` |
+
+It also prints the callboard magic link and copy-paste worker/director
+prompts (ways to run: simple fleet vs dedicated lanes).
+
 Then:
 
-1. Fill in `SHOWRUNNER.md` for THIS project: read the repo (README,
-   docs, build commands) and draft the playbook honestly. Show the
-   user before committing.
-2. Commit `.showrunner`, `SHOWRUNNER.md`, `SHOWRUNNER.rules.md`, `.mcp.json`,
-   `.cursor/mcp.json` (never `.env`).
+1. Fill in `SHOWRUNNER.md` for THIS project (README, docs, build commands,
+   area/`files_hint` map, escalation). Show the user before committing.
+2. Optionally edit `SHOWRUNNER.rules.md` Dedicated workers if they want
+   capability lanes (art / verify / laptop-only tools).
+3. Commit `.showrunner`, `SHOWRUNNER.md`, `SHOWRUNNER.rules.md`, `.mcp.json`,
+   `.cursor/mcp.json`. Never commit `.env`.
+
+## 5. How clients connect (after init)
+
+Prefer the **repo-committed** MCP from step 4. Do not add a user-global
+showrunner MCP that hardcodes the director token for everyone.
+
+- **Workers (local or Claude Code cloud):** open the project; committed
+  `showrunner` MCP is enough. No env var required. Paste:
+  `You're a showrunner worker.`
+- **Director (this setup session and later trusted sessions):** need the
+  `showrunner-director` MCP entry plus `SHOWRUNNER_TOKEN` in the process
+  env (from `.env` / shell / cloud Runtime Secret). Paste:
+  `You're the showrunner director.`
+- **Cursor cloud:** dashboard-only as of 3.8 (repo MCP ignored). Paste URL
+  + literal **worker** token for workers; director sessions need the
+  **director** token separately. Point the user at the dashboard; do not
+  handle tokens in a browser for them.
+- **Claude Code cloud directors:** add `SHOWRUNNER_TOKEN` to cloud env and
+  allowlist `<APP>.fly.dev`. Workers need neither.
 
 ## 6. Take direction
 
-You, the setup agent, become the show's first director: call `register`
-(with `session_url`/`resume_hint` if you can determine them) and
+You, the setup agent, become the show's first director: use the
+**showrunner-director** tools, call `register` (with `session_url` /
+`resume_hint` if you can determine them) and
 `claim_direction({takeover: true})`, and read the playbook per protocol.
 **Create no tasks.** Planning starts when the user tells you what they
 want; setup ends with a healthy, idle show.
@@ -144,27 +168,28 @@ want; setup ends with a healthy, idle show.
 
 Tell the user, concretely:
 
-- **The callboard link**, without pasting the raw secret into the
-  transcript:
+- **Callboard** (director token; do not paste the raw secret into chat):
   ```bash
-  open "https://<APP>.fly.dev/?token=$(cat <token file>)"
+  open "https://$APP.fly.dev/?token=$(cat $TOKEN_FILE)&show=<show>"
   ```
   Opening it once signs the browser in; the URL cleans itself. The board
   should show this session as director, no tasks, no escalations.
-- **The status check** they can run anytime to confirm everything is
-  healthy:
+- **Status check:**
   ```bash
-  curl -s https://<APP>.fly.dev/healthz
-  node ~/showrunner/dist/cli/index.js status --show <show> --url https://<APP>.fly.dev --token $(cat <token file>)
+  curl -s https://$APP.fly.dev/healthz
+  node ~/showrunner/dist/cli/index.js status --show <show> \
+    --url https://$APP.fly.dev --token $(cat $TOKEN_FILE)
   ```
-  Healthy means: `{"ok":true}`, the status shows a live director (this
-  session), and zero stale members.
-- **The suggested next step**: open another agent session in this repo
-  and say "You're a showrunner worker." It appears on the callboard
-  within seconds. Then tell THIS session what to build; as director it
-  turns intent into tasks and the workers pick them up.
-- Where things live: token file, server app name, the clone path (CLI:
-  `node ~/showrunner/dist/cli/index.js`, alias suggestion in
-  docs/OPERATING.md).
-- Anything you skipped or that needs their hand (cloud dashboards,
+  Healthy means: `{"ok":true}`, a live director (this session), zero stale
+  members.
+- **Next step:** open another agent session in this repo and say
+  `You're a showrunner worker.` It appears on the callboard within seconds.
+  Then tell THIS (director) session what to build.
+- **Optional dedicated lane:** if they want capability routing, point at
+  `SHOWRUNNER.rules.md` Dedicated workers and a role-focused prompt such as
+  `You're a showrunner worker focused on art. Register display_name art.`
+- Where things live: `~/.showrunner-token` (director),
+  `~/.showrunner-worker-token` (worker), Fly app `$APP`, CLI at
+  `node ~/showrunner/dist/cli/index.js` (alias tip in docs/OPERATING.md).
+- Anything you skipped or that needs their hand (Cursor cloud dashboard,
   profile edits they declined).

@@ -19,30 +19,37 @@ from inside the project repo you want coordinated:
 
 > Set up showrunner for me. Fetch
 > https://raw.githubusercontent.com/khou/showrunner/main/docs/SETUP.md
-> and follow it: deploy the server to my Fly account, verify it, connect
-> the agent clients I use, and initialize this repo as a show. Ask me
-> before anything that costs money or edits config outside this repo.
+> and follow it: deploy the server to my Fly account, verify it, initialize
+> this repo as a show, and become the idle director. Ask me before anything
+> that costs money or edits config outside this repo.
 
 You bring a [Fly.io](https://fly.io) account (the agent will prompt you to
 `fly auth login` if needed; login and billing stay in your hands). The agent
-deploys the server (one small always-on machine, ~$3/mo), scaffolds this
-repo with dual-token MCP configs, and finishes as the show's director with
-your dashboard link. Prefer doing it by hand? [docs/SETUP.md](docs/SETUP.md)
-is the same runbook, human-readable.
+deploys one small always-on machine (~$3/mo), runs `showrunner init` in this
+repo, and finishes as the show's director with your callboard link. Prefer
+doing it by hand? [docs/SETUP.md](docs/SETUP.md) is the same runbook.
 
-**Auth split:** `init` commits a **worker** bearer into `.mcp.json` /
-`.cursor/mcp.json` so anyone who clones can join as a worker with no secrets
-setup. The **director** token stays in gitignored `.env` (and the
-`showrunner-director` MCP entry). Only the director token can
-`claim_direction` / create tasks / mutate the callboard API.
+### After setup: two tokens, two prompts
 
-From then on:
+`init` writes:
 
-> "You're a showrunner worker."
+| Piece | Where | Who uses it |
+|---|---|---|
+| **Worker** bearer | committed in `.mcp.json` / `.cursor/mcp.json` under `showrunner` | any clone / cloud worker (no secrets setup) |
+| **Director** bearer | gitignored `.env` as `SHOWRUNNER_TOKEN`; MCP entry `showrunner-director` | trusted director sessions only |
 
-> "You're the showrunner director." (needs director MCP + `SHOWRUNNER_TOKEN`)
+Only the director token can `claim_direction`, create tasks, or mutate the
+callboard API.
 
-**Ways to run**
+In a worker session (MCP already configured from the repo):
+
+> You're a showrunner worker.
+
+In a director session (`showrunner-director` MCP + `SHOWRUNNER_TOKEN` in env):
+
+> You're the showrunner director.
+
+### Ways to run
 
 - **A. Simple fleet** — one director + N general workers (default).
 - **B. Dedicated lanes (optional)** — edit `SHOWRUNNER.rules.md` Dedicated
@@ -52,9 +59,8 @@ From then on:
   stack vs cloud).
 
 See [DESIGN.md](DESIGN.md) for why it's built this way, and
-[docs/OPERATING.md](docs/OPERATING.md) for everything operational: client
-setup, the callboard tour, shared notes and rules, env knobs, the CLI,
-verifying a deployment, FAQ, and security posture.
+[docs/OPERATING.md](docs/OPERATING.md) for client setup, callboard, notes,
+env knobs, CLI, FAQ, and security.
 
 ## License
 
