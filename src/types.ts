@@ -61,6 +61,9 @@ export interface Task {
   createdBy: string;
   leaseExpiresAt: number | null;
   artifacts: TaskArtifact[];
+  // False only while withheld by the human release gate (REQUIRE_TASK_RELEASE); an unreleased
+  // task is queued but not claimable until a human releases it. Defaults true everywhere else.
+  released: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -84,6 +87,9 @@ export interface CreateTaskInput {
   filesHint?: string[];
   priority?: number;
   assignee?: string;
+  // When false, the task is created withheld (not claimable) until a human releases it. Set by
+  // the create_task tool when REQUIRE_TASK_RELEASE is on. Defaults to released.
+  released?: boolean;
 }
 
 // Advisory-only: files_hint globs on the new task intersect an in-flight task's globs.
@@ -158,6 +164,25 @@ export interface DirectionState {
   leaseExpiresAt?: number;
 }
 
+/**
+ * How a direction transition happened, for the audit log. `claimed` = took an unheld seat (or a
+ * renewal by the same holder); `takeover` = displaced a different live-or-stale holder (the
+ * explicit human-authority path); `released` = the holder gave the seat up; `admin_clear` = the
+ * human cleared it via the API; `expired` = the lease lapsed (liveness only -- this NEVER opens
+ * the seat for a plain claim, it just marks the holder stale).
+ */
+export type DirectionMethod = "claimed" | "released" | "takeover" | "admin_clear" | "expired";
+
+export interface DirectionEvent {
+  method: DirectionMethod;
+  actor: string;
+  epoch: number;
+  at: number;
+}
+
+/** How the current holder got the seat, surfaced on the board so a human can see provenance. */
+export type DirectionProvenance = DirectionEvent;
+
 export type ClaimDirectionResult = { ok: true; epoch: number } | { ok: false; holder: Member; epoch: number };
 
 export interface SweepResult {
@@ -192,13 +217,25 @@ export interface BoardTaskView {
   // (priority DESC, age ASC); updatedAt alone can't reconstruct that.
   createdAt: number;
   updatedAt: number;
+  // False when withheld by the human release gate: a queued task that no worker can claim until
+  // a human releases it. The callboard surfaces these as a distinct "pending release" state.
+  released: boolean;
   notes?: TaskNote[]; // present only when verbose
 }
 
 export interface BoardState {
   show: string;
   director:
-    | { memberId: string; epoch: number; leaseExpiresAt: number; stale: boolean; sessionUrl?: string; resumeHint?: string }
+    | {
+        memberId: string;
+        epoch: number;
+        leaseExpiresAt: number;
+        stale: boolean;
+        sessionUrl?: string;
+        resumeHint?: string;
+        // How this holder got the seat (method + when), from the direction audit log.
+        provenance?: DirectionProvenance;
+      }
     | null;
   members: BoardMemberView[];
   taskCounts: Record<TaskStatus, number>;
@@ -207,6 +244,7 @@ export interface BoardState {
     inputRequired: BoardTaskView[];
     humanMessages: Message[];
   };
+  rules: ShowRules; // current server-held show rules (the callboard renders these)
   recentMessages?: Message[]; // present only when verbose (DESIGN.md "Activity feed": notes + messages)
 }
 
@@ -229,6 +267,51 @@ export class SupersededError extends Error {
     this.holder = holder;
     this.epoch = epoch;
   }
+}
+
+// --- Show rules (server-held policy; DESIGN.md "Show rules") ---
+
+/**
+ * Machine-enforced switches: the server reads each of these on the code path it governs, so a
+ * worker cannot override policy by editing a repo file (the whole reason rules moved server-side).
+ * Contrast `ShowRules.policy`, which is advisory prose the server delivers but NEVER enforces.
+ */
+export interface ShowRuleSwitches {
+  /** Withhold director-created tasks until a human releases them (release gate). Enforced in
+   * createTask (via the create_task tool) + claimNextTask. */
+  requireTaskRelease: boolean;
+  /** Delivered, agent-followed policy: do not merge without human approval. There is no merge
+   * through the server, so this is authenticated policy the fleet obeys, not a server-blocked
+   * action; its value over the old repo file is that a worker can't rewrite it. */
+  requireHumanMergeApproval: boolean;
+  /** When false, a member's notes are not auto-propagated to peers (no push-on-save, no
+   * claim-time relevant_notes); notes remain available via explicit search_notes. Enforced in
+   * pushNote + notesForTask. */
+  workerNotePropagation: boolean;
+  /** Max chars for a `text` artifact; enforced in updateTask. */
+  artifactTextMaxChars: number;
+  /** Max serialized-JSON bytes for a `data` artifact; enforced in updateTask. */
+  artifactDataMaxBytes: number;
+}
+
+/**
+ * A show's standing rules, held on the server (not in a repo file a worker could edit). `switches`
+ * are machine-enforced; `policy` is advisory prose delivered to the fleet but never enforced.
+ * `version` bumps on every change so delivery can be incremental; `updatedBy`/`updatedAt` make
+ * changes auditable.
+ */
+export interface ShowRules {
+  version: number;
+  switches: ShowRuleSwitches;
+  policy: string;
+  updatedAt: number;
+  updatedBy: string;
+}
+
+/** Partial update applied by update_rules / the admin API. Omitted switches keep their value. */
+export interface ShowRulesPatch {
+  switches?: Partial<ShowRuleSwitches>;
+  policy?: string;
 }
 
 // --- Env config (DESIGN.md "Env knobs") ---
@@ -262,11 +345,20 @@ export interface EnvConfig extends LeaseConfig, NoteConfig {
 
 const DEFAULT_LEASES: LeaseConfig = { workerLeaseS: 90, taskLeaseS: 900, directionLeaseS: 600 };
 const DEFAULT_NOTES: NoteConfig = { noteMaxChars: 2000, notesPerTask: 4 };
+// OOTB rule defaults (seeded into a new show; env vars below override deployment-wide). Automation
+// stays frictionless for solo shows: release gate off, merge approval off, notes propagate.
+const DEFAULT_ARTIFACT_TEXT_MAX = 10000;
+const DEFAULT_ARTIFACT_DATA_MAX = 16384;
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
   if (raw === undefined || raw === "") return fallback;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+function parseBool(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined || raw === "") return fallback;
+  return /^(1|true|yes|on)$/i.test(raw.trim());
 }
 
 /** Lease TTLs only; no required vars, safe to call from the store without a token configured. */
@@ -283,6 +375,21 @@ export function readNoteConfig(env: NodeJS.ProcessEnv = process.env): NoteConfig
   return {
     noteMaxChars: parsePositiveInt(env.NOTE_MAX_CHARS, DEFAULT_NOTES.noteMaxChars),
     notesPerTask: parsePositiveInt(env.NOTES_PER_TASK, DEFAULT_NOTES.notesPerTask),
+  };
+}
+
+/**
+ * Deployment-wide default switches, seeded into each new show's rules (the show's director/human
+ * can then change them via update_rules). `REQUIRE_TASK_RELEASE` is the headline knob; the rest
+ * follow the same env-as-default pattern. Same no-required-vars contract as the configs above.
+ */
+export function readRulesDefaults(env: NodeJS.ProcessEnv = process.env): ShowRuleSwitches {
+  return {
+    requireTaskRelease: parseBool(env.REQUIRE_TASK_RELEASE, false),
+    requireHumanMergeApproval: parseBool(env.REQUIRE_HUMAN_MERGE_APPROVAL, false),
+    workerNotePropagation: parseBool(env.WORKER_NOTE_PROPAGATION, true),
+    artifactTextMaxChars: parsePositiveInt(env.ARTIFACT_TEXT_MAX_CHARS, DEFAULT_ARTIFACT_TEXT_MAX),
+    artifactDataMaxBytes: parsePositiveInt(env.ARTIFACT_DATA_MAX_BYTES, DEFAULT_ARTIFACT_DATA_MAX),
   };
 }
 

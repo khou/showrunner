@@ -28,7 +28,7 @@ prior system ships.
 
 Deliberately **not**: a runner UI, a worktree manager, an A2A node, a product.
 State is one SQLite file; the dashboard is one static page; the tool surface
-is 10 tools.
+is 12 tools.
 
 ## Constraints that shaped the design (research findings)
 
@@ -91,12 +91,16 @@ SQLite (better-sqlite3, WAL). All rows plain JSON-friendly; `sqlite3` CLI or
 
 ```
 shows      { name PK, created_at, config_json }
+show_rules { show PK, version, switches_json, policy, updated_at, updated_by }
 members    { id PK, show, kind, display_name, role, registered_at,
-             last_seen_at, lease_expires_at, current_task_id }
+             last_seen_at, lease_expires_at, current_task_id, secret_hash,
+             rules_version_seen }
 direction  { show PK, director_id, epoch, lease_expires_at }   -- one row per show
+direction_events { id PK, show, actor, method, epoch, created_at }  -- audit log
 tasks      { id PK, show, context_id, title, brief, files_hint_json,
              depends_on_json, priority, status, assignee, attempt,
-             created_by, lease_expires_at, artifacts_json, created_at, updated_at }
+             created_by, lease_expires_at, artifacts_json, released,
+             created_at, updated_at }
 task_notes { id PK, task_id, author, body, created_at }         -- append-only journal
 messages   { id PK, show, from_id, to_id, task_id, body, kind, created_at }
 message_reads { message_id, member_id }                         -- unread-only delivery
@@ -125,8 +129,15 @@ queued ──▶ assigned ──▶ working ──▶ completed
 ```
 
 - `queued → assigned` happens inside `await_work` (atomic claim in a SQLite
-  transaction; dependency-unblocked, priority DESC, age ASC; honors a pinned
-  `assignee` if the director set one).
+  transaction; dependency-unblocked, `released = 1`, priority DESC, age ASC;
+  honors a pinned `assignee` if the director set one).
+- **Release gate:** when the show's `requireTaskRelease` rule is on, `create_task`
+  inserts the task with `released = 0`; it stays `queued` but is not claimable
+  until a human releases it (`showrunner task release`, i.e. `POST
+  /api/.../release`; the callboard is read-only and only badges it PENDING
+  RELEASE). Off by default (the `REQUIRE_TASK_RELEASE` env sets the seed default
+  for new shows), so OOTB automation is unchanged; the security lever for
+  untrusted workers (see Security posture).
 - `input-required` is distinct from `failed` on purpose: it means "a decision
   is needed", pings the director's poll, and pulses amber on the callboard.
 - Terminal statuses are idempotent by task id: a worker whose lease was
@@ -139,7 +150,7 @@ queued ──▶ assigned ──▶ working ──▶ completed
 |---|---|---|---|
 | worker | 90s | any tool call by that member (polling is the heartbeat) | member shown stale on callboard; an `input-required` task assigned to it requeues (it's supposed to still be polling while blocked) |
 | task | 15 min | `update_task` (status/note/heartbeat) by assignee | task requeues, `attempt`+1, journal preserved |
-| direction | 10 min | any tool call by the director | show runs headless: workers keep draining the queue; callboard shows "no director"; nothing self-promotes |
+| direction | 10 min | any tool call by the director | liveness only: callboard shows the holder stale and the show effectively headless, but the seat stays held -- expiry never lets anyone else claim it (see "Direction") |
 
 A worker's `assigned`/`working` task is reaped **only** by the task lease, never by the
 worker lease alone: a worker heads-down executing may not touch any tool for long stretches
@@ -154,20 +165,35 @@ server) and the human appoints a new one with one sentence.
 
 ### Direction: election, transfer, fencing
 
-One row per show: `{director_id, epoch, lease_expires_at}`.
+One row per show: `{director_id, epoch, lease_expires_at}`, plus an append-only
+`direction_events` audit log.
 
-- `claim_direction` is a compare-and-swap: succeeds if the lease is expired,
-  unheld, or the caller already holds it — and always bumps `epoch`.
-- `claim_direction(takeover: true)` succeeds unconditionally (the human said
-  "you're now the leader"; the human is the authority — there is exactly one
-  human).
-- Every director-only tool takes the caller's `epoch`; the server rejects
-  stale epochs with a structured error: `superseded: you are no longer
-  director of <show>; <new-id> holds epoch <n>. Re-register as a worker or
-  await instructions.` That error is how "the pool figures it out amongst
-  themselves": the old director demotes itself on its next call, no gossip
-  protocol needed. The server is the sole arbiter, so fencing is one integer
-  compare.
+**Authority never transfers implicitly by timeout.** A non-takeover
+`claim_direction` succeeds only when the seat is *unheld* -- never claimed,
+explicitly released, or admin-cleared (`director_id IS NULL`) -- or when the
+caller already holds it (renewal). A merely expired lease does **not** open the
+seat: expiry keeps its liveness effects (callboard staleness, effectively
+headless show) but the recorded holder stays put, so no one else can plain-claim
+it. This closes the "wait out the lease, then grab the seat" path.
+
+Three ways the seat legitimately changes hands, all explicit:
+
+- `release_direction({epoch})` — the current holder stands down (epoch-fenced),
+  clearing the holder and creating the unheld state a later plain claim can take.
+- `claim_direction(takeover: true)` — succeeds unconditionally; the explicit
+  human-authority recovery path for a dead director, and now the *only* way to
+  displace a live-or-stale holder. The human is the authority (there is exactly
+  one human).
+- admin clear (`/api .../direction/clear`) — the human clears a runaway holder.
+
+Every director-only tool takes the caller's `epoch`; the server rejects stale
+epochs with a structured `superseded: ...` error, so the old director demotes
+itself on its next call (no gossip protocol; the server is the sole arbiter, so
+fencing is one integer compare). Every transition (`claimed | released |
+takeover | admin_clear | expired`) is appended to `direction_events` with actor,
+epoch, and timestamp; `get_board` and the callboard surface the current holder's
+provenance (how they got the seat, when), so an unexpected holder is easy to
+spot.
 
 ### The show playbook (SHOWRUNNER.md)
 
@@ -181,18 +207,33 @@ placement means it travels with every clone, worktree, and cloud checkout,
 and a takeover director in a brand-new session picks it up with zero server
 machinery. The server never stores or parses it.
 
-### Showrunner rules (SHOWRUNNER.rules.md)
+### Showrunner rules (server-held show state)
 
 Playbook is *how to break down this project*. Rules are *how the fleet
-behaves*: PR/merge automation, optional dedicated-worker preferences, and
-short project standing rules. `showrunner init` scaffolds
-`SHOWRUNNER.rules.md` with OOTB defaults that favor full automation (open PR,
-squash-merge when green, verify is part of done). Users edit the file to
-require human merge approval or name soft assignee preferences (e.g. prefer
-one registered worker for art, one for verify). The director reads rules after
-`claim_direction`, reminds the cast via `send_message` to `all`, and workers
-re-read them when claiming a task. Same repo placement as the playbook; the
-server never stores or parses it.
+behaves*. Rules are **server-held per-show state, not a repo file** -- policy
+that governs untrusted members must not be writable by them, and every worker
+used to read `SHOWRUNNER.rules.md` from its own checkout. A show's rules split
+into two parts, and the schema is explicit about which is which:
+
+- **`switches`** -- structured, machine-enforced. The server reads each on the
+  code path it governs: `requireTaskRelease` (the release gate, in
+  `createTask`/`claimNextTask`), `workerNotePropagation` (in `pushNote` +
+  `notesForTask`), `artifactTextMaxChars`/`artifactDataMaxBytes` (in
+  `updateTask`), and `requireHumanMergeApproval` (delivered, agent-followed --
+  there is no merge through the server to block).
+- **`policy`** -- advisory prose, delivered but **never enforced**.
+
+New shows are seeded with OOTB defaults (favoring automation: release gate off,
+merge approval off, notes propagate); `REQUIRE_TASK_RELEASE` is the
+deployment-wide env default for the release-gate switch on new shows. The
+director changes rules with the `update_rules` tool (director-token-gated,
+epoch-fenced); the human edits them from the callboard or `showrunner rules
+set` (admin `/api`). Every change bumps `version`, records `updated_by`, and
+notifies the cast via `send_message` to `all`. Delivery has token discipline:
+`rules_version` rides on every task claim, and the full text is delivered at
+`register` and re-delivered on the first poll after the version changes.
+Delivered rules are tagged authenticated director policy, distinct from the
+`untrusted_peer` envelope on peer content.
 
 Sessions may fan out their own subagents to speed work; showrunner membership
 and task ownership stay with the registered session.
@@ -238,7 +279,7 @@ after finishing one, save a note if you learned something the next agent
 would want (with `files_hint` of the affected globs). Directors record
 generalizable decisions (especially answers to `input-required`) as notes.
 
-## MCP tool surface (10 tools)
+## MCP tool surface (12 tools)
 
 Everything takes/returns compact JSON. `member_id` is explicit in every call
 (the server is stateless per-request; reconnects and session restarts don't
@@ -247,8 +288,11 @@ matter).
 **Shared:**
 
 1. `register({show, kind, display_name?, capabilities?, session_url?,
-   resume_hint?})` → `{member_id, show, director, board_summary, protocol}`
-   — creates the show if new; `protocol` is the full worker/director loop
+   resume_hint?})` → `{member_id, member_secret, show, director,
+   board_summary, rules, protocol}` — creates the show if new; `member_secret`
+   is issued once and must accompany `member_id` on every later call (per-member
+   auth); `rules` is the show's current server-held policy (authenticated,
+   distinct from peer content); `protocol` is the full worker/director loop
    contract in ~600 tokens, so even a client that ignored the server
    instructions knows what to do next. `session_url`/`resume_hint` are how
    a human opens this session's chat: only the session knows this, so it
@@ -281,6 +325,11 @@ matter).
 **Director-only (epoch-fenced):**
 
 8. `claim_direction({member_id, takeover?})` → `{epoch, board_summary}`.
+   Without `takeover`, succeeds only if the seat is unheld or the caller already
+   holds it; a merely expired lease does not open it. `takeover:true` displaces
+   any holder (the human-authority path). `release_direction({member_id,
+   epoch})` → `{epoch}` lets the current holder give the seat up so a later plain
+   claim can take it.
 9. `create_task({member_id, epoch, title, brief, context_id?, depends_on?,
    files_hint?, priority?, assignee?})` → `{task_id}` — brief should be
    pointers ("see docs/combat.md §3; branch off main"), not inlined specs.
@@ -291,6 +340,10 @@ matter).
    `requeue`, `assign {assignee}`, `answer {body}` (for `input-required` →
    flips back to `working` and delivers the answer), `approve` (optional
    review gate, see config).
+11. `update_rules({member_id, epoch, switches?, policy?})` → `{rules}` — set
+   the show's server-held rules (machine-enforced switches and/or advisory
+   policy prose). Bumps `version`, is audited (`updated_by`), and notifies the
+   cast. The human's equivalent is the admin `/api` route (callboard / CLI).
 
 ### The one-line-prompt trick
 
@@ -378,7 +431,10 @@ Auth: `Authorization: Bearer` (or `?token=` once → cookie). Two tokens:
 - **Env knobs:** `SHOWRUNNER_TOKEN` (required), `SHOWRUNNER_WORKER_TOKEN`
   (optional), `PORT`, `DATA_DIR`, `POLL_HOLD_SECONDS=25`, `WORKER_LEASE_S=90`,
   `TASK_LEASE_S=900`, `DIRECTION_LEASE_S=600`, `NOTE_MAX_CHARS=2000`,
-  `NOTES_PER_TASK=4`.
+  `NOTES_PER_TASK=4`. Rule seed-defaults for new shows: `REQUIRE_TASK_RELEASE=false`,
+  `REQUIRE_HUMAN_MERGE_APPROVAL=false`, `WORKER_NOTE_PROPAGATION=true`,
+  `ARTIFACT_TEXT_MAX_CHARS=10000`, `ARTIFACT_DATA_MAX_BYTES=16384` (per-show
+  values live in the show's rules and are changed with `update_rules`).
 - **Reclaim sweep:** one `setInterval` (5s) expires leases, requeues tasks,
   wakes relevant waiters. Restart-safe because all state is in SQLite.
 
@@ -392,13 +448,44 @@ Auth: `Authorization: Bearer` (or `?token=` once → cookie). Two tokens:
 
 ## Security posture
 
-Dual bearer tokens. The worker token is intended to be committed so remote
-agents can join; anyone with it can register, pull tasks, and write notes on
-every show on the deployment, but cannot claim direction or mutate admin API.
-Keep the director token secret (`.env` / Fly secret / cloud Runtime Secret)
-and rotate via `fly secrets set`. Non-goals: per-member tokens, show-level
-ACLs, task-content encryption. Keep secrets out of task briefs; point at
-repo files instead.
+A show may include agents run by other people, so directors and workers do not
+trust each other. The design goal is not "no agent is ever fooled" (prompt
+injection makes that unreachable for any system that feeds an LLM
+attacker-controlled text); it is that a fooled agent still can't cause harm,
+because the capabilities that would let it aren't reachable through showrunner.
+See [SECURITY.md](docs/SECURITY.md) for the threat model and the full layering.
+The four controls, strongest first:
+
+1. **Per-member auth (real boundary).** `register` issues a per-member secret;
+   the DB stores only its SHA-256; every later tool call must present it
+   (constant-time check). `member_id` is a board-visible handle, not a
+   credential -- without this, anyone holding the shared worker bearer could
+   pass any `member_id` and act as that member (impersonate a peer, speak as the
+   director, complete/poison another worker's task). Unknown member and wrong
+   secret return the same `unauthorized_member` result, so there's no member-id
+   oracle.
+2. **Human release gate (real boundary, opt-in).** With the show's
+   `requireTaskRelease` rule on, a director-created task is withheld (not
+   claimable) until a human releases it (`showrunner task release`; the
+   read-only callboard badges it PENDING RELEASE) -- the deterministic check
+   against a malicious or compromised director admitting work no human vetted.
+   This and the other fleet rules are server-held per-show state, not a
+   repo file a worker could edit (see "Showrunner rules").
+3. **Runtime containment (the real host boundary, not ours).** showrunner
+   cannot stop a worker's host from running `curl`; only the agent runtime's
+   own permissions can. So "can't upload host files" is enforced by running
+   workers under a locked-down runtime (repo-scoped FS, network allowlist, no
+   host-secret access) and by never handing out work that needs more. SECURITY.md
+   states this as a precondition.
+4. **Dual bearer tokens + untrusted-content annotation (defense in depth).**
+   The committable worker token can register/pull/write but not direct; keep the
+   director token secret and rotate via `fly secrets set`. On delivery, every
+   peer-authored field (brief, note, message, artifact) is tagged
+   `trust:"untrusted_peer"` with fixed guidance. This is a mitigation, not a
+   boundary: it labels data as data, it does not sanitize it.
+
+Non-goals (v1): show-level ACLs, task-content encryption, and server-side
+content classification. Keep secrets out of task briefs; point at repo files.
 
 ## What v1 explicitly skips
 

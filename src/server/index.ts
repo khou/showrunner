@@ -144,7 +144,10 @@ app.post("/mcp", async (c) => {
   // "Direct response from Node.js API").
   const transport = createStatelessTransport();
   try {
-    const server = createMcpServer(store, { pollHoldSeconds: config.pollHoldSeconds, authLevel: c.get("authLevel") });
+    const server = createMcpServer(store, {
+      pollHoldSeconds: config.pollHoldSeconds,
+      authLevel: c.get("authLevel"),
+    });
     await server.connect(transport);
     await transport.handleRequest(c.env.incoming, c.env.outgoing);
   } catch (err) {

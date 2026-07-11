@@ -5,7 +5,7 @@ import { parseArgs } from "node:util";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import type { BoardState, CreateTaskInput, DirectionState, Message, MessageTarget, OverlapWarning, Task } from "../types.js";
+import type { BoardState, CreateTaskInput, DirectionState, Message, MessageTarget, OverlapWarning, ShowRules, Task } from "../types.js";
 import { INSTRUCTIONS } from "../server/instructions.js";
 
 class UsageError extends Error {}
@@ -83,6 +83,14 @@ function printBoard(state: BoardState): void {
     .map(([status, n]) => `${status}=${n}`)
     .join(" ");
   lines.push(`tasks: ${counts || "none"}`);
+
+  const pendingRelease = state.tasks.filter((t) => t.status === "queued" && t.released === false);
+  if (pendingRelease.length > 0) {
+    lines.push("pending release (human must approve before workers can claim):");
+    for (const t of pendingRelease) {
+      lines.push(`  ${t.id}  "${t.title}"  -- release with: showrunner task release --show ${state.show} --id ${t.id}`);
+    }
+  }
 
   if (state.escalations.inputRequired.length > 0 || state.escalations.humanMessages.length > 0) {
     lines.push("escalations:");
@@ -221,6 +229,104 @@ async function cmdTaskCancel(argv: string[]): Promise<void> {
   process.stdout.write(`canceled task ${result.task.id}: "${result.task.title}" (status: ${result.task.status})\n`);
 }
 
+// --- task release (human release gate) ---
+
+async function cmdTaskRelease(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      show: { type: "string" },
+      id: { type: "string" },
+      url: { type: "string" },
+      token: { type: "string" },
+    },
+    allowPositionals: false,
+  });
+  const cfg = requireConfig(values);
+  if (!values.show) throw new UsageError("task release requires --show");
+  if (!values.id) throw new UsageError("task release requires --id");
+
+  const result = await apiRequest<{ task: Task }>(
+    cfg,
+    "POST",
+    `/api/shows/${encodeURIComponent(values.show)}/tasks/${encodeURIComponent(values.id)}/release`,
+  );
+  process.stdout.write(`released task ${result.task.id}: "${result.task.title}" -- workers can now claim it\n`);
+}
+
+// --- rules (server-held show rules) ---
+
+function printRules(rules: ShowRules): void {
+  const s = rules.switches;
+  const lines = [
+    `rules v${rules.version} (updated by ${rules.updatedBy})`,
+    "switches (machine-enforced):",
+    `  requireTaskRelease        ${s.requireTaskRelease}`,
+    `  requireHumanMergeApproval ${s.requireHumanMergeApproval}`,
+    `  workerNotePropagation     ${s.workerNotePropagation}`,
+    `  artifactTextMaxChars      ${s.artifactTextMaxChars}`,
+    `  artifactDataMaxBytes      ${s.artifactDataMaxBytes}`,
+    `policy (advisory prose, delivered but never enforced):`,
+    rules.policy ? `  ${rules.policy.replace(/\n/g, "\n  ")}` : "  (none)",
+  ];
+  process.stdout.write(lines.join("\n") + "\n");
+}
+
+async function cmdRules(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: { show: { type: "string" }, url: { type: "string" }, token: { type: "string" } },
+    allowPositionals: false,
+  });
+  const cfg = requireConfig(values);
+  if (!values.show) throw new UsageError("rules requires --show");
+  const { rules } = await apiRequest<{ rules: ShowRules }>(cfg, "GET", `/api/shows/${encodeURIComponent(values.show)}/rules`);
+  printRules(rules);
+}
+
+function parseOnOff(flag: string, raw: string): boolean {
+  if (/^(on|true|1|yes)$/i.test(raw)) return true;
+  if (/^(off|false|0|no)$/i.test(raw)) return false;
+  throw new UsageError(`${flag} expects on|off, got "${raw}"`);
+}
+
+async function cmdRulesSet(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      show: { type: "string" },
+      url: { type: "string" },
+      token: { type: "string" },
+      "require-release": { type: "string" },
+      "merge-approval": { type: "string" },
+      "note-propagation": { type: "string" },
+      "artifact-text-max": { type: "string" },
+      "artifact-data-max": { type: "string" },
+      policy: { type: "string" },
+    },
+    allowPositionals: false,
+  });
+  const cfg = requireConfig(values);
+  if (!values.show) throw new UsageError("rules set requires --show");
+
+  const switches: Record<string, unknown> = {};
+  if (values["require-release"] !== undefined) switches.requireTaskRelease = parseOnOff("--require-release", values["require-release"]);
+  if (values["merge-approval"] !== undefined) switches.requireHumanMergeApproval = parseOnOff("--merge-approval", values["merge-approval"]);
+  if (values["note-propagation"] !== undefined) switches.workerNotePropagation = parseOnOff("--note-propagation", values["note-propagation"]);
+  if (values["artifact-text-max"] !== undefined) switches.artifactTextMaxChars = Number(values["artifact-text-max"]);
+  if (values["artifact-data-max"] !== undefined) switches.artifactDataMaxBytes = Number(values["artifact-data-max"]);
+
+  const payload: { switches?: Record<string, unknown>; policy?: string } = {};
+  if (Object.keys(switches).length > 0) payload.switches = switches;
+  if (values.policy !== undefined) payload.policy = values.policy;
+  if (payload.switches === undefined && payload.policy === undefined) {
+    throw new UsageError("rules set needs at least one switch flag or --policy");
+  }
+
+  const { rules } = await apiRequest<{ rules: ShowRules }>(cfg, "POST", `/api/shows/${encodeURIComponent(values.show)}/rules`, payload);
+  printRules(rules);
+}
+
 async function cmdShowDelete(argv: string[]): Promise<void> {
   const { values } = parseArgs({
     args: argv,
@@ -285,9 +391,11 @@ async function cmdDirectionClear(argv: string[]): Promise<void> {
 
 const PLAYBOOK_TEMPLATE = `# Show playbook
 
-Read by the director right after \`claim_direction\`. Everything here overrides
-the generic protocol defaults. Keep it short; briefs should point at docs, not
-duplicate them. Fleet automation/role defaults live in \`SHOWRUNNER.rules.md\`.
+Read by the director right after \`claim_direction\`. Advisory context that
+overrides the generic protocol defaults. Keep it short; briefs should point at
+docs, not duplicate them. Fleet automation/role rules are NOT here -- they are
+server-held show rules (see update_rules / the callboard), so a worker can't
+edit policy by editing a repo file.
 
 ## What this project is
 
@@ -310,62 +418,6 @@ duplicate them. Fleet automation/role defaults live in \`SHOWRUNNER.rules.md\`.
 
 - Decisions the director may make alone: <...>
 - Decisions that must go to the human (\`send_message\` to \`human\`): <...>
-`;
-
-const RULES_TEMPLATE = `# Showrunner rules
-
-User-editable. The director reads this after \`claim_direction\` and reminds
-workers; every worker re-reads it when claiming a task. Playbook
-(\`SHOWRUNNER.md\`) is how to decompose this project; this file is how the
-fleet behaves.
-
-## Automation defaults (flip to change)
-
-**Default path: feature branch → PR → squash-merge when green.**
-Do **not** commit or push directly to \`main\` unless you flip that below.
-
-| Default | Setting |
-|---|---|
-| **ON** | Open a PR when a task has a reviewable unit |
-| **ON** | Squash-merge that PR when verify is green (do not wait for the human) |
-| **OFF** | Require human approval before merge |
-| **OFF** | Allow direct commits/pushes to \`main\` (keep off; use PR → squash-merge) |
-| **ON** | Close superseded / abandoned drafts in the same session |
-| **ON** | Verification is part of done (see verify step in \`SHOWRUNNER.md\`) |
-
-To require human merge approval: set "Require human approval before merge" to
-**ON**. The path remains PR → squash-merge after approval — still not
-direct-to-main.
-
-## Dedicated workers (optional)
-
-Use this when some sessions have tools others lack (laptop with local secrets,
-GPU, browser, or a running stack vs a cloud VM). Soft preferences only:
-list lanes below, open a role-focused worker with a clear \`display_name\`, and
-the director pins matching tasks with \`assignee\`.
-
-By default assign any idle registered worker:
-
-- *(none)* — example: prefer one worker for visual/art; prefer one for verify/playtest
-
-## Subagents
-
-Sessions may fan out their own subagents to speed up work. Encouraged when it
-helps. Showrunner task ownership stays with the registered session.
-
-## Models (optional)
-
-Model choice is normally up to whoever opens the session. Edit only if the
-director itself spawns cloud agents via API keys:
-
-- Smarter models for strategic / architectural / design-direction work
-- Cheaper/faster models for routine implementation
-- Prefer plan-included models when cost matters; still prefer capable over weak when the task is hard
-- Do not hardcode vendor-specific model IDs unless you want to
-
-## Project rules
-
-Add show-specific standing rules below. Keep them short; point at docs.
 `;
 
 /** Writes a file unless it exists; reports either way. */
@@ -447,7 +499,9 @@ function cmdInit(argv: string[]): void {
   process.stdout.write(`initializing showrunner for show "${values.show}" in ${dir}\n`);
   scaffold(join(dir, ".showrunner"), values.show + "\n");
   scaffold(join(dir, "SHOWRUNNER.md"), PLAYBOOK_TEMPLATE);
-  scaffold(join(dir, "SHOWRUNNER.rules.md"), RULES_TEMPLATE);
+  // No SHOWRUNNER.rules.md: fleet rules are server-held show state now (seeded with OOTB defaults
+  // on the server, editable via `showrunner rules set` or the callboard), so policy that governs
+  // untrusted members isn't writable by them in a repo file.
   scaffold(join(dir, ".mcp.json"), JSON.stringify(mcpEntry, null, 2) + "\n");
   // Director token only: MCP ${VAR} interpolation reads process env, not .env files,
   // so this feeds shells/direnv/tooling for showrunner-director. Never committed.
@@ -465,8 +519,9 @@ function cmdInit(argv: string[]): void {
   const callboard = `${base}/?${callboardQs.toString()}`;
   process.stdout.write(`
 next steps:
-  1. Fill in SHOWRUNNER.md and edit SHOWRUNNER.rules.md, then commit
-     (.showrunner, playbook, rules, .mcp.json, .cursor/mcp.json — never .env).
+  1. Fill in SHOWRUNNER.md (playbook), then commit
+     (.showrunner, playbook, .mcp.json, .cursor/mcp.json — never .env).
+     Fleet rules are server-held: view/edit with \`showrunner rules\` or on the callboard.
   2. Callboard (director token): ${callboard}
   3. Director session (needs showrunner-director MCP + SHOWRUNNER_TOKEN in env):
        You're the showrunner director.
@@ -476,11 +531,14 @@ next steps:
 
   Ways to run:
     A. Simple fleet — one director + N general workers (default).
-    B. Dedicated lanes (optional) — edit SHOWRUNNER.rules.md "Dedicated workers",
-       then open role-focused sessions, e.g.:
+    B. Dedicated lanes (optional) — open role-focused sessions and note the
+       preference in SHOWRUNNER.md, e.g.:
          You're a showrunner worker focused on art. Register display_name art.
        Why: some sessions have tools others lack (laptop .env / GPU / browser /
        local stack vs cloud). Director pins matching tasks with assignee.
+
+  Fleet rules (release gate, merge approval, note propagation, artifact caps,
+  policy) are server-held: view/edit with 'showrunner rules [set]' or the callboard.
 `);
 }
 
@@ -574,8 +632,13 @@ Usage:
                        [--context-id <id>] [--depends-on <id,id>] [--files-hint <glob,glob>]
                        [--priority <n>] [--assignee <id>] [--url <url>] [--token <token>]
   showrunner task cancel --show <name> --id <task-id> [--url <url>] [--token <token>]
+  showrunner task release --show <name> --id <task-id> [--url <url>] [--token <token>]
   showrunner message --show <name> --to <member-id|director|all|human> --body <text>
                       [--url <url>] [--token <token>]
+  showrunner rules --show <name>                    # print the show's server-held rules
+  showrunner rules set --show <name> [--require-release on|off] [--merge-approval on|off]
+                       [--note-propagation on|off] [--artifact-text-max <n>]
+                       [--artifact-data-max <n>] [--policy <text>]
   showrunner direction clear --show <name> [--url <url>] [--token <token>]
   showrunner show delete --show <name> [--url <url>] [--token <token>]
   showrunner init --show <name> --url <url> --token <director> --worker-token <worker> [--dir <path>]
@@ -600,10 +663,15 @@ async function main(): Promise<void> {
       case "task":
         if (rest[0] === "add") await cmdTaskAdd(rest.slice(1));
         else if (rest[0] === "cancel") await cmdTaskCancel(rest.slice(1));
-        else throw new UsageError(`unknown "task" subcommand: ${rest[0] ?? "(none)"} (expected: task add|cancel)`);
+        else if (rest[0] === "release") await cmdTaskRelease(rest.slice(1));
+        else throw new UsageError(`unknown "task" subcommand: ${rest[0] ?? "(none)"} (expected: task add|cancel|release)`);
         break;
       case "message":
         await cmdMessage(rest);
+        break;
+      case "rules":
+        if (rest[0] === "set") await cmdRulesSet(rest.slice(1));
+        else await cmdRules(rest);
         break;
       case "direction":
         if (rest[0] !== "clear") throw new UsageError(`unknown "direction" subcommand: ${rest[0] ?? "(none)"} (expected: direction clear)`);

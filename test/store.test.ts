@@ -377,14 +377,41 @@ describe("direction: CAS, takeover, stale epoch", () => {
     expect(takeover).toEqual({ ok: true, epoch: 2 });
   });
 
-  it("claim succeeds again once the lease has expired", () => {
+  it("an expired lease does NOT open the seat for a plain claim (no implicit transfer by timeout)", () => {
     const { store, clock } = newStore();
     const a = store.register("myshow", "claude-local");
     const b = store.register("myshow", "claude-local");
     store.claimDirection(a.id);
-    clock.t += 600_001; // past default DIRECTION_LEASE_S (600s)
+    clock.t += 600_001; // past default DIRECTION_LEASE_S (600s): a's lease is now stale
     const result = store.claimDirection(b.id);
-    expect(result).toEqual({ ok: true, epoch: 2 });
+    expect(result.ok).toBe(false); // still held by a; staleness is liveness-only
+    if (!result.ok) expect(result.holder.id).toBe(a.id);
+    // b must use takeover (human authority) to displace a stale holder.
+    expect(store.claimDirection(b.id, true)).toEqual({ ok: true, epoch: 2 });
+  });
+
+  it("release_direction opens the seat so a later plain claim succeeds", () => {
+    const { store } = newStore();
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
+    store.claimDirection(a.id); // epoch 1
+    const released = store.releaseDirection(a.id, 1); // a stands down
+    expect(released.epoch).toBe(2);
+    expect(store.directionState("myshow").directorId).toBeUndefined();
+    expect(store.getBoard("myshow").members.find((m) => m.id === a.id)!.role).toBe("worker");
+    // Now the seat is unheld; b's plain claim (no takeover) succeeds.
+    expect(store.claimDirection(b.id)).toEqual({ ok: true, epoch: 3 });
+  });
+
+  it("release_direction is epoch-fenced: a non-holder or stale epoch is rejected", () => {
+    const { store } = newStore();
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
+    store.claimDirection(a.id); // a holds epoch 1
+    expect(() => store.releaseDirection(b.id, 1)).toThrow(SupersededError); // b isn't the holder
+    expect(() => store.releaseDirection(a.id, 99)).toThrow(SupersededError); // wrong epoch
+    // a is still the director; nothing changed.
+    expect(store.directionState("myshow").directorId).toBe(a.id);
   });
 
   it("checkEpoch throws SupersededError with the new holder once superseded", () => {
@@ -470,6 +497,57 @@ describe("clearDirection", () => {
     store.register("myshow", "claude-local");
     expect(() => store.clearDirection("myshow")).not.toThrow();
     expect(store.directionState("myshow").directorId).toBeUndefined();
+  });
+});
+
+describe("direction audit + provenance", () => {
+  it("records an event per transition with actor, method, and epoch", () => {
+    const { store } = newStore();
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
+    store.claimDirection(a.id); // claimed @1
+    store.releaseDirection(a.id, 1); // released @2
+    store.claimDirection(b.id); // claimed @3 (unheld seat)
+    store.claimDirection(a.id, true); // takeover @4 (displaces b)
+    store.clearDirection("myshow"); // admin_clear @5
+
+    const events = store.directionEvents("myshow").map((e) => ({ actor: e.actor, method: e.method, epoch: e.epoch }));
+    expect(events).toEqual([
+      { actor: a.id, method: "claimed", epoch: 1 },
+      { actor: a.id, method: "released", epoch: 2 },
+      { actor: b.id, method: "claimed", epoch: 3 },
+      { actor: a.id, method: "takeover", epoch: 4 },
+      { actor: "human", method: "admin_clear", epoch: 5 },
+    ]);
+  });
+
+  it("surfaces the current holder's provenance on the board", () => {
+    const { store, clock } = newStore();
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
+    store.claimDirection(a.id);
+    clock.t += 1000;
+    store.claimDirection(b.id, true); // takeover @2
+
+    const board = store.getBoard("myshow");
+    expect(board.director?.memberId).toBe(b.id);
+    expect(board.director?.provenance).toMatchObject({ method: "takeover", actor: b.id, epoch: 2, at: clock.t });
+  });
+
+  it("sweep logs an expired event once per holding, without opening the seat", () => {
+    const { store, clock } = newStore();
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
+    store.claimDirection(a.id); // epoch 1
+    clock.t += 600_001; // a's direction lease expires
+    store.sweep();
+    store.sweep(); // idempotent: still one expired event at epoch 1
+
+    const expired = store.directionEvents("myshow").filter((e) => e.method === "expired");
+    expect(expired).toHaveLength(1);
+    expect(expired[0]).toMatchObject({ actor: a.id, epoch: 1 });
+    // The seat is still held (staleness is liveness-only): a plain claim by b still fails.
+    expect(store.claimDirection(b.id).ok).toBe(false);
   });
 });
 
@@ -1111,5 +1189,173 @@ describe("deleteShow", () => {
     store.deleteShow("drop");
     expect(store.showNames()).toEqual(["keep"]);
     expect(store.getBoard("keep").taskCounts.queued).toBe(1);
+  });
+});
+
+describe("member secrets (per-member auth)", () => {
+  it("issueMemberSecret returns a high-entropy secret that verifies, and a wrong one does not", () => {
+    const { store } = newStore();
+    const m = store.register("myshow", "claude-local");
+    const secret = store.issueMemberSecret(m.id);
+    expect(secret.length).toBeGreaterThanOrEqual(20);
+    expect(store.verifyMemberSecret(m.id, secret)).toBe(true);
+    expect(store.verifyMemberSecret(m.id, secret + "x")).toBe(false);
+    expect(store.verifyMemberSecret(m.id, "")).toBe(false);
+  });
+
+  it("a member with no issued secret (e.g. the human pseudo-member) verifies nothing", () => {
+    const { store } = newStore();
+    const m = store.register("myshow", "claude-local");
+    // No issueMemberSecret call: the stored hash is NULL, so nothing authenticates as this member.
+    expect(store.verifyMemberSecret(m.id, "")).toBe(false);
+    expect(store.verifyMemberSecret(m.id, "anything")).toBe(false);
+  });
+
+  it("an unknown member id verifies nothing (no oracle) and re-issuing rotates the secret", () => {
+    const { store } = newStore();
+    expect(store.verifyMemberSecret("nobody", "x")).toBe(false);
+    const m = store.register("myshow", "claude-local");
+    const first = store.issueMemberSecret(m.id);
+    const second = store.issueMemberSecret(m.id);
+    expect(second).not.toBe(first);
+    expect(store.verifyMemberSecret(m.id, first)).toBe(false); // old secret no longer valid
+    expect(store.verifyMemberSecret(m.id, second)).toBe(true);
+  });
+
+  it("secrets survive a reopen (hash persisted, not just in memory)", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "showrunner-secret-"));
+    try {
+      const dbPath = path.join(dir, "s.db");
+      let store = new Store(dbPath);
+      const m = store.register("myshow", "claude-local");
+      const secret = store.issueMemberSecret(m.id);
+      store = new Store(dbPath);
+      expect(store.verifyMemberSecret(m.id, secret)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("human release gate (released column)", () => {
+  it("a released task is claimable; a withheld one is not until released", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+
+    const { task: held } = store.createTask({ show: "myshow", title: "held", brief: "b", createdBy: director.id, released: false });
+    expect(held.released).toBe(false);
+    // Nothing claimable while withheld.
+    expect(store.claimNextTask(worker.id)).toBeUndefined();
+
+    const released = store.releaseTask(held.id, "human");
+    expect(released?.released).toBe(true);
+    const claimed = store.claimNextTask(worker.id);
+    expect(claimed?.id).toBe(held.id);
+  });
+
+  it("tasks default to released (backward compatible) and the board exposes the flag", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
+    expect(task.released).toBe(true);
+    const view = store.getBoard("myshow").tasks.find((t) => t.id === task.id);
+    expect(view?.released).toBe(true);
+  });
+
+  it("releaseTask is idempotent and returns undefined for an unknown task", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, released: false });
+    const first = store.releaseTask(task.id, "human");
+    const second = store.releaseTask(task.id, "human");
+    expect(first?.released).toBe(true);
+    expect(second?.released).toBe(true);
+    expect(store.releaseTask("no-such-task", "human")).toBeUndefined();
+  });
+
+  it("a withheld task is skipped in favor of a released one, regardless of priority", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    // Higher-priority task is withheld; lower-priority one is released. The released one wins.
+    store.createTask({ show: "myshow", title: "held-high", brief: "b", createdBy: director.id, priority: 10, released: false });
+    const { task: open } = store.createTask({ show: "myshow", title: "open-low", brief: "b", createdBy: director.id, priority: 1 });
+    const claimed = store.claimNextTask(worker.id);
+    expect(claimed?.id).toBe(open.id);
+  });
+});
+
+describe("show rules (server-held policy)", () => {
+  it("seeds OOTB defaults on first touch (version 1, automation-friendly)", () => {
+    const { store } = newStore();
+    store.register("myshow", "claude-local");
+    const rules = store.getShowRules("myshow");
+    expect(rules.version).toBe(1);
+    expect(rules.switches.requireTaskRelease).toBe(false);
+    expect(rules.switches.requireHumanMergeApproval).toBe(false);
+    expect(rules.switches.workerNotePropagation).toBe(true);
+    expect(rules.switches.artifactTextMaxChars).toBeGreaterThan(0);
+    expect(rules.updatedBy).toBe("default");
+    // The board exposes the current rules.
+    expect(store.getBoard("myshow").rules.version).toBe(1);
+  });
+
+  it("updateShowRules merges a partial patch, bumps version, and records who", () => {
+    const { store } = newStore();
+    store.register("myshow", "claude-local");
+    const v2 = store.updateShowRules("myshow", { switches: { requireTaskRelease: true }, policy: "no force-push" }, "amber-fox");
+    expect(v2.version).toBe(2);
+    expect(v2.switches.requireTaskRelease).toBe(true);
+    expect(v2.switches.workerNotePropagation).toBe(true); // untouched fields keep their value
+    expect(v2.policy).toBe("no force-push");
+    expect(v2.updatedBy).toBe("amber-fox");
+    // A non-positive cap patch is ignored (can't disable a cap by setting 0).
+    const v3 = store.updateShowRules("myshow", { switches: { artifactTextMaxChars: 0 } }, "amber-fox");
+    expect(v3.switches.artifactTextMaxChars).toBe(v2.switches.artifactTextMaxChars);
+    expect(v3.version).toBe(3);
+  });
+
+  it("delivers full rules once per change: seeded-seen at register, re-delivered after a bump", () => {
+    const { store } = newStore();
+    const m = store.register("myshow", "claude-local");
+    // register seeds the member's cursor to current, so nothing to re-deliver yet.
+    expect(store.consumeRulesDelivery(m.id)).toEqual({ version: 1 });
+    store.updateShowRules("myshow", { switches: { requireHumanMergeApproval: true } }, "human");
+    const delivered = store.consumeRulesDelivery(m.id);
+    expect(delivered.version).toBe(2);
+    expect(delivered.rules?.switches.requireHumanMergeApproval).toBe(true);
+    // Consumed: not delivered again until the next change.
+    expect(store.consumeRulesDelivery(m.id)).toEqual({ version: 2 });
+  });
+
+  it("enforces workerNotePropagation: off suppresses push and claim-time recall, search still works", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const author = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: worker.id, filesHint: ["src/**"] });
+    store.claimNextTask(worker.id);
+
+    store.updateShowRules("myshow", { switches: { workerNotePropagation: false } }, "human");
+    const { deliveredTo } = store.saveNote(author.id, { body: "distinctive zebra note", filesHint: ["src/app.ts"] });
+    expect(deliveredTo).toEqual([]); // no push to the working peer
+    expect(store.notesForTask({ show: "myshow", title: "t", brief: "b", filesHint: ["src/**"] })).toEqual([]); // no claim-time recall
+    expect(store.searchNotes("myshow", "zebra").length).toBe(1); // explicit pull still works
+  });
+
+  it("enforces artifact caps in updateTask (text over the cap is rejected)", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: worker.id });
+    store.claimNextTask(worker.id);
+    store.updateShowRules("myshow", { switches: { artifactTextMaxChars: 10 } }, "human");
+    expect(() =>
+      store.updateTask(worker.id, task.id, { artifacts: [{ kind: "text", text: "x".repeat(11) }] }),
+    ).toThrow(/artifactTextMaxChars/);
+    // At the cap it's accepted.
+    const ok = store.updateTask(worker.id, task.id, { artifacts: [{ kind: "text", text: "x".repeat(10) }] });
+    expect(ok.artifacts.length).toBe(1);
   });
 });

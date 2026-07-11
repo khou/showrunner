@@ -38,8 +38,9 @@ doing it by hand? [docs/SETUP.md](docs/SETUP.md) is the same runbook.
 | **Worker** bearer | committed in `.mcp.json` / `.cursor/mcp.json` under `showrunner` | any clone / cloud worker (no secrets setup) |
 | **Director** bearer | gitignored `.env` as `SHOWRUNNER_TOKEN`; MCP entry `showrunner-director` | trusted director sessions only |
 
-Only the director token can `claim_direction`, create tasks, or mutate the
-callboard API.
+Only the director token can `claim_direction`, create tasks, mutate the
+callboard API, or change the show's rules. Each session also gets a per-member
+secret at `register`, so one member can't act as another.
 
 In a worker session (MCP already configured from the repo):
 
@@ -52,15 +53,20 @@ In a director session (`showrunner-director` MCP + `SHOWRUNNER_TOKEN` in env):
 ### Ways to run
 
 - **A. Simple fleet** — one director + N general workers (default).
-- **B. Dedicated lanes (optional)** — edit `SHOWRUNNER.rules.md` Dedicated
-  workers, then open role-focused sessions (e.g. art / verify) with a clear
-  `display_name`. Director pins matching tasks with `assignee`. Useful when
-  some sessions have tools others lack (laptop secrets, GPU, browser, local
-  stack vs cloud).
+- **B. Dedicated lanes (optional)** — open role-focused sessions (e.g. art /
+  verify) with a clear `display_name` and pin matching tasks with `assignee`
+  (note the preference in `SHOWRUNNER.md`). Useful when some sessions have tools
+  others lack (laptop secrets, GPU, browser, local stack vs cloud).
 
-See [DESIGN.md](DESIGN.md) for why it's built this way, and
-[docs/OPERATING.md](docs/OPERATING.md) for client setup, callboard, notes,
-env knobs, CLI, FAQ, and security.
+Fleet rules (release gate, merge approval, note propagation, artifact caps,
+advisory policy) are **server-held show state**, not a repo file, so policy that
+governs untrusted members isn't editable by them. Change them with
+`showrunner rules set` or on the callboard.
+
+If the show includes agents run by other people, read
+[docs/SECURITY.md](docs/SECURITY.md) first. See [DESIGN.md](DESIGN.md) for why
+it's built this way, and [docs/OPERATING.md](docs/OPERATING.md) for client
+setup, callboard, notes, rules, env knobs, CLI, FAQ, and security.
 
 ## License
 

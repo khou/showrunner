@@ -43,6 +43,15 @@ async function callTool(
   return { data, isError: result.isError === true };
 }
 
+// Per-member auth: tool calls now require member_secret. store.register() alone doesn't mint one
+// (only the MCP register tool does), so tests that drive tools through a store-registered member
+// use this to also issue the secret, mirroring what a real register() round-trip hands back.
+type Registered = ReturnType<Store["register"]> & { secret: string };
+function reg(store: Store, show: string, kind: Parameters<Store["register"]>[1] = "claude-local", displayName?: string): Registered {
+  const m = store.register(show, kind, displayName);
+  return Object.assign(m, { secret: store.issueMemberSecret(m.id) });
+}
+
 describe("await_work resolution order (PLAN.md pinned order)", () => {
   it("messages take precedence over a claimable task", async () => {
     const { store } = newStore();
@@ -296,12 +305,23 @@ describe("unknown member", () => {
     });
   });
 
-  it("other member-scoped tools report the same shape, not a protocol error", async () => {
+  it("other member-scoped tools report a structured unauthorized_member result, not a protocol error", async () => {
     const { store } = newStore();
     const client = await connectClient(store);
-    const result = await callTool(client, "get_board", { member_id: "ghost" });
-    expect(result.isError).toBe(false);
-    expect(result.data).toMatchObject({ status: "unknown_member", member_id: "ghost" });
+    // Unknown id (with any secret) and a real id with the wrong secret both return the SAME
+    // unauthorized_member shape -- no oracle for which member ids exist.
+    const ghost = await callTool(client, "get_board", { member_id: "ghost", member_secret: "whatever" });
+    expect(ghost.isError).toBe(false);
+    expect(ghost.data).toMatchObject({ status: "unauthorized_member", member_id: "ghost" });
+
+    const real = reg(store, "myshow");
+    const wrongSecret = await callTool(client, "get_board", { member_id: real.id, member_secret: "not-the-secret" });
+    expect(wrongSecret.isError).toBe(false);
+    expect(wrongSecret.data).toMatchObject({ status: "unauthorized_member", member_id: real.id });
+
+    const rightSecret = await callTool(client, "get_board", { member_id: real.id, member_secret: real.secret });
+    expect(rightSecret.isError).toBe(false);
+    expect(rightSecret.data).toMatchObject({ show: "myshow" });
   });
 });
 
@@ -309,13 +329,13 @@ describe("epoch fencing surfaces as a tool result", () => {
   it("create_task returns {status:'superseded'} with isError:false for a stale epoch", async () => {
     const { store } = newStore();
     const client = await connectClient(store);
-    const a = store.register("myshow", "claude-local");
-    const b = store.register("myshow", "claude-local");
-    const claimA = await callTool(client, "claim_direction", { member_id: a.id });
+    const a = reg(store, "myshow");
+    const b = reg(store, "myshow");
+    const claimA = await callTool(client, "claim_direction", { member_id: a.id, member_secret: a.secret });
     expect((claimA.data as { epoch: number }).epoch).toBe(1);
     store.claimDirection(b.id, true); // takeover: supersedes a at epoch 2
 
-    const result = await callTool(client, "create_task", { member_id: a.id, epoch: 1, title: "t", brief: "b" });
+    const result = await callTool(client, "create_task", { member_id: a.id, member_secret: a.secret, epoch: 1, title: "t", brief: "b" });
 
     expect(result.isError).toBe(false);
     expect(result.data).toMatchObject({ status: "superseded", epoch: 2, holder: { id: b.id } });
@@ -324,14 +344,15 @@ describe("epoch fencing surfaces as a tool result", () => {
   it("direct_task returns {status:'superseded'} with isError:false for a stale epoch", async () => {
     const { store } = newStore();
     const client = await connectClient(store);
-    const a = store.register("myshow", "claude-local");
-    const b = store.register("myshow", "claude-local");
-    await callTool(client, "claim_direction", { member_id: a.id });
+    const a = reg(store, "myshow");
+    const b = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: a.id, member_secret: a.secret });
     const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: a.id });
     store.claimDirection(b.id, true);
 
     const result = await callTool(client, "direct_task", {
       member_id: a.id,
+      member_secret: a.secret,
       epoch: 1,
       task_id: task.id,
       action: "cancel",
@@ -344,10 +365,10 @@ describe("epoch fencing surfaces as a tool result", () => {
   it("the current epoch still succeeds", async () => {
     const { store } = newStore();
     const client = await connectClient(store);
-    const a = store.register("myshow", "claude-local");
-    await callTool(client, "claim_direction", { member_id: a.id });
+    const a = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: a.id, member_secret: a.secret });
 
-    const result = await callTool(client, "create_task", { member_id: a.id, epoch: 1, title: "t", brief: "b" });
+    const result = await callTool(client, "create_task", { member_id: a.id, member_secret: a.secret, epoch: 1, title: "t", brief: "b" });
     expect(result.isError).toBe(false);
     expect(result.data).toMatchObject({ task: { title: "t", status: "queued" } });
   });
@@ -357,9 +378,9 @@ describe("save_note / search_notes tools", () => {
   it("save_note pushes to a live overlapping member, and search_notes finds it back", async () => {
     const { store } = newStore();
     const client = await connectClient(store);
-    const author = store.register("myshow", "claude-local");
-    const director = store.register("myshow", "claude-local");
-    const worker = store.register("myshow", "claude-local");
+    const author = reg(store, "myshow");
+    const director = reg(store, "myshow");
+    const worker = reg(store, "myshow");
     store.createTask({
       show: "myshow",
       title: "t",
@@ -372,6 +393,7 @@ describe("save_note / search_notes tools", () => {
 
     const saved = await callTool(client, "save_note", {
       member_id: author.id,
+      member_secret: author.secret,
       body: "gotcha: fox dens are load-bearing",
       files_hint: ["src/server/store.ts"],
     });
@@ -380,7 +402,7 @@ describe("save_note / search_notes tools", () => {
     expect(note_id).toBeTruthy();
     expect(delivered_to).toEqual([worker.id]);
 
-    const searched = await callTool(client, "search_notes", { member_id: author.id, query: "fox dens" });
+    const searched = await callTool(client, "search_notes", { member_id: author.id, member_secret: author.secret, query: "fox dens" });
     expect(searched.isError).toBe(false);
     const { notes } = searched.data as { notes: { id: string; body: string }[] };
     expect(notes.map((n) => n.id)).toContain(note_id);
@@ -389,24 +411,24 @@ describe("save_note / search_notes tools", () => {
   it("save_note reports a body-too-long error as a tool result, not a protocol error", async () => {
     const { store } = newStore();
     const client = await connectClient(store);
-    const author = store.register("myshow", "claude-local");
+    const author = reg(store, "myshow");
 
-    const result = await callTool(client, "save_note", { member_id: author.id, body: "x".repeat(2001) });
+    const result = await callTool(client, "save_note", { member_id: author.id, member_secret: author.secret, body: "x".repeat(2001) });
     expect(result.isError).toBe(true);
     expect(result.data).toMatchObject({ status: "error" });
   });
 
-  it("save_note and search_notes report unknown_member the same way as the rest", async () => {
+  it("save_note and search_notes report unauthorized_member the same way as the rest", async () => {
     const { store } = newStore();
     const client = await connectClient(store);
 
-    const saveResult = await callTool(client, "save_note", { member_id: "ghost", body: "x" });
+    const saveResult = await callTool(client, "save_note", { member_id: "ghost", member_secret: "x", body: "x" });
     expect(saveResult.isError).toBe(false);
-    expect(saveResult.data).toMatchObject({ status: "unknown_member", member_id: "ghost" });
+    expect(saveResult.data).toMatchObject({ status: "unauthorized_member", member_id: "ghost" });
 
-    const searchResult = await callTool(client, "search_notes", { member_id: "ghost", query: "x" });
+    const searchResult = await callTool(client, "search_notes", { member_id: "ghost", member_secret: "x", query: "x" });
     expect(searchResult.isError).toBe(false);
-    expect(searchResult.data).toMatchObject({ status: "unknown_member", member_id: "ghost" });
+    expect(searchResult.data).toMatchObject({ status: "unauthorized_member", member_id: "ghost" });
   });
 });
 
@@ -417,6 +439,8 @@ describe("register and the join prompt", () => {
     const result = await callTool(client, "register", { show: "myshow", kind: "claude-local" });
     expect(result.data).toMatchObject({ show: "myshow", director: null, protocol: INSTRUCTIONS });
     expect((result.data as { member_id: string }).member_id).toMatch(/^[a-z]+-[a-z]+/);
+    // register mints a member_secret and hands it back exactly once.
+    expect((result.data as { member_secret: string }).member_secret).toMatch(/.{20,}/);
   });
 
   it("exposes the same protocol text as the 'join' prompt", async () => {
@@ -485,19 +509,19 @@ describe("update_task drains unread messages (heartbeat delivery)", () => {
   it("returns unread messages once, then omits the key on the next call", async () => {
     const { store } = newStore();
     const client = await connectClient(store);
-    const director = store.register("myshow", "claude-local");
-    const worker = store.register("myshow", "claude-local");
+    const director = reg(store, "myshow");
+    const worker = reg(store, "myshow");
     const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: worker.id });
     store.claimNextTask(worker.id);
     store.sendMessage(director.id, worker.id, "how's it going?");
 
-    const first = await callTool(client, "update_task", { member_id: worker.id, task_id: task.id, note: "still working" });
+    const first = await callTool(client, "update_task", { member_id: worker.id, member_secret: worker.secret, task_id: task.id, note: "still working" });
     expect(first.isError).toBe(false);
     const firstData = first.data as { task: unknown; messages?: { body: string }[] };
     expect(firstData.messages).toHaveLength(1);
     expect(firstData.messages?.[0]?.body).toBe("how's it going?");
 
-    const second = await callTool(client, "update_task", { member_id: worker.id, task_id: task.id, note: "still working" });
+    const second = await callTool(client, "update_task", { member_id: worker.id, member_secret: worker.secret, task_id: task.id, note: "still working" });
     expect(second.isError).toBe(false);
     const secondData = second.data as { task: unknown; messages?: unknown[] };
     expect(secondData.messages).toBeUndefined();
@@ -550,16 +574,17 @@ describe("dual-token authLevel gating", () => {
   it("worker authLevel can register but cannot claim_direction or create_task", async () => {
     const { store } = newStore();
     const workerClient = await connectClient(store, { ...FAST_CONFIG, authLevel: "worker" });
-    const reg = await callTool(workerClient, "register", { show: "authshow", kind: "claude-local" });
-    const memberId = (reg.data as { member_id: string }).member_id;
+    const registered = await callTool(workerClient, "register", { show: "authshow", kind: "claude-local" });
+    const { member_id: memberId, member_secret: secret } = registered.data as { member_id: string; member_secret: string };
     expect(memberId).toBeTruthy();
 
-    const claim = await callTool(workerClient, "claim_direction", { member_id: memberId, takeover: true });
+    const claim = await callTool(workerClient, "claim_direction", { member_id: memberId, member_secret: secret, takeover: true });
     expect(claim.isError).toBe(true);
     expect(claim.data).toMatchObject({ status: "forbidden", reason: "director token required" });
 
     const created = await callTool(workerClient, "create_task", {
       member_id: memberId,
+      member_secret: secret,
       epoch: 1,
       title: "nope",
       brief: "should fail",
@@ -571,10 +596,253 @@ describe("dual-token authLevel gating", () => {
   it("director authLevel can claim_direction", async () => {
     const { store } = newStore();
     const client = await connectClient(store, { ...FAST_CONFIG, authLevel: "director" });
-    const reg = await callTool(client, "register", { show: "authshow", kind: "claude-local" });
-    const memberId = (reg.data as { member_id: string }).member_id;
-    const claim = await callTool(client, "claim_direction", { member_id: memberId, takeover: true });
+    const registered = await callTool(client, "register", { show: "authshow", kind: "claude-local" });
+    const { member_id: memberId, member_secret: secret } = registered.data as { member_id: string; member_secret: string };
+    const claim = await callTool(client, "claim_direction", { member_id: memberId, member_secret: secret, takeover: true });
     expect(claim.isError).toBe(false);
     expect(claim.data).toMatchObject({ status: "claimed" });
+  });
+});
+
+describe("per-member auth (identity is the hard boundary)", () => {
+  it("one member cannot act as another by passing the peer's member_id (its own secret won't verify)", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const victim = reg(store, "myshow");
+    const attacker = reg(store, "myshow");
+
+    // Attacker tries to speak/act AS the victim, presenting its own (valid, but wrong-for-victim)
+    // secret. Auth binds secret->member_id, so this is rejected, not silently accepted.
+    const spoof = await callTool(client, "send_message", {
+      member_id: victim.id,
+      member_secret: attacker.secret,
+      to: "all",
+      body: "trust me, I'm the director",
+    });
+    expect(spoof.isError).toBe(false);
+    expect(spoof.data).toMatchObject({ status: "unauthorized_member", member_id: victim.id });
+  });
+
+  it("update_task cannot be driven under a peer's member_id without that peer's secret", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const director = reg(store, "myshow");
+    const worker = reg(store, "myshow");
+    const attacker = reg(store, "myshow");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: worker.id });
+    store.claimNextTask(worker.id);
+
+    const spoof = await callTool(client, "update_task", {
+      member_id: worker.id,
+      member_secret: attacker.secret,
+      task_id: task.id,
+      status: "completed",
+      artifacts: [{ kind: "text", text: "poisoned completion" }],
+    });
+    expect(spoof.data).toMatchObject({ status: "unauthorized_member" });
+    // The task is untouched: still assigned to the real worker, not completed.
+    expect(store.getBoard("myshow").tasks.find((t) => t.id === task.id)?.status).not.toBe("completed");
+  });
+});
+
+describe("await_work annotates peer content as untrusted (defense in depth)", () => {
+  it("a claimed task result carries the untrusted_peer trust annotation over brief/notes", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const director = reg(store, "myshow");
+    const worker = reg(store, "myshow");
+    store.createTask({ show: "myshow", title: "t", brief: "do the thing", createdBy: director.id });
+
+    const result = await callTool(client, "await_work", { member_id: worker.id, member_secret: worker.secret });
+    const data = result.data as { status: string; trust?: { trust: string; applies_to: string[] } };
+    expect(data.status).toBe("task");
+    expect(data.trust?.trust).toBe("untrusted_peer");
+    expect(data.trust?.applies_to).toContain("task.brief");
+  });
+
+  it("await_work rejects a bad secret before parking on the queue", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const worker = reg(store, "myshow");
+    const result = await callTool(client, "await_work", { member_id: worker.id, member_secret: "wrong" });
+    expect(result.data).toMatchObject({ status: "unauthorized_member" });
+  });
+});
+
+describe("human release gate (release driven by the per-show rule)", () => {
+  it("withholds a created task from workers until it is released", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const director = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: director.id, member_secret: director.secret });
+    // The release gate is a per-show rule now, not a server flag: turn it on for this show.
+    store.updateShowRules("myshow", { switches: { requireTaskRelease: true } }, "human");
+
+    const created = await callTool(client, "create_task", {
+      member_id: director.id,
+      member_secret: director.secret,
+      epoch: 1,
+      title: "risky",
+      brief: "point at repo docs",
+    });
+    expect(created.data).toMatchObject({ pending_release: true });
+    const taskId = (created.data as { task_id: string }).task_id;
+
+    // A worker polling finds nothing claimable while the task is withheld.
+    const worker = reg(store, "myshow");
+    const poll = await callTool(client, "await_work", { member_id: worker.id, member_secret: worker.secret });
+    expect((poll.data as { status: string }).status).toBe("nothing");
+
+    // After a human release, the same worker can claim it.
+    store.releaseTask(taskId, "human");
+    const poll2 = await callTool(client, "await_work", { member_id: worker.id, member_secret: worker.secret });
+    expect((poll2.data as { status: string }).status).toBe("task");
+  });
+});
+
+describe("update_rules (server-held rules mutation)", () => {
+  it("is director-token gated: a worker-authLevel caller is forbidden", async () => {
+    const { store } = newStore();
+    const workerClient = await connectClient(store, { ...FAST_CONFIG, authLevel: "worker" });
+    const reg = await callTool(workerClient, "register", { show: "myshow", kind: "claude-local" });
+    const { member_id, member_secret } = reg.data as { member_id: string; member_secret: string };
+    const res = await callTool(workerClient, "update_rules", {
+      member_id,
+      member_secret,
+      epoch: 1,
+      switches: { requireTaskRelease: true },
+    });
+    expect(res.isError).toBe(true);
+    expect(res.data).toMatchObject({ status: "forbidden", reason: "director token required" });
+  });
+
+  it("is epoch-fenced: a stale epoch returns superseded and does not change rules", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const a = reg(store, "myshow");
+    const b = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: a.id, member_secret: a.secret });
+    store.claimDirection(b.id, true); // takeover -> epoch 2, a is stale at epoch 1
+
+    const res = await callTool(client, "update_rules", {
+      member_id: a.id,
+      member_secret: a.secret,
+      epoch: 1,
+      switches: { requireTaskRelease: true },
+    });
+    expect(res.data).toMatchObject({ status: "superseded", epoch: 2 });
+    expect(store.getShowRules("myshow").switches.requireTaskRelease).toBe(false);
+  });
+
+  it("the current director updates rules, bumps version, and notifies the cast", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const director = reg(store, "myshow");
+    const worker = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: director.id, member_secret: director.secret });
+
+    const res = await callTool(client, "update_rules", {
+      member_id: director.id,
+      member_secret: director.secret,
+      epoch: 1,
+      switches: { requireHumanMergeApproval: true },
+      policy: "squash-merge only",
+    });
+    expect(res.isError).toBe(false);
+    expect(res.data).toMatchObject({ status: "updated", rules: { version: 2, policy: "squash-merge only" } });
+    expect((res.data as { rules_trust: { trust: string } }).rules_trust.trust).toBe("authenticated_director_policy");
+
+    // The cast is notified via a send-to-all message: the worker sees it on its next poll.
+    const poll = await callTool(client, "await_work", { member_id: worker.id, member_secret: worker.secret });
+    const data = poll.data as { status: string; messages?: { body: string }[] };
+    expect(data.status).toBe("messages");
+    expect(data.messages?.some((m) => /rules updated to v2/.test(m.body))).toBe(true);
+  });
+
+  it("rules_version rides on a task claim, and the full rules re-deliver after a change", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const director = reg(store, "myshow");
+    const worker = reg(store, "myshow");
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
+
+    const claim = await callTool(client, "await_work", { member_id: worker.id, member_secret: worker.secret });
+    const claimData = claim.data as { status: string; rules_version: number; rules?: unknown };
+    expect(claimData.status).toBe("task");
+    expect(claimData.rules_version).toBe(1);
+    expect(claimData.rules).toBeUndefined(); // already seen at register; not re-sent
+
+    // A rule change re-delivers the full text on the worker's next poll.
+    store.updateShowRules("myshow", { switches: { requireTaskRelease: true } }, "human");
+    const poll = await callTool(client, "await_work", { member_id: worker.id, member_secret: worker.secret });
+    const pollData = poll.data as { rules_version: number; rules?: { version: number }; rules_trust?: { trust: string } };
+    expect(pollData.rules_version).toBe(2);
+    expect(pollData.rules?.version).toBe(2);
+    expect(pollData.rules_trust?.trust).toBe("authenticated_director_policy");
+  });
+});
+
+describe("release_direction + timeout no longer opens the seat", () => {
+  it("is director-token gated", async () => {
+    const { store } = newStore();
+    const workerClient = await connectClient(store, { ...FAST_CONFIG, authLevel: "worker" });
+    const reg = await callTool(workerClient, "register", { show: "myshow", kind: "claude-local" });
+    const { member_id, member_secret } = reg.data as { member_id: string; member_secret: string };
+    const res = await callTool(workerClient, "release_direction", { member_id, member_secret, epoch: 1 });
+    expect(res.isError).toBe(true);
+    expect(res.data).toMatchObject({ status: "forbidden", reason: "director token required" });
+  });
+
+  it("is epoch-fenced: a stale caller gets superseded", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const a = reg(store, "myshow");
+    const b = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: a.id, member_secret: a.secret });
+    store.claimDirection(b.id, true); // a is now stale at epoch 1
+    const res = await callTool(client, "release_direction", { member_id: a.id, member_secret: a.secret, epoch: 1 });
+    expect(res.data).toMatchObject({ status: "superseded", epoch: 2 });
+  });
+
+  it("release opens the seat for a later plain claim; a stale lease does not", async () => {
+    const { store, clock } = newStore();
+    const client = await connectClient(store);
+    const a = reg(store, "myshow");
+    const b = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: a.id, member_secret: a.secret }); // epoch 1
+
+    // Lease expiry alone: b's plain claim is denied with a hint pointing at takeover/release.
+    clock.t += 600_001;
+    const denied = await callTool(client, "claim_direction", { member_id: b.id, member_secret: b.secret });
+    expect(denied.data).toMatchObject({ status: "denied" });
+    expect((denied.data as { hint: string }).hint).toMatch(/takeover|release/);
+
+    // a releases; now b's plain claim succeeds.
+    const rel = await callTool(client, "release_direction", { member_id: a.id, member_secret: a.secret, epoch: 1 });
+    expect(rel.data).toMatchObject({ status: "released", epoch: 2 });
+    const claimed = await callTool(client, "claim_direction", { member_id: b.id, member_secret: b.secret });
+    expect(claimed.data).toMatchObject({ status: "claimed", epoch: 3 });
+  });
+
+  it("takeover still displaces a live-or-stale holder", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const a = reg(store, "myshow");
+    const b = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: a.id, member_secret: a.secret });
+    const takeover = await callTool(client, "claim_direction", { member_id: b.id, member_secret: b.secret, takeover: true });
+    expect(takeover.data).toMatchObject({ status: "claimed", epoch: 2 });
+  });
+});
+
+describe("register delivers current rules as authenticated policy", () => {
+  it("includes the full rules and a director-policy trust tag", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const res = await callTool(client, "register", { show: "myshow", kind: "claude-local" });
+    const data = res.data as { rules: { version: number; switches: unknown }; rules_trust: { trust: string } };
+    expect(data.rules.version).toBe(1);
+    expect(data.rules.switches).toBeTruthy();
+    expect(data.rules_trust.trust).toBe("authenticated_director_policy");
   });
 });

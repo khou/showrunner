@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { EventEmitter } from "node:events";
 import Database from "better-sqlite3";
 import {
@@ -11,6 +11,9 @@ import {
   type Member,
   type MemberKind,
   type MemberRole,
+  type DirectionEvent,
+  type DirectionMethod,
+  type DirectionProvenance,
   type Message,
   type MessageKind,
   type MessageTarget,
@@ -18,6 +21,9 @@ import {
   type NoteHit,
   type OverlapWarning,
   type SaveNoteInput,
+  type ShowRules,
+  type ShowRulesPatch,
+  type ShowRuleSwitches,
   type SweepResult,
   type Task,
   type TaskArtifact,
@@ -25,6 +31,7 @@ import {
   type TaskStatus,
   readLeaseConfig,
   readNoteConfig,
+  readRulesDefaults,
   SupersededError,
 } from "../types.js";
 
@@ -47,9 +54,20 @@ CREATE TABLE IF NOT EXISTS members (
   current_task_id TEXT,
   review_cursor INTEGER NOT NULL DEFAULT 0,
   session_url TEXT,
-  resume_hint TEXT
+  resume_hint TEXT,
+  secret_hash TEXT,
+  rules_version_seen INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS members_show_idx ON members(show);
+
+CREATE TABLE IF NOT EXISTS show_rules (
+  show TEXT PRIMARY KEY REFERENCES shows(name),
+  version INTEGER NOT NULL DEFAULT 1,
+  switches_json TEXT NOT NULL,
+  policy TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL,
+  updated_by TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS direction (
   show TEXT PRIMARY KEY REFERENCES shows(name),
@@ -57,6 +75,16 @@ CREATE TABLE IF NOT EXISTS direction (
   epoch INTEGER NOT NULL DEFAULT 0,
   lease_expires_at INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS direction_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  show TEXT NOT NULL REFERENCES shows(name),
+  actor TEXT NOT NULL,
+  method TEXT NOT NULL,
+  epoch INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS direction_events_show_idx ON direction_events(show, created_at);
 
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
@@ -73,6 +101,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_by TEXT NOT NULL,
   lease_expires_at INTEGER,
   artifacts_json TEXT NOT NULL DEFAULT '[]',
+  released INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -161,6 +190,30 @@ function randomHex(bytes: number): string {
   return randomBytes(bytes).toString("hex");
 }
 
+// Per-member auth (the hard identity line): register issues a high-entropy secret, the DB stores
+// only its SHA-256, and every later tool call must present the secret. member_id is a memorable,
+// board-visible handle (addressing), NOT a credential -- without this a caller holding the shared
+// worker bearer could pass ANY member_id and act as that member (impersonate a peer worker, speak
+// as the director on non-director-gated tools, complete/poison another worker's task). A single
+// SHA-256 is the right hash here: the secret is 32 bytes of CSPRNG output, so it has no low-entropy
+// structure for an offline attacker to grind the way a human password would.
+function hashSecret(secret: string): string {
+  return createHash("sha256").update(secret).digest("hex");
+}
+
+function timingSafeEqualHex(a: string, b: string): boolean {
+  const abuf = Buffer.from(a, "hex");
+  const bbuf = Buffer.from(b, "hex");
+  if (abuf.length !== bbuf.length || abuf.length === 0) return false;
+  return timingSafeEqual(abuf, bbuf);
+}
+
+/** A rules cap must stay a positive integer; a non-positive or non-finite patch value keeps the
+ * current value rather than letting a caller disable a cap by setting it to 0 or a bad type. */
+function clampPositiveInt(value: number, fallback: number): number {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
 /** Longest literal prefix before the first glob metacharacter. */
 function globPrefix(glob: string): string {
   const idx = glob.search(/[*?[]/);
@@ -216,6 +269,17 @@ interface MemberRow {
   review_cursor: number;
   session_url: string | null;
   resume_hint: string | null;
+  secret_hash: string | null;
+  rules_version_seen: number;
+}
+
+interface ShowRulesRow {
+  show: string;
+  version: number;
+  switches_json: string;
+  policy: string;
+  updated_at: number;
+  updated_by: string;
 }
 
 interface TaskRow {
@@ -233,6 +297,7 @@ interface TaskRow {
   created_by: string;
   lease_expires_at: number | null;
   artifacts_json: string;
+  released: number;
   created_at: number;
   updated_at: number;
 }
@@ -253,6 +318,15 @@ interface DirectionRow {
   director_id: string | null;
   epoch: number;
   lease_expires_at: number;
+}
+
+interface DirectionEventRow {
+  id: number;
+  show: string;
+  actor: string;
+  method: string;
+  epoch: number;
+  created_at: number;
 }
 
 // task_notes: a task's append-only journal (TaskNote). Not to be confused with NoteRow below,
@@ -309,6 +383,7 @@ function mapTask(r: TaskRow): Task {
     createdBy: r.created_by,
     leaseExpiresAt: r.lease_expires_at,
     artifacts: JSON.parse(r.artifacts_json) as TaskArtifact[],
+    released: r.released !== 0,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -349,12 +424,23 @@ function mapNoteHit(r: NoteRow): NoteHit {
   return { id: r.id, author: r.author, tags: JSON.parse(r.tags_json) as string[], body: r.body, createdAt: r.created_at };
 }
 
+function mapShowRules(r: ShowRulesRow): ShowRules {
+  return {
+    version: r.version,
+    switches: JSON.parse(r.switches_json) as ShowRuleSwitches,
+    policy: r.policy,
+    updatedAt: r.updated_at,
+    updatedBy: r.updated_by,
+  };
+}
+
 export class Store {
   readonly events = new EventEmitter();
   private readonly db: Database.Database;
   private readonly now: () => number;
   private readonly leases: ReturnType<typeof readLeaseConfig>;
   private readonly noteConfig: ReturnType<typeof readNoteConfig>;
+  private readonly rulesDefaults: ShowRuleSwitches;
 
   constructor(dbPath: string, now: () => number = Date.now) {
     this.db = new Database(dbPath);
@@ -363,9 +449,13 @@ export class Store {
     this.db.exec(SCHEMA_SQL);
     this.migrateMessagesKindColumn();
     this.migrateMemberSessionColumns();
+    this.migrateMemberSecretColumn();
+    this.migrateTaskReleasedColumn();
+    this.migrateMemberRulesSeenColumn();
     this.now = now;
     this.leases = readLeaseConfig();
     this.noteConfig = readNoteConfig();
+    this.rulesDefaults = readRulesDefaults();
     // Every parked await_work adds a wake:* listener; a healthy show can easily have more
     // than the EventEmitter default of 10 concurrent pollers. Listener count is bounded by
     // concurrent polls and provably cleaned up (see mcp.test.ts), so unbound this rather
@@ -395,6 +485,38 @@ export class Store {
     }
     if (!cols.some((c) => c.name === "resume_hint")) {
       this.db.exec("ALTER TABLE members ADD COLUMN resume_hint TEXT");
+    }
+  }
+
+  /** Guarded upgrade-in-place: members predates per-member secrets. A deployed DB gets the
+   * nullable column added; every pre-existing row keeps a NULL hash, which authenticates NOTHING
+   * through the MCP boundary (verifyMemberSecret rejects a NULL hash), so those sessions must
+   * re-register to get a secret. That one-time disruption on upgrade is the price of closing the
+   * impersonation hole; there is deliberately no "no secret presented == allowed" grandfather,
+   * because an attacker would just omit the secret. */
+  private migrateMemberSecretColumn(): void {
+    const cols = this.db.pragma("table_info(members)") as { name: string }[];
+    if (!cols.some((c) => c.name === "secret_hash")) {
+      this.db.exec("ALTER TABLE members ADD COLUMN secret_hash TEXT");
+    }
+  }
+
+  /** Guarded upgrade-in-place: tasks predates the human release gate. Existing tasks backfill to
+   * released=1 (the column default), preserving current behavior; only tasks created while
+   * REQUIRE_TASK_RELEASE is on are withheld. */
+  private migrateTaskReleasedColumn(): void {
+    const cols = this.db.pragma("table_info(tasks)") as { name: string }[];
+    if (!cols.some((c) => c.name === "released")) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN released INTEGER NOT NULL DEFAULT 1");
+    }
+  }
+
+  /** Guarded upgrade-in-place: members predates the per-member rules-version cursor. Existing rows
+   * backfill to 0, so the next await_work re-delivers the current rules once (harmless). */
+  private migrateMemberRulesSeenColumn(): void {
+    const cols = this.db.pragma("table_info(members)") as { name: string }[];
+    if (!cols.some((c) => c.name === "rules_version_seen")) {
+      this.db.exec("ALTER TABLE members ADD COLUMN rules_version_seen INTEGER NOT NULL DEFAULT 0");
     }
   }
 
@@ -514,16 +636,118 @@ export class Store {
       this.db
         .prepare("INSERT OR IGNORE INTO direction (show, director_id, epoch, lease_expires_at) VALUES (?, NULL, 0, 0)")
         .run(show);
+      // Seed the show's rules with OOTB defaults on first touch, so a new member starts already
+      // "seeing" the current version (register returns the full rules; no re-delivery needed).
+      const rules = this.ensureShowRules(show, at);
 
       const id = this.generateMemberId();
       const leaseExpiresAt = at + this.leases.workerLeaseS * 1000;
       this.db
         .prepare(
-          `INSERT INTO members (id, show, kind, display_name, role, registered_at, last_seen_at, lease_expires_at, current_task_id, session_url, resume_hint)
-           VALUES (?, ?, ?, ?, 'worker', ?, ?, ?, NULL, ?, ?)`,
+          `INSERT INTO members (id, show, kind, display_name, role, registered_at, last_seen_at, lease_expires_at, current_task_id, session_url, resume_hint, rules_version_seen)
+           VALUES (?, ?, ?, ?, 'worker', ?, ?, ?, NULL, ?, ?, ?)`,
         )
-        .run(id, show, kind, displayName ?? null, at, at, leaseExpiresAt, sessionUrl ?? null, resumeHint ?? null);
+        .run(id, show, kind, displayName ?? null, at, at, leaseExpiresAt, sessionUrl ?? null, resumeHint ?? null, rules.version);
       return mapMember(this.getMemberRowRaw(id)!);
+    });
+  }
+
+  /**
+   * Mint (or re-mint) this member's auth secret, store only its hash, and return the plaintext
+   * once. The MCP `register` tool calls this and hands the secret back to the session; the human
+   * pseudo-member (created by the /api layer) never calls it, so it keeps a NULL hash and cannot
+   * authenticate through the agent tool surface -- it only ever acts via the bearer-gated /api.
+   */
+  issueMemberSecret(memberId: string): string {
+    const secret = randomBytes(24).toString("base64url");
+    this.db.prepare("UPDATE members SET secret_hash = ? WHERE id = ?").run(hashSecret(secret), memberId);
+    return secret;
+  }
+
+  /**
+   * Constant-time check that `secret` matches the stored hash for `memberId`. Returns false for an
+   * unknown member and for any member whose hash is NULL (legacy/human pseudo-member): there is no
+   * bypass for "no secret on file", so a caller cannot authenticate as an unprovisioned member.
+   */
+  verifyMemberSecret(memberId: string, secret: string): boolean {
+    const row = this.getMemberRowRaw(memberId);
+    if (!row || !row.secret_hash) return false;
+    return timingSafeEqualHex(hashSecret(secret), row.secret_hash);
+  }
+
+  // --- show rules (server-held policy; DESIGN.md "Show rules") ---
+
+  private getShowRulesRow(show: string): ShowRulesRow | undefined {
+    return this.db.prepare("SELECT * FROM show_rules WHERE show = ?").get(show) as ShowRulesRow | undefined;
+  }
+
+  /** Seed a show's rules with OOTB defaults if none exist yet; returns the current rules. Idempotent
+   * (INSERT OR IGNORE), so it doubles as the lazy migration path for shows that predate the table. */
+  private ensureShowRules(show: string, at = this.now()): ShowRules {
+    const existing = this.getShowRulesRow(show);
+    if (existing) return mapShowRules(existing);
+    // Don't persist a rules row for a show that doesn't exist (the FK would reject it, and a board
+    // read for an unknown/deleted show should still succeed): return transient defaults instead.
+    const showExists = this.db.prepare("SELECT 1 FROM shows WHERE name = ?").get(show) !== undefined;
+    if (!showExists) {
+      return { version: 1, switches: { ...this.rulesDefaults }, policy: "", updatedAt: at, updatedBy: "default" };
+    }
+    this.db
+      .prepare(
+        "INSERT OR IGNORE INTO show_rules (show, version, switches_json, policy, updated_at, updated_by) VALUES (?, 1, ?, '', ?, 'default')",
+      )
+      .run(show, JSON.stringify(this.rulesDefaults), at);
+    return mapShowRules(this.getShowRulesRow(show)!);
+  }
+
+  /** Current rules for a show (seeds defaults on first access). */
+  getShowRules(show: string): ShowRules {
+    return this.ensureShowRules(show);
+  }
+
+  /**
+   * Apply a partial rules update, bump the version, and record who/when for audit. Switch fields
+   * are validated (caps stay positive ints); unknown switch keys are ignored. Returns the new
+   * rules. Callers (update_rules tool, admin /api) are responsible for auth/epoch fencing and for
+   * notifying the cast.
+   */
+  updateShowRules(show: string, patch: ShowRulesPatch, updatedBy: string): ShowRules {
+    return this.txn(() => {
+      const current = this.ensureShowRules(show);
+      const switches: ShowRuleSwitches = { ...current.switches };
+      if (patch.switches) {
+        if (typeof patch.switches.requireTaskRelease === "boolean") switches.requireTaskRelease = patch.switches.requireTaskRelease;
+        if (typeof patch.switches.requireHumanMergeApproval === "boolean") switches.requireHumanMergeApproval = patch.switches.requireHumanMergeApproval;
+        if (typeof patch.switches.workerNotePropagation === "boolean") switches.workerNotePropagation = patch.switches.workerNotePropagation;
+        if (patch.switches.artifactTextMaxChars !== undefined) switches.artifactTextMaxChars = clampPositiveInt(patch.switches.artifactTextMaxChars, current.switches.artifactTextMaxChars);
+        if (patch.switches.artifactDataMaxBytes !== undefined) switches.artifactDataMaxBytes = clampPositiveInt(patch.switches.artifactDataMaxBytes, current.switches.artifactDataMaxBytes);
+      }
+      const policy = patch.policy !== undefined ? patch.policy : current.policy;
+      const at = this.now();
+      this.db
+        .prepare("UPDATE show_rules SET version = version + 1, switches_json = ?, policy = ?, updated_at = ?, updated_by = ? WHERE show = ?")
+        .run(JSON.stringify(switches), policy, at, updatedBy, show);
+      // A rule change is show-wide; wake everyone so the next poll delivers the new version.
+      this.events.emit(`wake:show:${show}`);
+      return mapShowRules(this.getShowRulesRow(show)!);
+    });
+  }
+
+  /**
+   * Rules delivery with token discipline: always returns the current `version`; returns the full
+   * `rules` only when this member hasn't seen the current version yet (register seeded the cursor
+   * to current, update_rules bumps the version past it), and advances the member's cursor so the
+   * full text is delivered exactly once per change. Delivered rules are authenticated director
+   * policy, distinct from the untrusted_peer envelope on peer content.
+   */
+  consumeRulesDelivery(memberId: string): { version: number; rules?: ShowRules } {
+    return this.txn(() => {
+      const member = this.getMemberRowRaw(memberId);
+      if (!member) return { version: 0 };
+      const rules = this.ensureShowRules(member.show);
+      if (member.rules_version_seen >= rules.version) return { version: rules.version };
+      this.db.prepare("UPDATE members SET rules_version_seen = ? WHERE id = ?").run(rules.version, memberId);
+      return { version: rules.version, rules };
     });
   }
 
@@ -542,6 +766,8 @@ export class Store {
       this.db.prepare("DELETE FROM tasks WHERE show = ?").run(show);
       this.db.prepare("DELETE FROM members WHERE show = ?").run(show);
       this.db.prepare("DELETE FROM direction WHERE show = ?").run(show);
+      this.db.prepare("DELETE FROM direction_events WHERE show = ?").run(show);
+      this.db.prepare("DELETE FROM show_rules WHERE show = ?").run(show);
       this.db.prepare("DELETE FROM shows WHERE name = ?").run(show);
       // Parked polls of deleted members resolve on their next check with unknown_member.
       this.events.emit(`wake:show:${show}`);
@@ -573,6 +799,7 @@ export class Store {
     const now = this.now();
     const dir = this.getDirectionRow(show);
     const directorMemberRow = dir?.director_id ? this.getMemberRowRaw(dir.director_id) : undefined;
+    const provenance = dir && dir.director_id ? this.directionProvenance(show, dir.director_id, dir.epoch) : undefined;
     const director =
       dir && dir.director_id
         ? {
@@ -582,6 +809,7 @@ export class Store {
             stale: dir.lease_expires_at < now,
             ...(directorMemberRow?.session_url ? { sessionUrl: directorMemberRow.session_url } : {}),
             ...(directorMemberRow?.resume_hint ? { resumeHint: directorMemberRow.resume_hint } : {}),
+            ...(provenance ? { provenance } : {}),
           }
         : null;
 
@@ -628,6 +856,7 @@ export class Store {
         attempt: t.attempt,
         createdAt: t.created_at,
         updatedAt: t.updated_at,
+        released: t.released !== 0,
       };
       if (verbose) view.notes = this.getNotes(t.id);
       return view;
@@ -658,22 +887,40 @@ export class Store {
         inputRequired: tasks.filter((t) => t.status === "input-required"),
         humanMessages,
       },
+      rules: this.getShowRules(show),
       ...(verbose ? { recentMessages: this.getRecentMessages(show) } : {}),
     };
   }
 
   // --- direction ---
 
+  private recordDirectionEvent(show: string, actor: string, method: DirectionMethod, epoch: number, at: number): void {
+    this.db
+      .prepare("INSERT INTO direction_events (show, actor, method, epoch, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run(show, actor, method, epoch, at);
+  }
+
+  /**
+   * Claim (or take over) the direction seat.
+   *
+   * Non-takeover: succeeds ONLY when the seat is unheld (never claimed, explicitly released, or
+   * admin-cleared -> director_id IS NULL) or the caller already holds it (renewal). A merely
+   * expired lease does NOT open the seat -- expiry is a liveness signal (callboard staleness,
+   * headless show), never a claimability signal, so authority never transfers implicitly by
+   * timeout. takeover:true is the explicit human-authority path and displaces any holder
+   * unconditionally. Every successful claim bumps epoch and writes an audit event.
+   */
   claimDirection(memberId: string, takeover = false): ClaimDirectionResult {
     return this.txn(() => {
       const member = this.getMemberRowRaw(memberId);
       if (!member) throw new Error(`unknown member: ${memberId}`);
       const now = this.now();
       const dir = this.getDirectionRow(member.show)!;
-      const currentValid = dir.director_id !== null && dir.lease_expires_at > now;
+      const unheld = dir.director_id === null;
+      const isSelf = dir.director_id === memberId;
       const isNewHolder = dir.director_id !== memberId;
 
-      if (takeover || !currentValid || dir.director_id === memberId) {
+      if (takeover || unheld || isSelf) {
         const newEpoch = dir.epoch + 1;
         this.db
           .prepare("UPDATE direction SET director_id = ?, epoch = ?, lease_expires_at = ? WHERE show = ?")
@@ -688,11 +935,42 @@ export class Store {
           // replay the show's entire done-history in its first await_work.
           this.db.prepare("UPDATE members SET review_cursor = ? WHERE id = ?").run(now, memberId);
         }
+        // Audit: takeover only when actually displacing a *different* holder; a takeover of an
+        // unheld seat or a self-renewal is a plain claim.
+        const method: DirectionMethod = takeover && dir.director_id !== null && !isSelf ? "takeover" : "claimed";
+        this.recordDirectionEvent(member.show, memberId, method, newEpoch, now);
         return { ok: true, epoch: newEpoch };
       }
 
+      // Seat is held by someone else and this is not a takeover: denied, even if the lease is
+      // stale. The caller must use takeover:true (human authority) or wait for a release.
       const holder = mapMember(this.getMemberRowRaw(dir.director_id!)!);
       return { ok: false, holder, epoch: dir.epoch };
+    });
+  }
+
+  /**
+   * The current director explicitly gives up the seat (epoch-fenced). Creates the legitimate
+   * "given up" state a later plain claim can take. Throws SupersededError if the caller is not the
+   * current holder at `epoch`. Bumps epoch, clears the holder, demotes to worker, records an audit
+   * event, and wakes the show so headless workers keep draining. Returns the new (unheld) epoch.
+   */
+  releaseDirection(memberId: string, epoch: number): { epoch: number } {
+    return this.txn(() => {
+      const member = this.getMemberRowRaw(memberId);
+      if (!member) throw new Error(`unknown member: ${memberId}`);
+      // checkEpoch throws SupersededError unless memberId is the current holder at this epoch.
+      this.checkEpoch(member.show, memberId, epoch);
+      const now = this.now();
+      const dir = this.getDirectionRow(member.show)!;
+      const newEpoch = dir.epoch + 1;
+      this.db
+        .prepare("UPDATE direction SET director_id = NULL, epoch = ?, lease_expires_at = ? WHERE show = ?")
+        .run(newEpoch, now, member.show);
+      this.db.prepare("UPDATE members SET role = 'worker' WHERE id = ?").run(memberId);
+      this.recordDirectionEvent(member.show, memberId, "released", newEpoch, now);
+      this.events.emit(`wake:show:${member.show}`);
+      return { epoch: newEpoch };
     });
   }
 
@@ -707,10 +985,33 @@ export class Store {
       if (dir.director_id) {
         this.db.prepare("UPDATE members SET role = 'worker' WHERE id = ?").run(dir.director_id);
       }
+      const newEpoch = dir.epoch + 1;
       this.db
-        .prepare("UPDATE direction SET director_id = NULL, epoch = epoch + 1, lease_expires_at = ? WHERE show = ?")
-        .run(now, show);
+        .prepare("UPDATE direction SET director_id = NULL, epoch = ?, lease_expires_at = ? WHERE show = ?")
+        .run(newEpoch, now, show);
+      this.recordDirectionEvent(show, "human", "admin_clear", newEpoch, now);
+      this.events.emit(`wake:show:${show}`);
     });
+  }
+
+  /** Direction audit log for a show, newest-last. */
+  directionEvents(show: string): DirectionEvent[] {
+    const rows = this.db
+      .prepare("SELECT * FROM direction_events WHERE show = ? ORDER BY id ASC")
+      .all(show) as DirectionEventRow[];
+    return rows.map((r) => ({ method: r.method as DirectionMethod, actor: r.actor, epoch: r.epoch, at: r.created_at }));
+  }
+
+  /** How the current holder got the seat: the acquiring event (claimed|takeover) at the current
+   * epoch. Returns undefined if there's no holder or no matching event (e.g. pre-audit rows). */
+  private directionProvenance(show: string, directorId: string, epoch: number): DirectionProvenance | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM direction_events WHERE show = ? AND actor = ? AND epoch = ? AND method IN ('claimed', 'takeover') ORDER BY id DESC LIMIT 1",
+      )
+      .get(show, directorId, epoch) as DirectionEventRow | undefined;
+    if (!row) return undefined;
+    return { method: row.method as DirectionMethod, actor: row.actor, epoch: row.epoch, at: row.created_at };
   }
 
   getReviewCursor(memberId: string): number {
@@ -771,12 +1072,15 @@ export class Store {
       const dependsOn = input.dependsOn ?? [];
       const priority = input.priority ?? 0;
 
+      // released defaults true; a caller (the create_task tool under REQUIRE_TASK_RELEASE) passes
+      // false to withhold the task from workers until a human releases it on the callboard.
+      const released = input.released === false ? 0 : 1;
       this.db
         .prepare(
           `INSERT INTO tasks
              (id, show, context_id, title, brief, files_hint_json, depends_on_json, priority,
-              status, assignee, attempt, created_by, lease_expires_at, artifacts_json, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, NULL, '[]', ?, ?)`,
+              status, assignee, attempt, created_by, lease_expires_at, artifacts_json, released, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, NULL, '[]', ?, ?, ?)`,
         )
         .run(
           id,
@@ -789,17 +1093,47 @@ export class Store {
           priority,
           input.assignee ?? null,
           input.createdBy,
+          released,
           at,
           at,
         );
 
       const overlaps = this.computeOverlaps(input.show, id, filesHint);
-      if (input.assignee) {
+      // An unreleased task is not claimable, so waking workers would only make them re-poll and
+      // find nothing. Wake the show so the callboard/human sees the pending-release item instead.
+      if (!released) {
+        this.events.emit(`wake:show:${input.show}`);
+      } else if (input.assignee) {
         this.events.emit(`wake:${input.assignee}`);
       } else {
         this.events.emit(`wake:show:${input.show}`);
       }
       return { task: mapTask(this.getTaskRowRaw(id)!), overlaps };
+    });
+  }
+
+  /**
+   * Human release of a withheld task (REQUIRE_TASK_RELEASE gate): flips released=1 and wakes
+   * workers to claim it. Idempotent. Bearer-gated at the /api layer (director/admin token), so
+   * this is the one point where a human vets a director-authored brief before any worker can see
+   * it -- the deterministic check against a malicious or compromised director. Returns undefined
+   * for an unknown task.
+   */
+  releaseTask(taskId: string, actor: string): Task | undefined {
+    return this.txn(() => {
+      const row = this.getTaskRowRaw(taskId);
+      if (!row) return undefined;
+      if (row.released === 0) {
+        const at = this.now();
+        this.db.prepare("UPDATE tasks SET released = 1, updated_at = ? WHERE id = ?").run(at, taskId);
+        this.insertNote(taskId, actor, "released by human", at);
+        if (row.assignee) {
+          this.events.emit(`wake:${row.assignee}`);
+        } else {
+          this.events.emit(`wake:show:${row.show}`);
+        }
+      }
+      return mapTask(this.getTaskRowRaw(taskId)!);
     });
   }
 
@@ -820,9 +1154,10 @@ export class Store {
       }
 
       const now = this.now();
+      // released = 1 excludes tasks a human hasn't yet vetted under the REQUIRE_TASK_RELEASE gate.
       const candidates = this.db
         .prepare(
-          "SELECT * FROM tasks WHERE show = ? AND status = 'queued' AND (assignee IS NULL OR assignee = ?) ORDER BY priority DESC, created_at ASC",
+          "SELECT * FROM tasks WHERE show = ? AND status = 'queued' AND released = 1 AND (assignee IS NULL OR assignee = ?) ORDER BY priority DESC, created_at ASC",
         )
         .all(member.show, memberId) as TaskRow[];
 
@@ -885,6 +1220,20 @@ export class Store {
 
       let artifacts = JSON.parse(row.artifacts_json) as TaskArtifact[];
       if (patch.artifacts && patch.artifacts.length > 0) {
+        // Artifact caps (show rule, machine-enforced): a worker->director channel bounded so a
+        // hostile completion can't ship an oversized text/data payload into the director's review.
+        const { artifactTextMaxChars, artifactDataMaxBytes } = this.getShowRules(row.show).switches;
+        for (const a of patch.artifacts) {
+          if (a.kind === "text" && a.text.length > artifactTextMaxChars) {
+            throw new Error(`artifact text exceeds artifactTextMaxChars (${artifactTextMaxChars}); got ${a.text.length}`);
+          }
+          if (a.kind === "data") {
+            const bytes = Buffer.byteLength(JSON.stringify(a.data ?? null), "utf8");
+            if (bytes > artifactDataMaxBytes) {
+              throw new Error(`artifact data exceeds artifactDataMaxBytes (${artifactDataMaxBytes}); got ${bytes}`);
+            }
+          }
+        }
         artifacts = artifacts.concat(patch.artifacts);
       }
 
@@ -1166,6 +1515,10 @@ export class Store {
 
   private pushNote(show: string, authorId: string, note: Note): string[] {
     const now = this.now();
+    // Note-propagation switch (show rule): when off, notes are stored and searchable but never
+    // auto-pushed to peers -- closing the unprompted worker->peer channel. Explicit search_notes
+    // still works (a pull the reader initiates, not a push).
+    if (!this.getShowRules(show).switches.workerNotePropagation) return [];
     // Delivery is gated on the recipient's *current task* being live, not the 90s member
     // lease: a worker heads-down executing only has to heartbeat every ~10min (see the sweep()
     // comment below), so it's routinely outside its member lease window while still genuinely
@@ -1236,6 +1589,10 @@ export class Store {
   notesForTask(task: Pick<Task, "show" | "title" | "brief" | "filesHint">, limit = this.noteConfig.notesPerTask): Note[] {
     const seen = new Set<string>();
     const result: Note[] = [];
+
+    // Note-propagation switch (show rule): when off, claim-time recall delivers nothing, so a
+    // claim never auto-surfaces peer notes. (Explicit search_notes remains available.)
+    if (!this.getShowRules(task.show).switches.workerNotePropagation) return result;
 
     if (task.filesHint.length > 0) {
       // notes is append-only and unbounded; bound the scan to the most recent slice instead of
@@ -1332,10 +1689,20 @@ export class Store {
         }
       }
 
+      // Expired direction is a liveness signal only: the holder STAYS held (director_id
+      // untouched), so a plain claim by anyone else still fails -- authority never transfers by
+      // timeout. We only note the expiry in the audit log, once per holding (idempotent on the
+      // current epoch), so provenance/history shows when a seat went stale.
       const expiredDirectionRows = this.db
-        .prepare("SELECT show FROM direction WHERE director_id IS NOT NULL AND lease_expires_at < ?")
-        .all(now) as { show: string }[];
+        .prepare("SELECT show, director_id, epoch FROM direction WHERE director_id IS NOT NULL AND lease_expires_at < ?")
+        .all(now) as { show: string; director_id: string; epoch: number }[];
       const expiredDirectionShows = expiredDirectionRows.map((d) => d.show);
+      for (const d of expiredDirectionRows) {
+        const already = this.db
+          .prepare("SELECT 1 FROM direction_events WHERE show = ? AND epoch = ? AND method = 'expired' LIMIT 1")
+          .get(d.show, d.epoch);
+        if (!already) this.recordDirectionEvent(d.show, d.director_id, "expired", d.epoch, now);
+      }
 
       for (const show of showsTouched) this.events.emit(`wake:show:${show}`);
 

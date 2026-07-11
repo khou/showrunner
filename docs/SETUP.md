@@ -120,21 +120,21 @@ equal). It writes:
 |---|---|---|
 | `.showrunner` | yes | show name pin |
 | `SHOWRUNNER.md` | yes | director playbook template |
-| `SHOWRUNNER.rules.md` | yes | fleet rules (merge defaults, optional dedicated workers) |
 | `.mcp.json` / `.cursor/mcp.json` | yes | `showrunner` = hardcoded **worker** Bearer; `showrunner-director` = `${SHOWRUNNER_TOKEN}` / `${env:SHOWRUNNER_TOKEN}` |
 | `.env` | **no** | `SHOWRUNNER_TOKEN` (director) + `SHOWRUNNER_URL` |
 
-It also prints the callboard magic link and copy-paste worker/director
-prompts (ways to run: simple fleet vs dedicated lanes).
+Fleet rules are **not** a repo file: they are server-held per-show state, seeded
+with OOTB defaults on the server and edited with `showrunner rules set` or the
+callboard. `init` also prints the callboard magic link and copy-paste
+worker/director prompts (ways to run: simple fleet vs dedicated lanes).
 
 Then:
 
 1. Fill in `SHOWRUNNER.md` for THIS project (README, docs, build commands,
    area/`files_hint` map, escalation). Show the user before committing.
-2. Optionally edit `SHOWRUNNER.rules.md` Dedicated workers if they want
-   capability lanes (art / verify / laptop-only tools).
-3. Commit `.showrunner`, `SHOWRUNNER.md`, `SHOWRUNNER.rules.md`, `.mcp.json`,
-   `.cursor/mcp.json`. Never commit `.env`.
+2. Commit `.showrunner`, `SHOWRUNNER.md`, `.mcp.json`, `.cursor/mcp.json`.
+   Never commit `.env`. Adjust fleet rules later with `showrunner rules set`
+   (e.g. `--require-release on` for a show with untrusted workers).
 
 ## 5. How clients connect (after init)
 
@@ -185,8 +185,8 @@ Tell the user, concretely:
 - **Next step:** open another agent session in this repo and say
   `You're a showrunner worker.` It appears on the callboard within seconds.
   Then tell THIS (director) session what to build.
-- **Optional dedicated lane:** if they want capability routing, point at
-  `SHOWRUNNER.rules.md` Dedicated workers and a role-focused prompt such as
+- **Optional dedicated lane:** if they want capability routing, open a
+  role-focused worker and note the preference in `SHOWRUNNER.md`, e.g.
   `You're a showrunner worker focused on art. Register display_name art.`
 - Where things live: `~/.showrunner-token` (director),
   `~/.showrunner-worker-token` (worker), Fly app `$APP`, CLI at

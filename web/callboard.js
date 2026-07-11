@@ -149,9 +149,34 @@
   function render(board) {
     renderDirector(board && board.director);
     renderMembers(board);
+    renderRules(board && board.rules);
     renderTasks(board);
     renderActivity(board);
     renderQueueBanner(board);
+  }
+
+  // Server-held show rules, display-only (the callboard is a read-only window). Switches show as
+  // on/off text; the human changes them via `showrunner rules set` or the director's update_rules.
+  function renderRules(rules) {
+    const body = el("rules-body");
+    if (!body) return;
+    if (!rules) {
+      body.innerHTML = `<span class="hint">no show selected</span>`;
+      return;
+    }
+    const s = rules.switches || {};
+    const sw = (label, on) => `<li><span class="rule-state ${on ? "on" : "off"}">${on ? "on" : "off"}</span> ${label}</li>`;
+    const num = (label, val) => `<li><span class="rule-num">${escapeHtml(String(val))}</span> ${label}</li>`;
+    body.innerHTML = `
+      <div class="hint">v${rules.version} · updated by ${escapeHtml(rules.updatedBy || "?")}</div>
+      <ul class="rule-list">
+        ${sw("require human release of new tasks", !!s.requireTaskRelease)}
+        ${sw("require human merge approval", !!s.requireHumanMergeApproval)}
+        ${sw("propagate worker notes to peers", !!s.workerNotePropagation)}
+        ${num("artifact text max (chars)", s.artifactTextMaxChars)}
+        ${num("artifact data max (bytes)", s.artifactDataMaxBytes)}
+      </ul>
+      <div class="rule-policy"><span class="hint">policy (advisory)</span><div>${rules.policy ? escapeHtml(rules.policy) : '<span class="hint">none</span>'}</div></div>`;
   }
 
   function renderQueueBanner(board) {
@@ -183,9 +208,9 @@
       return `<a class="chat-open" href="${escapeHtml(entity.sessionUrl)}" target="_blank" rel="noopener">open chat &#8599;</a>`;
     }
     if (entity.resumeHint) {
-      // resume_hint is self-reported by the session, not vetted by the server (DESIGN.md security
-      // posture: one shared token, no per-member trust) -- label it so a copy-paste isn't mistaken
-      // for a server-verified command.
+      // resume_hint is self-reported by the session and not vetted by the server (member auth
+      // proves who registered, not that this string is a safe command) -- label it so a
+      // copy-paste isn't mistaken for a server-verified command.
       return `<code class="resume-hint">${escapeHtml(entity.resumeHint)}</code> <button type="button" class="copy-hint" data-hint="${escapeHtml(entity.resumeHint)}">copy</button> <span class="hint" title="self-reported by the session, not verified by the server">self-reported</span>`;
     }
     return `<span class="hint">no chat link reported</span>`;
@@ -202,9 +227,14 @@
       return;
     }
     const dot = director.stale ? "stale" : "fresh";
+    // Provenance: how this holder got the seat (audit log). A stale lease no longer opens the
+    // seat, so showing "how/when" makes an unexpected holder easy to spot.
+    const p = director.provenance;
+    const prov = p ? `<div class="hint">seat: ${escapeHtml(p.method)} &middot; ${relTime(p.at)}</div>` : "";
     body.innerHTML = `
       <div><span class="dot ${dot}"></span> ${escapeHtml(director.memberId)}</div>
-      <div class="hint">epoch ${director.epoch} &middot; ${director.stale ? "lease expired" : "lease active"}</div>
+      <div class="hint">epoch ${director.epoch} &middot; ${director.stale ? "lease expired (still holds the seat)" : "lease active"}</div>
+      ${prov}
       <div class="chat-link">${chatLinkHtml(director)}</div>
     `;
   }
@@ -393,11 +423,20 @@
       ? `<span class="badge status-${escapeHtml(t.status)}">${escapeHtml(t.status)}</span>`
       : "";
     const attention = col === "needsinput" ? " attention" : "";
-    return `<li class="task-item${attention}"${attention ? pulsePhaseAttr() : ""} data-id="${escapeHtml(t.id)}">
+    // Release gate (display only; the callboard is a read-only window): a queued task withheld by
+    // the requireTaskRelease rule shows a PENDING RELEASE badge so the human sees the checkpoint.
+    // Releasing happens via `showrunner task release`, not here. (Only queued tasks can be
+    // withheld, and only needs-input pulses, so the two never co-occur on one card.)
+    const pending = t.status === "queued" && t.released === false;
+    const pendingUi = pending
+      ? `<span class="badge badge-hold" title="withheld until a human releases it with: showrunner task release">PENDING RELEASE</span>`
+      : "";
+    return `<li class="task-item${attention}${pending ? " task-hold" : ""}"${attention ? pulsePhaseAttr() : ""} data-id="${escapeHtml(t.id)}">
       <div class="task-row">
         <span class="task-title">${escapeHtml(t.title)}</span>
         ${statusBadge}
         <span class="badge">p${t.priority}</span>
+        ${pendingUi}
       </div>
       <div class="hint">${escapeHtml(t.id)} &middot; ${t.assignee ? escapeHtml(t.assignee) : "unassigned"} &middot; attempt ${t.attempt} &middot; ${relTime(t.updatedAt)}</div>
       ${col === "failures" && !expanded ? failureReportHtml(t) : ""}

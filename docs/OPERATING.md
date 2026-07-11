@@ -91,11 +91,20 @@ drives the same `/api` the callboard reads. Shows:
 
 ## Showrunner rules
 
-`SHOWRUNNER.rules.md` (scaffolded by `init`) holds user-editable fleet
-defaults: open PR / squash-merge when green / verify-is-done, optional soft
-dedicated-worker preferences, and project standing rules. The director
-propagates them; workers re-read on claim. Playbook (`SHOWRUNNER.md`) stays
-about decomposing *this* project. Sessions may fan out subagents freely.
+Fleet rules are **server-held per-show state**, not a repo file (policy that
+governs untrusted members must not be editable by them). Each show has:
+
+- **switches** (machine-enforced): `requireTaskRelease`,
+  `requireHumanMergeApproval`, `workerNotePropagation`, `artifactTextMaxChars`,
+  `artifactDataMaxBytes`.
+- **policy** (advisory prose, delivered but never enforced).
+
+New shows seed OOTB defaults (favoring automation). The director changes rules
+with the `update_rules` tool; the human edits them on the callboard or with
+`showrunner rules set`. Every change bumps a version, is audited (`updated_by`),
+and pings the cast; `register` delivers the full rules and later polls
+re-deliver on version change. Playbook (`SHOWRUNNER.md`) stays a repo file about
+decomposing *this* project (advisory). Sessions may fan out subagents freely.
 
 ## How it works
 
@@ -113,6 +122,14 @@ about decomposing *this* project. Sessions may fan out subagents freely.
   leases and requeues their tasks; nothing is trusted to say goodbye.
 - Director-only calls carry an `epoch` integer; the server bumps it on every
   claim and rejects stale epochs. That's the entire fencing mechanism.
+- **Direction never transfers by timeout.** An expired direction lease is a
+  liveness signal only (the callboard shows the holder stale); it does not open
+  the seat. A plain `claim_direction` succeeds only if the seat is unheld
+  (nobody claimed it, the holder called `release_direction`, or the human
+  cleared it) or you already hold it. To displace a live-or-stale holder, the
+  human uses `claim_direction` with `takeover:true`. Every transition is audited
+  (`claimed | released | takeover | admin_clear | expired`) and the current
+  holder's provenance shows on the board and callboard.
 - Workers can't receive pushes (cloud sessions are outbound-only), so
   `await_work` is a long-poll: it blocks up to `POLL_HOLD_SECONDS` (default
   25, chosen to clear Cursor/Fly/Claude Code's independent ~60s connection
@@ -180,6 +197,17 @@ decisions (especially answers to `input-required`) as notes.
 | `NOTE_MAX_CHARS` | `2000` | Max shared-note body length. |
 | `NOTES_PER_TASK` | `4` | Max `relevant_notes` attached at task claim time. |
 
+Rule seed-defaults (applied to a **new** show's rules; per-show values then live
+on the server and change with `showrunner rules set` / `update_rules`):
+
+| Var | Default | Seeds switch |
+|---|---|---|
+| `REQUIRE_TASK_RELEASE` | `false` | `requireTaskRelease` — withhold director tasks until a human releases them. Turn on for untrusted workers. |
+| `REQUIRE_HUMAN_MERGE_APPROVAL` | `false` | `requireHumanMergeApproval` — agents leave PRs for the human. |
+| `WORKER_NOTE_PROPAGATION` | `true` | `workerNotePropagation` — auto-push notes to peers' claims. |
+| `ARTIFACT_TEXT_MAX_CHARS` | `10000` | `artifactTextMaxChars` cap. |
+| `ARTIFACT_DATA_MAX_BYTES` | `16384` | `artifactDataMaxBytes` cap. |
+
 ## CLI
 
 This package isn't published to npm (the name `showrunner` is already taken
@@ -198,7 +226,11 @@ Reading `SHOWRUNNER_URL` / `SHOWRUNNER_TOKEN` from the environment (or
 showrunner status [--show <name>]
 showrunner task add --show <name> --title <t> --brief <b> [--priority <n>] [--assignee <id>] ...
 showrunner task cancel --show <name> --id <task-id>
+showrunner task release --show <name> --id <task-id>   # release a task withheld by the release gate
 showrunner message --show <name> --to <member-id|director|all|human> --body <text>
+showrunner rules --show <name>                         # print the show's server-held rules
+showrunner rules set --show <name> [--require-release on|off] [--merge-approval on|off] \
+                     [--note-propagation on|off] [--artifact-text-max <n>] [--artifact-data-max <n>] [--policy <text>]
 showrunner direction clear --show <name>
 showrunner show delete --show <name>        # removes the show and everything under it
 showrunner init --show <name> --url <url> --token <director> --worker-token <worker>
@@ -208,13 +240,14 @@ showrunner snippets [--url <url>] [--worker-token <token>]
 ```
 
 `init` sets a repo up as a show: it writes `.showrunner` (the name pin),
-`SHOWRUNNER.md` (the show playbook), `SHOWRUNNER.rules.md` (fleet rules),
-committed `.mcp.json` / `.cursor/mcp.json` with a **hardcoded worker** Bearer
-plus a `showrunner-director` entry that reads `SHOWRUNNER_TOKEN` from env, and
-a gitignored `.env` with the director token. It prints the callboard link and
-ways-to-run (simple fleet vs dedicated lanes).
-Fill in the playbook, tweak rules, commit, and every clone, worktree, and
-cloud checkout gets the same show name and direction rules.
+`SHOWRUNNER.md` (the show playbook), committed `.mcp.json` / `.cursor/mcp.json`
+with a **hardcoded worker** Bearer plus a `showrunner-director` entry that reads
+`SHOWRUNNER_TOKEN` from env, and a gitignored `.env` with the director token. It
+prints the callboard link and ways-to-run (simple fleet vs dedicated lanes).
+Fleet rules are server-held (seeded with OOTB defaults on the server), not
+scaffolded into the repo -- view/edit them with `showrunner rules` or on the
+callboard. Fill in the playbook, commit, and every clone, worktree, and cloud
+checkout gets the same show name.
 
 `open` builds the callboard `?token=` handshake URL (optionally `&show=`) from
 env/`~` context and opens it in the browser (`--print` to stdout only).
@@ -276,10 +309,30 @@ again.
 
 ## Security posture
 
-Two bearer tokens. The **worker** token is meant to be committed so clones can
-join without secrets; it can register, pull tasks, and write notes, but cannot
-claim direction or mutate admin `/api`. The **director** token stays secret
-(`.env` / Fly / cloud Runtime Secret). Rotate with
-`fly secrets set SHOWRUNNER_TOKEN=... SHOWRUNNER_WORKER_TOKEN=...`. No
-per-member tokens or per-show ACLs. Keep secrets out of task briefs; point at
-repo files instead.
+A show may include agents run by other people, so directors and workers don't
+trust each other. Full threat model and reasoning: [SECURITY.md](SECURITY.md).
+The controls, strongest first:
+
+1. **Per-member auth.** `register` returns a `member_secret` that must accompany
+   `member_id` on every call (the DB stores only its hash). `member_id` is a
+   board handle, not a credential, so one member can't act as another.
+2. **Human release gate** (the show's `requireTaskRelease` rule, on). Director-
+   created tasks are withheld until a human releases them with `showrunner task
+   release` (the read-only callboard only badges them) -- the check against a
+   malicious/compromised director. Fleet rules are server-held per-show state
+   (not a repo file), edited via `update_rules` / `showrunner rules set`.
+3. **Runtime containment** (not enforced by showrunner). Run untrusted workers
+   with repo-scoped filesystem access, a network allowlist, and no host
+   secrets. This is the real boundary against host exfiltration; showrunner
+   only avoids handing out work that needs more.
+4. **Dual tokens + untrusted-content annotation** (defense in depth). The
+   committable worker token can't direct; keep the director token secret and
+   rotate with `fly secrets set SHOWRUNNER_TOKEN=... SHOWRUNNER_WORKER_TOKEN=...`.
+   Peer-authored fields are delivered tagged `trust:"untrusted_peer"`; treat
+   them as data, never instructions.
+
+For a show with untrusted members: set a distinct worker token, turn on the
+`requireTaskRelease` rule (`showrunner rules set --require-release on`, or seed
+it deployment-wide with `REQUIRE_TASK_RELEASE`), run workers locked-down, and
+keep secrets out of briefs (point at repo files). Non-goals in v1: per-member
+tokens with revocation, per-show ACLs, content encryption.

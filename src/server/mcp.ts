@@ -1,11 +1,12 @@
 // MCP tool surface for showrunner (DESIGN.md "MCP tool surface", PLAN.md "MCP tools"
-// + "Long-poll semantics"). The 10 pinned tools plus the "join" prompt.
+// + "Long-poll semantics"). The 12 pinned tools plus the "join" prompt.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { Store } from "./store.js";
 import { INSTRUCTIONS } from "./instructions.js";
+import { directorPolicyNotice, untrustedNotice } from "./trust.js";
 import {
   SupersededError,
   type AuthLevel,
@@ -66,6 +67,18 @@ const UPDATE_STATUS = z.enum(["working", "input-required", "completed", "failed"
 
 const DIRECT_ACTION = z.enum(["cancel", "requeue", "assign", "answer", "approve"]);
 
+// Partial rules switches for update_rules; every field optional so a caller changes one switch
+// without restating the rest. Structured switches only -- the advisory `policy` prose is separate.
+const RULES_SWITCHES = z
+  .object({
+    requireTaskRelease: z.boolean().optional(),
+    requireHumanMergeApproval: z.boolean().optional(),
+    workerNotePropagation: z.boolean().optional(),
+    artifactTextMaxChars: z.number().int().positive().optional(),
+    artifactDataMaxBytes: z.number().int().positive().optional(),
+  })
+  .optional();
+
 // register's self-reported chat link (DESIGN.md "session_url/resume_hint are how a human opens
 // this session's chat"): only the session itself knows this, so it's optional and validated at
 // the boundary rather than trusted verbatim.
@@ -102,12 +115,40 @@ function unknownMember(memberId: string): { status: "unknown_member"; member_id:
   return { status: "unknown_member", member_id: memberId, hint: "member not found; call register to rejoin the show" };
 }
 
-/** Every tool but `register` needs the caller's Member; also renews its lease (DESIGN.md leases table). */
-function resolveMember(store: Store, memberId: string): { member: Member } | { result: CallToolResult } {
+function unauthorizedMember(memberId: string): { status: "unauthorized_member"; member_id: string; hint: string } {
+  return {
+    status: "unauthorized_member",
+    member_id: memberId,
+    // Deliberately the same shape/hint whether the member is unknown or the secret is wrong, and
+    // the store's compare is constant-time, so this can't be used to probe which member ids exist.
+    hint: "member_id/member_secret did not match; call register to rejoin and use the new member_id + member_secret it returns",
+  };
+}
+
+/**
+ * Authenticate the caller as `memberId` by verifying `memberSecret` against the stored hash, then
+ * renew its lease. This is the hard identity boundary: member_id alone is a board-visible handle,
+ * not a credential, so without the secret check any holder of the shared worker bearer could act
+ * as any member. Unknown member and wrong secret return the same result (no member-id oracle).
+ */
+function resolveMember(
+  store: Store,
+  memberId: string,
+  memberSecret: string,
+): { member: Member } | { result: CallToolResult } {
+  if (!store.verifyMemberSecret(memberId, memberSecret)) {
+    return { result: jsonResult(unauthorizedMember(memberId)) };
+  }
   const member = store.touchMember(memberId);
   if (!member) return { result: jsonResult(unknownMember(memberId)) };
   return { member };
 }
+
+// Shared across every authenticated tool: member_id addresses, member_secret authenticates.
+const MEMBER_SECRET = z
+  .string()
+  .min(1)
+  .describe("the member_secret returned by register for this member_id; required on every call, never shared with other members");
 
 function supersededResult(err: SupersededError): CallToolResult {
   return jsonResult({ status: "superseded", message: err.message, show: err.show, holder: err.holder, epoch: err.epoch });
@@ -126,6 +167,41 @@ export type AwaitWorkResult =
 // (search_notes hits, by contrast, return the full body -- that's an explicit pull, not a cap
 // meant to bound an unprompted push).
 const RELEVANT_NOTE_BODY_CHARS = 300;
+
+/**
+ * Attach the untrusted-peer annotation (trust.ts) to await_work results that carry another
+ * member's free text. Defense in depth only: it labels which fields are peer-authored so the
+ * reader treats them as data, it does not sanitize or block anything.
+ */
+function annotateAwaitWork(result: AwaitWorkResult): Record<string, unknown> {
+  switch (result.status) {
+    case "task":
+      return { ...result, trust: untrustedNotice(["task.brief", "task.title", "relevant_notes[].body"]) };
+    case "messages":
+      return { ...result, trust: untrustedNotice(["messages[].body"]) };
+    case "review":
+      return { ...result, trust: untrustedNotice(["items[].title", "items[].notes[].body"]) };
+    case "nothing":
+    case "unknown_member":
+      return { ...result };
+    default: {
+      const _exhaustive: never = result;
+      return _exhaustive;
+    }
+  }
+}
+
+/**
+ * Rules delivery with token discipline (DESIGN.md "Show rules"): `rules_version` always rides
+ * along so a member can tell if it's current; the full `rules` text (tagged as authenticated
+ * director policy) is included only when this member hasn't seen the current version, and exactly
+ * once per change. Merged into await_work and update_task results.
+ */
+function rulesDelivery(store: Store, memberId: string): Record<string, unknown> {
+  const { version, rules } = store.consumeRulesDelivery(memberId);
+  if (rules) return { rules_version: version, rules, rules_trust: directorPolicyNotice() };
+  return { rules_version: version };
+}
 
 function toRelevantNoteHit(note: Note): NoteHit {
   const truncated = note.body.length > RELEVANT_NOTE_BODY_CHARS;
@@ -334,13 +410,22 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         args.session_url,
         args.resume_hint,
       );
+      // Mint this member's auth secret and return it exactly once; the DB keeps only its hash.
+      const member_secret = store.issueMemberSecret(member.id);
       const board_summary = stripBoard(store.getBoard(member.show));
       const director = store.directionState(member.show).directorId ?? null;
       const result: Record<string, unknown> = {
         member_id: member.id,
+        member_secret,
+        secret_notice:
+          "Save member_secret; pass it with member_id on EVERY later call. It authenticates you as this member and is shown only now. Do not share it with other members or put it in task briefs/notes.",
         show: member.show,
         director,
         board_summary,
+        // Full show rules at register (authenticated director policy, distinct from untrusted peer
+        // content). rules_version rides on later task claims; the full text re-delivers on change.
+        rules: store.getShowRules(member.show),
+        rules_trust: directorPolicyNotice(),
         protocol: INSTRUCTIONS,
       };
       if (!preexisting.includes(member.show)) {
@@ -364,10 +449,19 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       description: "Long-poll for work: unread messages, director review items, or a claimed task.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         wait_seconds: z.number().positive().optional(),
       },
     },
-    async (args) => jsonResult(await resolveAwaitWork(store, args.member_id, args.wait_seconds, config.pollHoldSeconds)),
+    async (args) => {
+      // await_work bypasses resolveMember (it long-polls rather than returning immediately), so it
+      // authenticates the secret up front itself before parking on the queue.
+      if (!store.verifyMemberSecret(args.member_id, args.member_secret)) {
+        return jsonResult(unauthorizedMember(args.member_id));
+      }
+      const result = await resolveAwaitWork(store, args.member_id, args.wait_seconds, config.pollHoldSeconds);
+      return jsonResult({ ...annotateAwaitWork(result), ...rulesDelivery(store, args.member_id) });
+    },
   );
 
   server.registerTool(
@@ -376,6 +470,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       description: "Heartbeat, journal, and/or transition a task you hold.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         task_id: z.string().min(1),
         status: UPDATE_STATUS.optional(),
         note: z.string().optional(),
@@ -383,7 +478,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       },
     },
     async (args) => {
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       try {
         const task = store.updateTask(resolved.member.id, args.task_id, {
@@ -395,7 +490,12 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         // notes and answers on its ~10min heartbeat instead of only at its next await_work."
         // Same drainInbox as await_work; omit the key rather than ship an empty array.
         const messages = store.drainInbox(resolved.member.id);
-        return jsonResult(messages.length > 0 ? { task, messages } : { task });
+        const rules = rulesDelivery(store, resolved.member.id);
+        return jsonResult(
+          messages.length > 0
+            ? { task, messages, trust: untrustedNotice(["messages[].body"]), ...rules }
+            : { task, ...rules },
+        );
       } catch (err) {
         return jsonResult({ status: "error", message: (err as Error).message }, true);
       }
@@ -408,13 +508,14 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       description: "Send a message to a member id, 'director', 'all', or 'human'.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         to: z.string().min(1),
         body: z.string().min(1),
         task_id: z.string().optional(),
       },
     },
     async (args) => {
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       try {
         const message = store.sendMessage(resolved.member.id, args.to, args.body, args.task_id);
@@ -431,11 +532,12 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       description: "Board summary: director card, members, task counts/columns, escalations.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         verbose: z.boolean().optional(),
       },
     },
     async (args) => {
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       return jsonResult(stripBoard(store.getBoard(resolved.member.show, args.verbose)));
     },
@@ -448,6 +550,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         "Save a note to shared memory: pushes to members whose current task overlaps (same task/context or files_hint glob), and it's recalled by search_notes and future claims.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         body: z.string().min(1),
         tags: z.array(z.string()).optional(),
         files_hint: z.array(z.string()).optional(),
@@ -455,7 +558,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       },
     },
     async (args) => {
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       try {
         const { note, deliveredTo } = store.saveNote(resolved.member.id, {
@@ -477,15 +580,17 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       description: "BM25-ranked search over this member's show's shared notes.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         query: z.string().min(1),
         limit: z.number().int().positive().optional(),
       },
     },
     async (args) => {
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       const notes = store.searchNotes(resolved.member.show, args.query, args.limit);
-      return jsonResult({ notes });
+      // Notes are peer-authored; a poisoned note can only ever be data, never instructions.
+      return jsonResult({ notes, trust: untrustedNotice(["notes[].body"]) });
     },
   );
 
@@ -493,22 +598,58 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     "claim_direction",
     {
       description:
-        "Claim (or take over) the direction lease for this member's show. Requires the director bearer token (showrunner-director MCP).",
+        "Claim the direction seat for this member's show. Without takeover, succeeds only if the seat is unheld (never claimed, released, or admin-cleared) or you already hold it (renewal) -- a merely expired lease does NOT open the seat. takeover:true (human-authority path) displaces any holder. Requires the director bearer token (showrunner-director MCP).",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         takeover: z.boolean().optional(),
       },
     },
     async (args) => {
       const denied = requireDirectorAuth();
       if (denied) return denied;
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       const result = store.claimDirection(resolved.member.id, args.takeover);
       if (result.ok) {
         return jsonResult({ status: "claimed", epoch: result.epoch, board_summary: stripBoard(store.getBoard(resolved.member.show)) });
       }
-      return jsonResult({ status: "denied", holder: result.holder, epoch: result.epoch });
+      // Held by someone else and not a takeover: the seat does not open on lease expiry. Say so.
+      return jsonResult({
+        status: "denied",
+        holder: result.holder,
+        epoch: result.epoch,
+        hint: "the seat is held; a stale lease does not open it. Use takeover:true (human authority) or wait for the holder to release_direction.",
+      });
+    },
+  );
+
+  server.registerTool(
+    "release_direction",
+    {
+      description:
+        "Director-only: explicitly give up the direction seat (epoch-fenced). Clears the holder and bumps epoch so a later plain claim_direction can take the now-unheld seat. Use this when standing down cleanly; a dead director instead needs the human to claim_direction with takeover:true. Requires the director bearer token.",
+      inputSchema: {
+        member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
+        epoch: z.number().int(),
+      },
+    },
+    async (args) => {
+      const denied = requireDirectorAuth();
+      if (denied) return denied;
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
+      if ("result" in resolved) return resolved.result;
+      const { member } = resolved;
+      try {
+        const { epoch } = store.releaseDirection(member.id, args.epoch);
+        // Notify the cast: the show is headless until someone claims (existing send-to-all pattern).
+        store.sendMessage(member.id, "all", `direction released by ${member.id}; show is headless until a new claim_direction`);
+        return jsonResult({ status: "released", epoch });
+      } catch (err) {
+        if (err instanceof SupersededError) return supersededResult(err);
+        return jsonResult({ status: "error", message: (err as Error).message }, true);
+      }
     },
   );
 
@@ -519,6 +660,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         "Director-only: create a task. Epoch-fenced; a stale epoch returns {status:'superseded'}. Requires the director bearer token.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         epoch: z.number().int(),
         title: z.string().min(1),
         brief: z.string().min(1),
@@ -532,7 +674,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     async (args) => {
       const denied = requireDirectorAuth();
       if (denied) return denied;
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       const { member } = resolved;
       try {
@@ -541,6 +683,10 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         if (err instanceof SupersededError) return supersededResult(err);
         throw err;
       }
+      // Release gate is a per-show rule now (not an env flag): a director-authored task is
+      // withheld until a human releases it (`showrunner task release`) -- the check against a
+      // malicious/compromised director. The human's own /api create path is never withheld.
+      const requireRelease = store.getShowRules(member.show).switches.requireTaskRelease;
       const { task, overlaps } = store.createTask({
         show: member.show,
         title: args.title,
@@ -551,8 +697,12 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         filesHint: args.files_hint,
         priority: args.priority,
         assignee: args.assignee,
+        released: requireRelease ? false : undefined,
       });
-      return jsonResult({ task_id: task.id, task, overlaps });
+      const pending = requireRelease
+        ? { pending_release: true, notice: "requireTaskRelease is on for this show: the task is withheld until a human releases it with `showrunner task release`." }
+        : {};
+      return jsonResult({ task_id: task.id, task, overlaps, ...pending });
     },
   );
 
@@ -563,6 +713,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         "Director-only: cancel/requeue/assign/answer/approve a task. Epoch-fenced. Requires the director bearer token.",
       inputSchema: {
         member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
         epoch: z.number().int(),
         task_id: z.string().min(1),
         action: DIRECT_ACTION,
@@ -573,7 +724,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     async (args) => {
       const denied = requireDirectorAuth();
       if (denied) return denied;
-      const resolved = resolveMember(store, args.member_id);
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
       if ("result" in resolved) return resolved.result;
       const { member } = resolved;
       const action = buildDirectTaskAction(args);
@@ -585,6 +736,42 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         if (err instanceof SupersededError) return supersededResult(err);
         return jsonResult({ status: "error", message: (err as Error).message }, true);
       }
+    },
+  );
+
+  server.registerTool(
+    "update_rules",
+    {
+      description:
+        "Director-only: set this show's rules (machine-enforced switches and/or advisory policy prose). Epoch-fenced. Bumps rules_version, is audited, and notifies the cast. Requires the director bearer token.",
+      inputSchema: {
+        member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
+        epoch: z.number().int(),
+        switches: RULES_SWITCHES,
+        policy: z.string().optional(),
+      },
+    },
+    async (args) => {
+      const denied = requireDirectorAuth();
+      if (denied) return denied;
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
+      if ("result" in resolved) return resolved.result;
+      const { member } = resolved;
+      try {
+        store.checkEpoch(member.show, member.id, args.epoch);
+      } catch (err) {
+        if (err instanceof SupersededError) return supersededResult(err);
+        throw err;
+      }
+      if (args.switches === undefined && args.policy === undefined) {
+        return jsonResult({ status: "error", message: "update_rules needs at least one of switches or policy" }, true);
+      }
+      const rules = store.updateShowRules(member.show, { switches: args.switches, policy: args.policy }, member.id);
+      // Notify the cast so workers re-read (existing send_message-to-all pattern); their next poll
+      // also carries the new version and full text via the rules-delivery cursor.
+      store.sendMessage(member.id, "all", `show rules updated to v${rules.version} by ${member.id}`);
+      return jsonResult({ status: "updated", rules, rules_trust: directorPolicyNotice() });
     },
   );
 
