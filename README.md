@@ -38,7 +38,9 @@ from inside the project repo you want coordinated:
 > the agent clients I use, and initialize this repo as a show. Ask me
 > before anything that costs money or edits config outside this repo.
 
-The agent deploys the server (one small always-on Fly machine, ~$3/mo),
+You bring a [Fly.io](https://fly.io) account (the agent will prompt you
+to `fly auth login` if needed; login and billing stay in your hands).
+The agent deploys the server (one small always-on machine, ~$3/mo),
 wires your clients, and scaffolds this repo. Prefer doing it by hand?
 [docs/SETUP.md](docs/SETUP.md) is the same runbook, human-readable.
 

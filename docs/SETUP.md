@@ -15,11 +15,15 @@ Agent ground rules:
 
 ## 0. Prerequisites
 
-Check, and help install/authenticate anything missing:
+**The user must bring a Fly.io account.** Signing up (fly.io, needs a
+payment method; the server costs ~$2-3/month) and authenticating are the
+human's job, in their browser. Agents: never create accounts, never
+enter credentials; if auth is missing, stop and ask the user to run
+`fly auth login` (or `fly auth signup`) themselves, then re-check.
 
 ```bash
 flyctl version || brew install flyctl     # or curl -L https://fly.io/install.sh | sh
-fly auth whoami || fly auth login         # interactive; hand to the user
+fly auth whoami                           # must print their account before you continue
 node --version                            # need 20+
 git --version
 ```
