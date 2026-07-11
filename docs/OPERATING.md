@@ -70,16 +70,24 @@ drives the same `/api` the callboard reads. Shows:
   kind (claude-local, cursor-cloud, ...), role badge, what it is working on
   right now (task title + status, not just an id), tasks done, joined/seen
   ages, and a small ↗ when the member reported a `session_url`.
-- **Task columns**: queued / in-flight / needs-input / done+failed. Queued
-  is ordered the way `await_work` claims (priority, then age), so the top
-  card is next in line unless it waits on `depends_on` or a pinned
-  assignee. Click a task to expand its journal. If
-  tasks are queued and no non-stale worker members are registered, a
-  banner asks you to open a worker session.
+- **Task columns** (each with a count): queued / needs input / failures.
+  Queued and needs-input show the full list; failures shows the latest 20.
+  Queued is ordered the way `await_work` claims (priority, then age), so
+  the top card is next in line unless it waits on `depends_on` or a pinned
+  assignee. Failures are what agents reported back (failed + rejected),
+  each with the agent's last journal entry and its original timestamp.
+  In-flight and done have no columns -- the members hero shows in-flight,
+  finished work just gets merged -- but their totals sit in the tasks
+  header. Click a task to expand its journal. If tasks are queued and no
+  non-stale worker members are registered, a banner asks you to open a
+  worker session.
+- **Escalations pulse amber in place** (there is no red banner): any
+  `input-required` task, plus messages addressed to `human` from the past
+  24h (latest 5; there's no ack mechanism, so recency is the bound),
+  render in the needs-input column. This is the thing you actually watch
+  for; older escalations survive in the activity feed.
 - **Activity** (collapsed by default): shared notes, task journal entries,
   and messages in one newest-first feed, last 50.
-- **Red escalation banner**: any `input-required` task, or any message
-  addressed to `human`. This is the thing you actually watch for.
 
 ## Showrunner rules
 

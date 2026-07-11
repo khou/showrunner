@@ -29,7 +29,6 @@
   const tokenInput = el("token-input");
   const tokenStatus = el("token-status");
   const lastPoll = el("last-poll");
-  const banner = el("banner");
 
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -150,9 +149,8 @@
   function render(board) {
     renderDirector(board && board.director);
     renderMembers(board);
-    renderTasks(board ? board.tasks : []);
+    renderTasks(board);
     renderActivity(board);
-    renderBanner(board && board.escalations);
     renderQueueBanner(board);
   }
 
@@ -268,39 +266,95 @@
       .join("");
   }
 
+  // Three columns of things worth reading here: what's waiting (queued), what's blocked on a
+  // human/director decision (needs input, plus messages addressed to `human`), and what agents
+  // reported back as failed/rejected. In-flight lives on the members hero (it IS what members
+  // are working on); completed work just gets merged, so neither earns a column -- both stay
+  // visible as totals in the tasks header.
   const COLUMN_OF = {
     queued: "queued",
-    assigned: "inflight",
-    working: "inflight",
     "input-required": "needsinput",
-    completed: "done",
-    failed: "done",
-    rejected: "done",
-    canceled: "done",
+    failed: "failures",
+    rejected: "failures",
   };
 
   // Per-column order. Queued mirrors await_work's claim order (priority DESC, age ASC) so the
   // top of the column is first in line -- modulo dependencies and pinned assignees, which
-  // claimNextTask also honors; needs-input floats the longest-blocked decision to the top.
+  // claimNextTask also honors; needs-input floats the longest-blocked decision to the top;
+  // failures put the freshest report first.
   const SORT_OF = {
     queued: (a, b) => b.priority - a.priority || a.createdAt - b.createdAt,
-    inflight: (a, b) => b.updatedAt - a.updatedAt,
     needsinput: (a, b) => a.updatedAt - b.updatedAt,
-    done: (a, b) => b.updatedAt - a.updatedAt,
+    failures: (a, b) => b.updatedAt - a.updatedAt,
   };
 
-  function renderTasks(tasks) {
-    const buckets = { queued: [], inflight: [], needsinput: [], done: [] };
-    for (const t of tasks) (buckets[COLUMN_OF[t.status]] || buckets.done).push(t);
+  const FAILURES_SHOWN = 20;
+  const HUMAN_MSG_TTL_MS = 24 * 60 * 60 * 1000;
+  const ATTENTION_PULSE_MS = 2000; // must match attention-pulse duration in callboard.css
+
+  // Every poll recreates the pulsing nodes, which would restart the animation at 0% and make
+  // the glow stutter; a wall-clock-phased negative delay lets the new node resume mid-cycle.
+  function pulsePhaseAttr() {
+    return ` style="animation-delay:-${Date.now() % ATTENTION_PULSE_MS}ms"`;
+  }
+
+  function setCount(key, n) {
+    const span = document.querySelector(`.count[data-count="${key}"]`);
+    if (span) span.textContent = n === null ? "" : `(${n})`;
+  }
+
+  function renderTasks(board) {
+    const totals = el("task-totals");
+    const tasks = (board && board.tasks) || [];
+    const buckets = { queued: [], needsinput: [], failures: [] };
+    for (const t of tasks) {
+      const col = COLUMN_OF[t.status];
+      if (col) buckets[col].push(t);
+    }
+
+    if (!state.show) {
+      for (const col of Object.keys(buckets)) {
+        document.querySelector(`.task-list[data-col="${col}"]`).innerHTML = `<li class="hint">no show selected</li>`;
+        setCount(col, null);
+      }
+      if (totals) totals.textContent = "";
+      return;
+    }
+
+    // In-flight and done have no column (members hero / merged away), so the header carries
+    // their totals; counts come from taskCounts, which covers every task ever, not just the
+    // bounded list in the payload.
+    const counts = (board && board.taskCounts) || {};
+    if (totals) {
+      const inFlight = (counts.assigned || 0) + (counts.working || 0);
+      const parts = [`${inFlight} in flight`, `${counts.completed || 0} done`];
+      if (counts.canceled) parts.push(`${counts.canceled} canceled`);
+      totals.textContent = parts.join(" · ");
+    }
 
     for (const [col, items] of Object.entries(buckets)) {
       const ul = document.querySelector(`.task-list[data-col="${col}"]`);
-      if (!state.show) {
-        ul.innerHTML = `<li class="hint">no show selected</li>`;
-        continue;
-      }
       items.sort(SORT_OF[col]);
-      ul.innerHTML = items.length ? items.map((t) => taskItemHtml(t, col)).join("") : `<li class="hint">empty</li>`;
+      let shown = items;
+      let overflow = "";
+      if (col === "failures" && items.length > FAILURES_SHOWN) {
+        shown = items.slice(0, FAILURES_SHOWN);
+        overflow = `<li class="hint">showing latest ${FAILURES_SHOWN} of ${items.length}</li>`;
+      }
+      let html = shown.map((t) => taskItemHtml(t, col)).join("") + overflow;
+      let count = items.length;
+      if (col === "needsinput" && board && board.escalations) {
+        // Messages addressed to `human` are escalations too; they live here so decisions
+        // waiting on you have exactly one home. There is no ack/read mechanism for the human,
+        // so bound by recency or a message would pulse amber forever.
+        const msgs = board.escalations.humanMessages
+          .filter((m) => Date.now() - m.createdAt < HUMAN_MSG_TTL_MS)
+          .slice(-5);
+        html += msgs.map(humanMessageHtml).join("");
+        count += msgs.length;
+      }
+      ul.innerHTML = html || `<li class="hint">empty</li>`;
+      setCount(col, count);
     }
 
     document.querySelectorAll(".task-item").forEach((node) => {
@@ -312,6 +366,21 @@
     });
   }
 
+  // A failed/rejected task's card carries what the agent reported back: the last journal
+  // entry, stamped with when it was originally written.
+  function failureReportHtml(t) {
+    const report = t.notes && t.notes.length ? t.notes[t.notes.length - 1] : null;
+    if (!report) return "";
+    return `<div class="failure-report">${escapeHtml(report.author)}: ${escapeHtml(report.body)} <span class="hint">(${relTime(report.createdAt)})</span></div>`;
+  }
+
+  function humanMessageHtml(m) {
+    return `<li class="msg-item attention"${pulsePhaseAttr()}>
+      <div class="hint"><span class="who">${escapeHtml(m.fromId)}</span> -&gt; human &middot; ${relTime(m.createdAt)}</div>
+      <div>${escapeHtml(m.body)}</div>
+    </li>`;
+  }
+
   function taskItemHtml(t, col) {
     const expanded = state.expanded.has(t.id);
     const notes = expanded && t.notes
@@ -319,17 +388,19 @@
           .map((n) => `<div>${escapeHtml(n.author)}: ${escapeHtml(n.body)} <span class="hint">(${relTime(n.createdAt)})</span></div>`)
           .join("")}</div>`
       : "";
-    // queued/needs-input columns are single-status; the mixed columns badge each task's status.
-    const statusBadge = col === "inflight" || col === "done"
+    // queued/needs-input are single-status columns; failures mixes failed + rejected.
+    const statusBadge = col === "failures"
       ? `<span class="badge status-${escapeHtml(t.status)}">${escapeHtml(t.status)}</span>`
       : "";
-    return `<li class="task-item" data-id="${escapeHtml(t.id)}">
+    const attention = col === "needsinput" ? " attention" : "";
+    return `<li class="task-item${attention}"${attention ? pulsePhaseAttr() : ""} data-id="${escapeHtml(t.id)}">
       <div class="task-row">
         <span class="task-title">${escapeHtml(t.title)}</span>
         ${statusBadge}
         <span class="badge">p${t.priority}</span>
       </div>
       <div class="hint">${escapeHtml(t.id)} &middot; ${t.assignee ? escapeHtml(t.assignee) : "unassigned"} &middot; attempt ${t.attempt} &middot; ${relTime(t.updatedAt)}</div>
+      ${col === "failures" && !expanded ? failureReportHtml(t) : ""}
       ${notes}
     </li>`;
   }
@@ -367,19 +438,6 @@
     list.innerHTML = top.length
       ? top.map((e) => `<li><span class="entry">${e.html}</span><span class="when">${relTime(e.at)}</span></li>`).join("")
       : `<li class="hint">no activity yet</li>`;
-  }
-
-  function renderBanner(escalations) {
-    if (!escalations || (escalations.inputRequired.length === 0 && escalations.humanMessages.length === 0)) {
-      banner.hidden = true;
-      return;
-    }
-    banner.hidden = false;
-    const items = [
-      ...escalations.inputRequired.map((t) => `input needed: ${escapeHtml(t.title)} (${escapeHtml(t.id)})`),
-      ...escalations.humanMessages.slice(-5).map((m) => `${escapeHtml(m.fromId)} -> human: ${escapeHtml(m.body)}`),
-    ];
-    banner.innerHTML = `<strong>needs attention</strong><ul>${items.map((i) => `<li>${i}</li>`).join("")}</ul>`;
   }
 
   // --- click-to-copy resume_hint (delegated: director/member rows are re-rendered every poll,

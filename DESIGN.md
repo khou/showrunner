@@ -111,7 +111,7 @@ notes_fts  ( FTS5 over body + tags, bm25-ranked )
   can cancel or reassign a whole thread at once (A2A borrow).
 - `to_id` of a message may be a member id, `director` (role-addressed —
   resolves at delivery time, so it survives director changes), `all`, or
-  `human` (lands on the callboard escalation banner).
+  `human` (lands in the callboard's needs-input column).
 
 ### Task state machine (A2A-derived)
 
@@ -128,7 +128,7 @@ queued ──▶ assigned ──▶ working ──▶ completed
   transaction; dependency-unblocked, priority DESC, age ASC; honors a pinned
   `assignee` if the director set one).
 - `input-required` is distinct from `failed` on purpose: it means "a decision
-  is needed", pings the director's poll, and lights the callboard red.
+  is needed", pings the director's poll, and pulses amber on the callboard.
 - Terminal statuses are idempotent by task id: a worker whose lease was
   reaped can still report `completed`; if the task was requeued but not yet
   re-claimed, the report wins and the task completes (attempt noted).
@@ -269,7 +269,7 @@ matter).
    ~10min heartbeat instead of only at its next `await_work`.
 4. `send_message({member_id, to, body, task_id?})` — to a member id,
    `director`, `all`, or `human`. Delivered via the recipient's next
-   `await_work`; `human` lands on the callboard banner.
+   `await_work`; `human` lands in the callboard's needs-input column.
 5. `get_board({member_id, verbose?})` — director card, member list with
    staleness, task counts by status, in-flight task titles, escalations.
    Summary by default (~300 tokens); `verbose` adds journals.
@@ -335,15 +335,23 @@ every 2s. No build step, no framework — one file, fetch + DOM.
   id, kind + role badges, the current task rendered by **title and status**
   (joined from the task list, not an opaque id), tasks done, joined/seen
   ages, ↗ when a session_url was reported.
-- Task columns: queued / in-flight (assigned+working) / needs-input /
-  done+failed. Queued is ordered the way `await_work` claims (priority DESC,
-  age ASC), so the top card is next in line, modulo unmet `depends_on` and
-  pinned assignees, which the claim also honors. Click a task → journal
-  + artifacts.
+- Task columns, each with a count: **queued** / **needs input** /
+  **failures**. Queued and needs-input grow to the full list; failures
+  shows the latest 20. Queued is ordered the way `await_work` claims
+  (priority DESC, age ASC), so the top card is next in line, modulo
+  unmet `depends_on` and pinned assignees, which the claim also honors.
+  Failures (failed + rejected, the statuses agents report back) carry the
+  agent's last journal entry with its original timestamp. In-flight has no
+  column (it is what the members hero shows) and completed work just gets
+  merged; both stay visible as totals in the tasks header. Click a task →
+  journal.
+- **Escalations pulse amber in place** (no banner): `input-required` tasks
+  and messages addressed to `human` (the latest 5 from the past 24h; there
+  is no ack mechanism, so recency is the bound) both render in the
+  needs-input column, so decisions waiting on the human have one home.
 - Activity (one demoted feed, collapsed by default): shared notes, task
-  journal entries, and messages interleaved newest-first, last 50.
-- **Red escalation banner**: `input-required` tasks and messages addressed to
-  `human`.
+  journal entries, and messages interleaved newest-first, last 50. The
+  audit trail; the page stays read-only.
 
 The callboard is deliberately a **window, not a control panel**: no task
 forms, no message box, no admin actions. The human steers by talking to
