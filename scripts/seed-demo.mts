@@ -25,6 +25,13 @@ store.updateTask(w3.id, done1.id, {
   status: 'completed', note: 'done, 14 files',
   artifacts: [{ kind: 'branch', name: 'show/' + done1.id + '-crafting-ui' }, { kind: 'text', text: 'Crafting bench pulls live inventory; drag-to-slot works; 6 new tests.' }],
 })
+// failed (agent-reported; claimed and failed by w1 before it picks up its working task)
+const fail1 = t('Upgrade physics dep to 2.x', 'Bump voxel-phys; see apps/server/package.json.', { filesHint: ['apps/server/**'] })
+store.claimNextTask(w1.id)
+store.updateTask(w1.id, fail1.id, {
+  status: 'failed',
+  note: 'npm install fails: voxel-phys 2.x peer-conflicts with voxelize 3.1; needs a call on pinning or forking.',
+})
 // working
 const wk1 = t('Chunk-save batching for world server', 'Persist dirty chunks in batches of 64; see server/src/persist.rs.', { filesHint: ['apps/server/src/persist/**'], priority: 4 })
 store.claimNextTask(w1.id)
@@ -38,7 +45,7 @@ store.saveNote(w1.id, {
 const wk2 = t('Day/night lighting pass', 'Interpolate ambient light by world clock; docs/lighting.md has curves.', { filesHint: ['apps/web/src/render/**'] })
 store.claimNextTask(w2.id)
 store.updateTask(w2.id, wk2.id, { status: 'working', note: 'dawn/dusk gradient landed, testing torch falloff' })
-// input-required (escalation banner)
+// input-required (pulses amber in the needs-input column)
 const blocked = t('Invite links expire after 24h', 'Gateway change; see apps/gateway/src/invites.ts.', { filesHint: ['apps/gateway/**'], priority: 2 })
 store.claimNextTask(w3.id)
 store.updateTask(w3.id, blocked.id, { status: 'input-required', note: 'Should expired links show a renew flow or a plain 410?' })

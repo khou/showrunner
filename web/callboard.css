@@ -61,19 +61,12 @@ button:hover { border-color: var(--accent); }
 
 .hint { color: var(--dim); font-size: 11px; }
 
-.banner {
-  background: color-mix(in srgb, var(--red) 18%, var(--bg));
-  border-bottom: 1px solid var(--red);
-  color: var(--red);
-  padding: 8px 16px;
-  font-size: 12px;
-}
-.banner ul { margin: 4px 0 0; padding-left: 18px; }
-
 .queue-banner {
   background: color-mix(in srgb, var(--amber) 16%, var(--bg));
   border-bottom: 1px solid var(--amber);
   color: var(--amber);
+  padding: 8px 16px;
+  font-size: 12px;
 }
 .queue-banner code {
   color: var(--text);
@@ -118,13 +111,13 @@ main[hidden] { display: none; }
 /* pin the hero to the wide track so it survives markup reordering */
 .card.hero { grid-column: 2; }
 
-#members-list, #activity-list, .task-list, .banner ul {
+#members-list, #activity-list, .task-list {
   list-style: none;
   margin: 0;
   padding: 0;
-  max-height: 320px;
-  overflow-y: auto;
 }
+/* members and activity stay capped scrollers; task columns grow to show the full list */
+#members-list, #activity-list { max-height: 320px; overflow-y: auto; }
 #members-list { max-height: 400px; }
 
 .task-list li {
@@ -178,9 +171,13 @@ main[hidden] { display: none; }
 .badge.status-assigned { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 45%, var(--border)); }
 .badge.status-failed, .badge.status-rejected { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, var(--border)); }
 
+.tasks-header { display: flex; align-items: baseline; gap: 10px; }
+.tasks-header #task-totals { margin-left: auto; }
+h3 .count { color: var(--dim); font-weight: 400; }
+
 #task-columns {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 10px;
 }
 
@@ -193,8 +190,30 @@ main[hidden] { display: none; }
 /* flex: 1 + min-width: 0 lets the nowrap title shrink and ellipsize; without min-width the row
    overflows the column and long titles clip instead of truncating. */
 .task-item .task-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.task-item .task-notes { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); font-size: 11px; color: var(--dim); }
+/* overflow-wrap: agent-authored bodies (journal notes, failure reports, human messages) can
+   carry long unbroken URLs/paths; without it they paint across the neighboring column. */
+.task-item .task-notes { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); font-size: 11px; color: var(--dim); overflow-wrap: anywhere; }
 .task-item .task-notes div { margin-bottom: 3px; }
+.task-item .failure-report { margin-top: 4px; font-size: 11px; color: var(--dim); border-left: 2px solid color-mix(in srgb, var(--red) 45%, var(--border)); padding-left: 6px; overflow-wrap: anywhere; }
+
+/* Escalations pulse amber in place (replaces the old red top banner): needs-input tasks and
+   messages addressed to `human`. */
+.task-list li.attention {
+  border: 1px solid var(--amber);
+  border-radius: 4px;
+  padding: 6px;
+  margin: 4px 0;
+  animation: attention-pulse 2s ease-in-out infinite;
+}
+.task-list li.msg-item { flex-direction: column; align-items: stretch; min-width: 0; font-size: 12px; overflow-wrap: anywhere; }
+.task-list .msg-item .who { color: var(--accent); }
+@keyframes attention-pulse {
+  0%, 100% { border-color: var(--amber); box-shadow: 0 0 0 0 transparent; }
+  50% { border-color: color-mix(in srgb, var(--amber) 55%, var(--border)); box-shadow: 0 0 6px 0 color-mix(in srgb, var(--amber) 35%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .task-list li.attention { animation: none; }
+}
 
 /* Demoted paper trail: collapsed by default, one line when closed. */
 details.card summary {
@@ -243,5 +262,8 @@ details.card[open] summary { margin-bottom: 8px; }
 @media (max-width: 820px) {
   main { grid-template-columns: 1fr; }
   .card.hero { grid-column: auto; }
-  #task-columns { grid-template-columns: 1fr 1fr; }
+  #task-columns { grid-template-columns: 1fr; }
+  /* single-column stacking: escalations first, or a long queued list (uncapped) buries the
+     pulsing cards below the fold. nth-child(2) = the needs-input column (source order). */
+  #task-columns .column:nth-child(2) { order: -1; }
 }

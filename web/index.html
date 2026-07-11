@@ -25,8 +25,7 @@
     <p class="hint">Without a token this page cannot list shows — that is expected, not an empty project.</p>
   </div>
 
-  <div id="banner" class="banner" hidden></div>
-  <div id="queue-banner" class="banner queue-banner" hidden></div>
+  <div id="queue-banner" class="queue-banner" hidden></div>
 
   <main id="board-main">
     <section id="director-card" class="card">
@@ -40,23 +39,22 @@
     </section>
 
     <section id="tasks-card" class="card wide">
-      <h2>tasks</h2>
+      <div class="tasks-header">
+        <h2>tasks</h2>
+        <span id="task-totals" class="hint"></span>
+      </div>
       <div id="task-columns">
         <div class="column">
-          <h3>queued</h3>
+          <h3>queued <span class="count" data-count="queued"></span></h3>
           <ul class="task-list" data-col="queued"></ul>
         </div>
         <div class="column">
-          <h3>in-flight</h3>
-          <ul class="task-list" data-col="inflight"></ul>
-        </div>
-        <div class="column">
-          <h3>needs input</h3>
+          <h3>needs input <span class="count" data-count="needsinput"></span></h3>
           <ul class="task-list" data-col="needsinput"></ul>
         </div>
         <div class="column">
-          <h3>done / failed</h3>
-          <ul class="task-list" data-col="done"></ul>
+          <h3>failures <span class="count" data-count="failures"></span></h3>
+          <ul class="task-list" data-col="failures"></ul>
         </div>
       </div>
     </section>
