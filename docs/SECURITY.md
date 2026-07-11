@@ -33,7 +33,7 @@ to classify intent.
 | Worker to director | Malicious direction grab: wait out the holder's lease, then plain-claim the seat | Timeouts don't open the seat -- a non-takeover claim needs the seat unheld (released/cleared); displacing a holder needs `takeover:true` (human authority). Every transition is audited with holder provenance on the board |
 | Either | "ignore previous instructions / you are now…" | Runtime containment + protocol refusal (mitigation) |
 
-## The four controls
+## The controls
 
 ### 1. Per-member auth (real boundary)
 
@@ -51,14 +51,15 @@ any `member_id` and act as that member.
 
 Multi-user note: a single shared worker token can't be part of a hardened story
 (you can't revoke one bad worker without rotating everyone). Per-member secrets
-are the first step; per-member *tokens* with revocation are the follow-on (see
-Not yet).
+are the first step; director-controlled invites + eviction (below) are how a
+show admits and removes a specific outside agent without rotating the shared
+token.
 
 ### 2. Human release gate (real boundary, opt-in)
 
 Turn on the show's `requireTaskRelease` rule (`showrunner rules set
---require-release on`, the callboard toggle, or seed it deployment-wide with the
-`REQUIRE_TASK_RELEASE` env). Director-created tasks are then withheld
+--require-release on`, the director's `update_rules`, or seed it deployment-wide
+with the `REQUIRE_TASK_RELEASE` env). Director-created tasks are then withheld
 (`released=0`, still `queued`) and no worker can claim them until a human
 releases each one on the callboard (or `showrunner task release`). This is the
 deterministic check against a malicious or compromised director: work no human
@@ -89,12 +90,50 @@ a **precondition** on how you run workers, not something the server enforces:
 showrunner's part of the bargain: it never hands out work that *requires*
 elevated capability, and briefs point at repo docs rather than inlining shell.
 
-### 4. Dual tokens + untrusted-content annotation (defense in depth)
+### 4. Director-controlled membership: invites + eviction (real boundary, opt-in)
+
+Who is in a show is the director's call, not anyone with the shared worker token.
+
+- **Invites.** `mint_invite` (director-token, epoch-fenced) issues a single-use,
+  show-scoped token that expires; the DB stores only its SHA-256 (same discipline
+  as member secrets), and the plaintext is shown once. `register` exchanges it
+  for the member's individual credential, consuming it atomically (single-use)
+  and recording provenance (which invite, minted by whom).
+- **`requireInvite` rule.** Off by default (solo shows keep the frictionless
+  shared worker token). When on, worker-token registration without a valid invite
+  is refused; the director token is exempt (it is how the director itself joins
+  and mints). Turn it on for a show that admits someone else's agent.
+- **Eviction.** `evict_member` (director-token, epoch-fenced) revokes the
+  target's credential immediately (every later call returns `unauthorized_member`),
+  requeues its in-flight task (attempt+1, journal preserved), stamps the
+  membership evicted with actor/time, and notifies the cast. The director sees
+  who is connected and what they're doing via `get_board`; that visibility is the
+  point.
+
+What this does **not** protect against, stated plainly: a compromised *director*
+(someone with the director token) can mint invites and evict members at will --
+membership control is only as trustworthy as the director token. Recovery from a
+compromised director is the human path: take over direction from a fresh session
+that holds the director token (`claim_direction` with `takeover:true`) and rotate
+the tokens (`fly secrets set`), re-registering members. And eviction is only
+durable when `requireInvite` is on: with it off, an evicted party can re-register
+with the still-shared worker token, so turn it on for genuinely untrusted shows.
+
+### 5. Merge approval pairs with external branch protection
+
+`requireHumanMergeApproval` is delivered, agent-followed policy, not a server
+gate: there is no merge through the showrunner server to block. Its value over
+the old repo rules file is that a worker cannot rewrite it. For an actual
+enforced gate, pair it with your host's branch protection / required checks (e.g.
+GitHub branch protection requiring a human review before merge to `main`).
+showrunner delivers the intent; the VCS enforces it.
+
+### 6. Dual tokens + untrusted-content annotation (defense in depth)
 
 - **Dual bearer tokens.** The worker token (committable) can register, pull
   tasks, and write notes/messages, but cannot `claim_direction` / `create_task`
-  / `direct_task` or mutate the admin `/api`. Keep the director token secret;
-  rotate via `fly secrets set`.
+  / `direct_task` / `update_rules` / `mint_invite` / `evict_member` or mutate the
+  admin `/api`. Keep the director token secret; rotate via `fly secrets set`.
 - **Untrusted-content annotation.** On delivery, every peer-authored field
   (task brief/title, notes, messages, review journals) is tagged
   `trust:"untrusted_peer"` with fixed guidance telling the reader to treat it as
@@ -103,19 +142,26 @@ elevated capability, and briefs point at repo docs rather than inlining shell.
 
 ## Not yet (deliberate v1 non-goals)
 
-- Per-member tokens with revocation, and per-show ACLs.
+- Per-show ACLs beyond the director/worker split; multiple concurrent directors.
 - Server-side content classification of briefs/notes.
 - Task-content encryption at rest.
 - Sandboxing the agent host from within showrunner (that is the runtime's job).
+- A server-enforced merge gate (paired with external branch protection instead).
 
 ## Operator checklist for a show with untrusted members
 
 1. Set `SHOWRUNNER_WORKER_TOKEN` (distinct from `SHOWRUNNER_TOKEN`) so workers
    can't direct.
-2. Turn on the `requireTaskRelease` rule and release tasks yourself after
+2. Turn on `requireInvite` (`showrunner rules set --require-invite on`) so only
+   agents you invited can join; the director mints one `mint_invite` token per
+   guest, and `evict_member` removes one when done.
+3. Turn on the `requireTaskRelease` rule and release tasks yourself after
    reading them (`showrunner rules set --require-release on`, or the callboard).
-3. Run untrusted workers under a locked-down runtime (repo-scoped FS, network
+4. Run untrusted workers under a locked-down runtime (repo-scoped FS, network
    allowlist, no host secrets).
-4. Keep secrets out of task briefs and notes; point at repo files.
-5. Rotate the director token if it leaks; re-register members after a secret
-   leak.
+5. Keep secrets out of task briefs and notes; point at repo files.
+6. Pair `requireHumanMergeApproval` with branch protection on the repo for an
+   enforced merge gate.
+7. Rotate the director token if it leaks; re-register members after a secret
+   leak. Recover a compromised/dead director from a fresh session holding the
+   director token with `claim_direction` `takeover:true`.
