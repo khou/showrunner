@@ -121,7 +121,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   artifacts_json TEXT NOT NULL DEFAULT '[]',
   released INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  status_changed_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS tasks_show_status_idx ON tasks(show, status);
 
@@ -332,6 +333,9 @@ interface TaskRow {
   released: number;
   created_at: number;
   updated_at: number;
+  // When the status last transitioned. The escalation clock (claimNextTask parkedPastWait)
+  // keys on this, NOT updated_at, so note-only heartbeats/handoff notes don't reset it.
+  status_changed_at: number | null;
 }
 
 interface MessageRow {
@@ -483,6 +487,7 @@ export class Store {
     this.migrateMemberSessionColumns();
     this.migrateMemberSecretColumn();
     this.migrateTaskReleasedColumn();
+    this.migrateTaskStatusChangedAtColumn();
     this.migrateMemberRulesSeenColumn();
     this.migrateMemberInviteEvictionColumns();
     this.now = now;
@@ -541,6 +546,16 @@ export class Store {
     const cols = this.db.pragma("table_info(tasks)") as { name: string }[];
     if (!cols.some((c) => c.name === "released")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN released INTEGER NOT NULL DEFAULT 1");
+    }
+  }
+
+  /** Guarded upgrade-in-place: tasks predates the status-transition stamp. Backfill from
+   * updated_at (close enough for in-flight escalation clocks at upgrade time). */
+  private migrateTaskStatusChangedAtColumn(): void {
+    const cols = this.db.pragma("table_info(tasks)") as { name: string }[];
+    if (!cols.some((c) => c.name === "status_changed_at")) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN status_changed_at INTEGER");
+      this.db.exec("UPDATE tasks SET status_changed_at = updated_at WHERE status_changed_at IS NULL");
     }
   }
 
@@ -787,32 +802,42 @@ export class Store {
    * the evicted party can rejoin is governed by the requireInvite rule (off -> they can re-register
    * with the shared worker token; on -> they need a fresh invite the director controls).
    */
-  evictMember(show: string, targetId: string, actor: string): { member: Member; requeuedTaskId: string | null } | undefined {
+  evictMember(
+    show: string,
+    targetId: string,
+    actor: string,
+  ): { member: Member; requeuedTaskId: string | null; requeuedTaskIds: string[] } | undefined {
     return this.txn(() => {
       const row = this.getMemberRowRaw(targetId);
       if (!row || row.show !== show) return undefined;
-      if (row.evicted_at !== null) return { member: mapMember(row), requeuedTaskId: null }; // already evicted
+      if (row.evicted_at !== null) return { member: mapMember(row), requeuedTaskId: null, requeuedTaskIds: [] }; // already evicted
 
       const at = this.now();
-      let requeuedTaskId: string | null = null;
-      if (row.current_task_id) {
-        const task = this.getTaskRowRaw(row.current_task_id);
-        if (task && !TERMINAL_STATUSES.has(task.status as TaskStatus) && task.assignee === targetId) {
-          this.db
-            .prepare("UPDATE tasks SET status = 'queued', assignee = NULL, lease_expires_at = NULL, attempt = attempt + 1, updated_at = ? WHERE id = ?")
-            .run(at, task.id);
-          this.insertNote(task.id, "system", `requeued: ${targetId} evicted by ${actor} (attempt ${task.attempt + 1})`, at);
-          requeuedTaskId = task.id;
-        }
+      // Requeue EVERY live task the member holds, not just its current one: escalation parking
+      // makes multi-task ownership normal (a parked input-required task plus current work), and
+      // an evicted member can never act on any of them again.
+      const held = this.db
+        .prepare("SELECT * FROM tasks WHERE assignee = ? AND status IN ('assigned', 'working', 'input-required')")
+        .all(targetId) as TaskRow[];
+      const requeuedTaskIds: string[] = [];
+      for (const task of held) {
+        this.db
+          .prepare(
+            "UPDATE tasks SET status = 'queued', assignee = NULL, lease_expires_at = NULL, attempt = attempt + 1, updated_at = ?, status_changed_at = ? WHERE id = ?",
+          )
+          .run(at, at, task.id);
+        this.insertNote(task.id, "system", `requeued: ${targetId} evicted by ${actor} (attempt ${task.attempt + 1})`, at);
+        requeuedTaskIds.push(task.id);
       }
+      const requeuedTaskId = row.current_task_id && requeuedTaskIds.includes(row.current_task_id) ? row.current_task_id : requeuedTaskIds[0] ?? null;
 
       // Revoke the credential and demote; clear current task; stamp the eviction.
       this.db
         .prepare("UPDATE members SET secret_hash = NULL, role = 'worker', current_task_id = NULL, evicted_at = ?, evicted_by = ? WHERE id = ?")
         .run(at, actor, targetId);
       this.events.emit(`wake:show:${show}`);
-      if (requeuedTaskId) this.events.emit(`wake:${targetId}`); // in case it's parked, so it re-polls and learns it's out
-      return { member: mapMember(this.getMemberRowRaw(targetId)!), requeuedTaskId };
+      if (requeuedTaskIds.length > 0) this.events.emit(`wake:${targetId}`); // in case it's parked, so it re-polls and learns it's out
+      return { member: mapMember(this.getMemberRowRaw(targetId)!), requeuedTaskId, requeuedTaskIds };
     });
   }
 
@@ -1232,8 +1257,8 @@ export class Store {
         .prepare(
           `INSERT INTO tasks
              (id, show, context_id, title, brief, files_hint_json, depends_on_json, priority,
-              status, assignee, attempt, created_by, lease_expires_at, artifacts_json, released, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, NULL, '[]', ?, ?, ?)`,
+              status, assignee, attempt, created_by, lease_expires_at, artifacts_json, released, created_at, updated_at, status_changed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, NULL, '[]', ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -1247,6 +1272,7 @@ export class Store {
           input.assignee ?? null,
           input.createdBy,
           released,
+          at,
           at,
           at,
         );
@@ -1290,10 +1316,20 @@ export class Store {
     });
   }
 
+  /** Released, claimable queue depth for a show -- the `next.queued` pointer update_task
+   * returns after a terminal report, so a worker sees work remains before deciding to stop. */
+  queuedReleasedCount(show: string): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS n FROM tasks WHERE show = ? AND status = 'queued' AND released = 1")
+      .get(show) as { n: number };
+    return row.n;
+  }
+
   claimNextTask(memberId: string): Task | undefined {
     return this.txn(() => {
       const member = this.getMemberRowRaw(memberId);
       if (!member) return undefined;
+      const now = this.now();
 
       // Idempotent redelivery: if this member already holds a live task (its previous
       // await_work response may have been lost in transit, or it re-polled while still
@@ -1302,11 +1338,46 @@ export class Store {
       if (member.current_task_id) {
         const current = this.getTaskRowRaw(member.current_task_id);
         if (current && !TERMINAL_STATUSES.has(current.status as TaskStatus)) {
-          return mapTask(current);
+          // input-required: the member escalated and is waiting on the director. Keep
+          // redelivering the parked task while the escalation is fresh; once it has gone
+          // unanswered past escalationWaitS, fall through so the member can progress other
+          // queued work. The parked task stays assigned to this member -- the director's
+          // answer flips it back to working and re-adoption below returns it.
+          const parkedSince = current.status_changed_at ?? current.updated_at;
+          const parkedPastWait =
+            current.status === "input-required" && parkedSince + this.leases.escalationWaitS * 1000 < now;
+          if (!parkedPastWait) {
+            // Redelivery doubles as a lease renewal for live work: the owner is provably
+            // present (it just polled), so sweep's deferral logic can trust the lease. A
+            // parked input-required task is left untouched -- its clock is status_changed_at
+            // and its reaping is owner-liveness, not lease, based.
+            if (current.status === "assigned" || current.status === "working") {
+              this.db
+                .prepare("UPDATE tasks SET lease_expires_at = ? WHERE id = ?")
+                .run(now + this.leases.taskLeaseS * 1000, current.id);
+              return mapTask(this.getTaskRowRaw(current.id)!);
+            }
+            return mapTask(current);
+          }
         }
       }
 
-      const now = this.now();
+      // Re-adopt an answered escalation: a live task still assigned to this member that is
+      // not its current task (the director answered input-required -> working while the
+      // member was on other work). Resuming owned work beats claiming new work.
+      const readopt = this.db
+        .prepare(
+          "SELECT * FROM tasks WHERE assignee = ? AND status IN ('assigned', 'working') AND id != COALESCE(?, '') ORDER BY updated_at ASC LIMIT 1",
+        )
+        .get(memberId, member.current_task_id) as TaskRow | undefined;
+      if (readopt) {
+        this.db
+          .prepare("UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE id = ?")
+          .run(now + this.leases.taskLeaseS * 1000, now, readopt.id);
+        this.db.prepare("UPDATE members SET current_task_id = ? WHERE id = ?").run(readopt.id, memberId);
+        return mapTask(this.getTaskRowRaw(readopt.id)!);
+      }
+
       // released = 1 excludes tasks a human hasn't yet vetted under the REQUIRE_TASK_RELEASE gate.
       const candidates = this.db
         .prepare(
@@ -1328,8 +1399,8 @@ export class Store {
 
         const leaseExpiresAt = now + this.leases.taskLeaseS * 1000;
         this.db
-          .prepare("UPDATE tasks SET status = 'assigned', assignee = ?, lease_expires_at = ?, updated_at = ? WHERE id = ?")
-          .run(memberId, leaseExpiresAt, now, row.id);
+          .prepare("UPDATE tasks SET status = 'assigned', assignee = ?, lease_expires_at = ?, updated_at = ?, status_changed_at = ? WHERE id = ?")
+          .run(memberId, leaseExpiresAt, now, now, row.id);
         this.db.prepare("UPDATE members SET current_task_id = ? WHERE id = ?").run(row.id, memberId);
         this.insertNote(row.id, "system", `claimed by ${memberId}`, now);
         return mapTask(this.getTaskRowRaw(row.id)!);
@@ -1410,9 +1481,12 @@ export class Store {
         leaseExpiresAt = at + this.leases.taskLeaseS * 1000;
       }
 
+      const statusChangedAt = status !== row.status ? at : row.status_changed_at;
       this.db
-        .prepare("UPDATE tasks SET status = ?, assignee = ?, lease_expires_at = ?, artifacts_json = ?, updated_at = ? WHERE id = ?")
-        .run(status, assignee, leaseExpiresAt, JSON.stringify(artifacts), at, taskId);
+        .prepare(
+          "UPDATE tasks SET status = ?, assignee = ?, lease_expires_at = ?, artifacts_json = ?, updated_at = ?, status_changed_at = ? WHERE id = ?",
+        )
+        .run(status, assignee, leaseExpiresAt, JSON.stringify(artifacts), at, statusChangedAt, taskId);
 
       if (patch.status && patch.status !== row.status) {
         this.insertNote(taskId, memberId, `status: ${row.status} -> ${patch.status}`, at);
@@ -1423,7 +1497,10 @@ export class Store {
 
       if (TERMINAL_STATUSES.has(status)) {
         this.db.prepare("UPDATE members SET current_task_id = NULL WHERE current_task_id = ?").run(taskId);
-      } else if (assignee) {
+      } else if (assignee && patch.status) {
+        // Re-point the member only on an explicit status transition. A note-only update (e.g.
+        // the handoff note on a PARKED task before switching to fallback work) must not steal
+        // the current pointer from the task the member is actually on.
         this.db.prepare("UPDATE members SET current_task_id = ? WHERE id = ?").run(taskId, assignee);
       }
 
@@ -1448,7 +1525,9 @@ export class Store {
           if (TERMINAL_STATUSES.has(status)) {
             throw new Error(`task ${taskId} is already ${status}; cannot cancel a finished task`);
           }
-          this.db.prepare("UPDATE tasks SET status = 'canceled', lease_expires_at = NULL, updated_at = ? WHERE id = ?").run(at, taskId);
+          this.db
+            .prepare("UPDATE tasks SET status = 'canceled', lease_expires_at = NULL, updated_at = ?, status_changed_at = ? WHERE id = ?")
+            .run(at, at, taskId);
           if (row.assignee) {
             this.db.prepare("UPDATE members SET current_task_id = NULL WHERE id = ? AND current_task_id = ?").run(row.assignee, taskId);
             this.insertMessageRow(
@@ -1470,8 +1549,10 @@ export class Store {
             throw new Error(`task ${taskId} is already ${status}; cannot requeue a finished task`);
           }
           this.db
-            .prepare("UPDATE tasks SET status = 'queued', assignee = NULL, lease_expires_at = NULL, attempt = attempt + 1, updated_at = ? WHERE id = ?")
-            .run(at, taskId);
+            .prepare(
+              "UPDATE tasks SET status = 'queued', assignee = NULL, lease_expires_at = NULL, attempt = attempt + 1, updated_at = ?, status_changed_at = ? WHERE id = ?",
+            )
+            .run(at, at, taskId);
           if (row.assignee) {
             this.db.prepare("UPDATE members SET current_task_id = NULL WHERE id = ? AND current_task_id = ?").run(row.assignee, taskId);
           }
@@ -1485,8 +1566,8 @@ export class Store {
               this.db.prepare("UPDATE members SET current_task_id = NULL WHERE id = ? AND current_task_id = ?").run(row.assignee, taskId);
             }
             this.db
-              .prepare("UPDATE tasks SET assignee = ?, status = 'queued', lease_expires_at = NULL, updated_at = ? WHERE id = ?")
-              .run(action.assignee, at, taskId);
+              .prepare("UPDATE tasks SET assignee = ?, status = 'queued', lease_expires_at = NULL, updated_at = ?, status_changed_at = ? WHERE id = ?")
+              .run(action.assignee, at, at, taskId);
           } else {
             this.db.prepare("UPDATE tasks SET assignee = ?, updated_at = ? WHERE id = ?").run(action.assignee, at, taskId);
           }
@@ -1499,8 +1580,8 @@ export class Store {
             throw new Error(`task ${taskId} is not awaiting input (status: ${status}); answer is only valid for input-required tasks`);
           }
           this.db
-            .prepare("UPDATE tasks SET status = 'working', lease_expires_at = ?, updated_at = ? WHERE id = ?")
-            .run(at + this.leases.taskLeaseS * 1000, at, taskId);
+            .prepare("UPDATE tasks SET status = 'working', lease_expires_at = ?, updated_at = ?, status_changed_at = ? WHERE id = ?")
+            .run(at + this.leases.taskLeaseS * 1000, at, at, taskId);
           this.insertNote(taskId, memberId, `answer: ${action.body}`, at);
           if (row.assignee) {
             this.insertMessageRow(this.generateMessageId(), row.show, memberId, row.assignee, taskId, action.body, at);
@@ -1815,24 +1896,47 @@ export class Store {
         .prepare("SELECT id, show, status, assignee, attempt, lease_expires_at FROM tasks WHERE status IN ('assigned', 'working', 'input-required')")
         .all() as { id: string; show: string; status: string; assignee: string | null; attempt: number; lease_expires_at: number | null }[];
 
+      // Owners holding at least one live-leased in-flight task are alive even when their poll
+      // lease lapsed (heads-down on that task, touching nothing).
+      const liveLeaseByOwner = new Set<string>();
+      for (const t of active) {
+        if (
+          t.assignee !== null &&
+          (t.status === "assigned" || t.status === "working") &&
+          t.lease_expires_at !== null &&
+          t.lease_expires_at >= now
+        ) {
+          liveLeaseByOwner.add(t.assignee);
+        }
+      }
+
       for (const t of active) {
         const memberDead = t.assignee !== null && staleMemberIds.has(t.assignee);
         const taskLeaseExpired = t.lease_expires_at !== null && t.lease_expires_at < now;
 
-        // assigned/working: the worker lease (90s) is renewed only by a tool call, but the
-        // protocol has it heartbeat every ~10min while heads-down executing -- it may not
-        // touch any tool for long stretches well inside the 90s window. Using memberDead here
-        // would requeue (and duplicate) a task that's still being worked on perfectly fine; the
-        // task lease (15min, matched to the heartbeat cadence) is the sole liveness signal.
+        // Escalation parking made multi-task ownership normal: a member can hold a parked
+        // input-required task (or an answered-but-not-yet-resumed one) while heads-down on
+        // OTHER work. An owner is alive if its poll lease is fresh OR it holds any other
+        // live-leased in-flight task -- reaping an alive owner's parked/deferred task would
+        // strand the escalation answer and duplicate work.
+        const ownerAlive =
+          t.assignee !== null && (!staleMemberIds.has(t.assignee) || liveLeaseByOwner.has(t.assignee));
+
+        // assigned/working: the task lease (15min, matched to the heartbeat cadence) is the
+        // primary liveness signal, but a lease-expired task whose owner is demonstrably alive
+        // (polling -- redelivery renews; or heartbeating another live-leased task) is deferred,
+        // not reaped: claimNextTask re-adopts and renews it once the owner's current work wraps.
         // input-required: the worker is legitimately idle awaiting an answer, not required to
-        // heartbeat, so the task lease alone is exempted -- but a member that's gone fully
-        // stale (not even polling) still needs reaping.
-        const shouldRequeue = t.status === "input-required" ? memberDead : taskLeaseExpired;
+        // heartbeat, so the task lease alone is exempted -- reaped only when the owner is gone.
+        const shouldRequeue =
+          t.status === "input-required" ? memberDead && !ownerAlive : taskLeaseExpired && !ownerAlive;
 
         if (shouldRequeue) {
           this.db
-            .prepare("UPDATE tasks SET status = 'queued', assignee = NULL, lease_expires_at = NULL, attempt = attempt + 1, updated_at = ? WHERE id = ?")
-            .run(now, t.id);
+            .prepare(
+              "UPDATE tasks SET status = 'queued', assignee = NULL, lease_expires_at = NULL, attempt = attempt + 1, updated_at = ?, status_changed_at = ? WHERE id = ?",
+            )
+            .run(now, now, t.id);
           if (t.assignee) {
             this.db.prepare("UPDATE members SET current_task_id = NULL WHERE id = ? AND current_task_id = ?").run(t.assignee, t.id);
           }

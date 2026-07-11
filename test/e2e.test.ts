@@ -243,4 +243,66 @@ describe("showrunner e2e (real server, real MCP client, streamable HTTP)", () =>
     },
     8_000,
   );
+
+  it(
+    "serves the same tools over the /v1 HTTP mirror (worker loop, director gate, bootstrap)",
+    async () => {
+      const show = `rest-${Date.now() % 100000}`;
+      const post = async (tool: string, args: Record<string, unknown>, token: string = TOKEN) => {
+        const res = await fetch(`${baseUrl}/v1/${tool}`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify(args),
+        });
+        return { status: res.status, data: (await res.json()) as any };
+      };
+
+      const protocol = await fetch(`${baseUrl}/v1/protocol`, { headers: { Authorization: `Bearer ${WORKER_TOKEN}` } });
+      expect(protocol.status).toBe(200);
+      expect(await protocol.text()).toContain("showrunner coordinates");
+      expect((await fetch(`${baseUrl}/v1/protocol`)).status).toBe(401);
+
+      const regD = await post("register", { show, kind: "other", display_name: "rest director" });
+      expect(regD.status).toBe(200);
+      expect(regD.data.member_secret).toBeTruthy();
+      const claim = await post("claim_direction", {
+        member_id: regD.data.member_id, member_secret: regD.data.member_secret, takeover: true,
+      });
+      expect(claim.status).toBe(200);
+      const created = await post("create_task", {
+        member_id: regD.data.member_id, member_secret: regD.data.member_secret,
+        epoch: claim.data.epoch, title: "rest task", brief: "b",
+      });
+      expect(created.status).toBe(200);
+
+      const regW = await post("register", { show, kind: "other", display_name: "rest worker" }, WORKER_TOKEN);
+      expect(regW.status).toBe(200);
+      expect(regW.data.loop_contract.after_update_task).toBe("await_work");
+      const got = await post("await_work", {
+        member_id: regW.data.member_id, member_secret: regW.data.member_secret, wait_seconds: 1,
+      }, WORKER_TOKEN);
+      expect(got.data.status).toBe("task");
+      const done = await post("update_task", {
+        member_id: regW.data.member_id, member_secret: regW.data.member_secret,
+        task_id: got.data.task.id, status: "completed", note: "done via /v1",
+      }, WORKER_TOKEN);
+      expect(done.status).toBe(200);
+      // Terminal report must carry the required-next-call pointer with live queue depth.
+      expect(done.data.next.action).toBe("await_work");
+      expect(done.data.next.queued).toBe(0);
+      expect(done.data.next.hint).toContain("await_work");
+
+      const forbidden = await post("claim_direction", {
+        member_id: regW.data.member_id, member_secret: regW.data.member_secret, takeover: true,
+      }, WORKER_TOKEN);
+      expect(forbidden.status).toBe(400);
+      expect(forbidden.data.status).toBe("forbidden");
+
+      const invalid = await post("update_task", { member_id: regW.data.member_id }, WORKER_TOKEN);
+      expect(invalid.status).toBe(400);
+      const unknown = await post("no_such_tool", {}, WORKER_TOKEN);
+      expect(unknown.status).toBe(404);
+    },
+    15_000,
+  );
 });

@@ -1450,3 +1450,130 @@ describe("eviction", () => {
     expect(store.evictMember("myshow", "nobody", director.id)).toBeUndefined();
   });
 });
+
+describe("escalation parking (input-required)", () => {
+  it("redelivers a fresh escalation, then offers other queued work after escalationWaitS", () => {
+    const { store, clock } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const a = store.createTask({ show: "myshow", title: "A", brief: "b", createdBy: director.id }).task;
+    const b = store.createTask({ show: "myshow", title: "B", brief: "b", createdBy: director.id }).task;
+    expect(store.claimNextTask(worker.id)!.id).toBe(a.id);
+    store.updateTask(worker.id, a.id, { status: "input-required", note: "renew flow or 410?" });
+
+    // Fresh escalation: the parked task keeps coming back, not task B.
+    expect(store.claimNextTask(worker.id)!.id).toBe(a.id);
+
+    clock.t += 900_001; // past default ESCALATION_WAIT_S
+    expect(store.claimNextTask(worker.id)!.id).toBe(b.id);
+    // The parked task stays assigned to the escalating worker, still input-required.
+    const parked = store.getBoard("myshow").tasks.find((t) => t.id === a.id)!;
+    expect(parked.status).toBe("input-required");
+    expect(parked.assignee).toBe(worker.id);
+  });
+
+  it("re-adopts an answered escalation after current work finishes", () => {
+    const { store, clock } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const claimed = store.claimDirection(director.id, true);
+    if (!claimed.ok) throw new Error("claim_direction failed");
+    const a = store.createTask({ show: "myshow", title: "A", brief: "b", createdBy: director.id }).task;
+    const b = store.createTask({ show: "myshow", title: "B", brief: "b", createdBy: director.id }).task;
+    expect(store.claimNextTask(worker.id)!.id).toBe(a.id);
+    store.updateTask(worker.id, a.id, { status: "input-required", note: "blocked on design" });
+    clock.t += 900_001;
+    expect(store.claimNextTask(worker.id)!.id).toBe(b.id);
+
+    store.directTask(director.id, claimed.epoch, a.id, { type: "answer", body: "go left" });
+    // Mid-task polls keep redelivering the current task; the answered one waits its turn.
+    expect(store.claimNextTask(worker.id)!.id).toBe(b.id);
+
+    store.updateTask(worker.id, b.id, { status: "completed" });
+    const resumed = store.claimNextTask(worker.id)!;
+    expect(resumed.id).toBe(a.id);
+    expect(resumed.status).toBe("working");
+  });
+
+  it("a handoff note on the parked task neither resets the escalation clock nor steals the current pointer", () => {
+    const { store, clock } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const a = store.createTask({ show: "myshow", title: "A", brief: "b", createdBy: director.id }).task;
+    const b = store.createTask({ show: "myshow", title: "B", brief: "b", createdBy: director.id }).task;
+    expect(store.claimNextTask(worker.id)!.id).toBe(a.id);
+    store.updateTask(worker.id, a.id, { status: "input-required", note: "blocked" });
+
+    clock.t += 600_000; // 10 min parked
+    store.updateTask(worker.id, a.id, { note: "handoff: draft PR up, state in body" });
+    clock.t += 300_001; // 15min+ since PARKING; the note must not have reset the clock
+    expect(store.claimNextTask(worker.id)!.id).toBe(b.id);
+
+    // A further note on parked A while B is current must not steal the pointer back.
+    store.updateTask(worker.id, a.id, { note: "more handoff detail" });
+    expect(store.claimNextTask(worker.id)!.id).toBe(b.id);
+  });
+
+  it("sweep leaves a parked task alone while its owner is alive on fallback work", () => {
+    const { store, clock } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const a = store.createTask({ show: "myshow", title: "A", brief: "b", createdBy: director.id }).task;
+    store.createTask({ show: "myshow", title: "B", brief: "b", createdBy: director.id });
+    expect(store.claimNextTask(worker.id)!.id).toBe(a.id);
+    store.updateTask(worker.id, a.id, { status: "input-required", note: "blocked" });
+
+    clock.t += 900_001; // poll lease long dead; escalation aged out
+    const fallback = store.claimNextTask(worker.id)!; // heads-down on B (live task lease)
+    expect(fallback.id).not.toBe(a.id);
+
+    const swept = store.sweep();
+    expect(swept.requeuedTasks).toEqual([]);
+    const parked = store.getBoard("myshow").tasks.find((t) => t.id === a.id)!;
+    expect(parked.status).toBe("input-required");
+    expect(parked.assignee).toBe(worker.id);
+  });
+
+  it("defers reaping an answered escalation while its owner heartbeats other work, requeues once the owner dies", () => {
+    const { store, clock } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const claimed = store.claimDirection(director.id, true);
+    if (!claimed.ok) throw new Error("claim_direction failed");
+    const a = store.createTask({ show: "myshow", title: "A", brief: "b", createdBy: director.id }).task;
+    const b = store.createTask({ show: "myshow", title: "B", brief: "b", createdBy: director.id }).task;
+    expect(store.claimNextTask(worker.id)!.id).toBe(a.id);
+    store.updateTask(worker.id, a.id, { status: "input-required", note: "blocked" });
+    clock.t += 900_001;
+    expect(store.claimNextTask(worker.id)!.id).toBe(b.id);
+    store.directTask(director.id, claimed.epoch, a.id, { type: "answer", body: "answered" });
+
+    clock.t += 899_000; // just inside A's post-answer lease; renew B
+    store.updateTask(worker.id, b.id, { status: "working", note: "heartbeat" });
+    clock.t += 2_000; // A's lease expired, but the owner is provably alive via B
+    expect(store.sweep().requeuedTasks).toEqual([]);
+
+    clock.t += 900_001; // owner dies mid-B: both leases run out; both requeue
+    expect(store.sweep().requeuedTasks.sort()).toEqual([a.id, b.id].sort());
+  });
+
+  it("evicting a member requeues its parked task too, not just its current one", () => {
+    const { store, clock } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const a = store.createTask({ show: "myshow", title: "A", brief: "b", createdBy: director.id }).task;
+    const b = store.createTask({ show: "myshow", title: "B", brief: "b", createdBy: director.id }).task;
+    expect(store.claimNextTask(worker.id)!.id).toBe(a.id);
+    store.updateTask(worker.id, a.id, { status: "input-required", note: "blocked" });
+    clock.t += 900_001;
+    expect(store.claimNextTask(worker.id)!.id).toBe(b.id);
+
+    const evicted = store.evictMember("myshow", worker.id, director.id)!;
+    expect([...evicted.requeuedTaskIds].sort()).toEqual([a.id, b.id].sort());
+    for (const id of [a.id, b.id]) {
+      const t = store.getBoard("myshow").tasks.find((x) => x.id === id)!;
+      expect(t.status).toBe("queued");
+      expect(t.assignee).toBeNull();
+    }
+  });
+});

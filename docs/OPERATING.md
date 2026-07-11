@@ -11,7 +11,7 @@ for why it's built this way.
 |---|---|---|
 | Claude Code local/cloud | committed `.mcp.json` from `init`: hardcoded worker Bearer on `showrunner`; `${SHOWRUNNER_TOKEN}` on `showrunner-director` | workers need no env; director sessions set director token + allowlist host |
 | Cursor local | `.cursor/mcp.json` same split (`${env:SHOWRUNNER_TOKEN}` for director) | 3.0+; allowlist/auto-run tools or poll stalls |
-| Cursor cloud | paste URL + hardcoded **worker** token in cursor.com/agents dashboard | best-effort as of 3.8; director needs director token separately |
+| Cursor cloud | Cloud Agents do **not** load repo `.mcp.json`/`.cursor/mcp.json`: add the showrunner HTTP MCP (URL + **worker** token) in the Cursor Cloud Agents / Integrations dashboard so `await_work` is a native tool | best-effort as of 3.8; shell-capable sessions can drive the `/v1` HTTP mirror with curl instead |
 
 Committed dual-token shape (see [examples/](../examples/)):
 
@@ -33,6 +33,27 @@ Committed dual-token shape (see [examples/](../examples/)):
 ```
 
 Or run `node dist/cli/index.js snippets --url <your-url> --worker-token <worker>` after build.
+
+## The /v1 HTTP mirror
+
+Every MCP tool is also plain HTTPS, for clients whose MCP plumbing is broken
+or absent (Cursor cloud ignores repo MCP configs as of 3.8) and for scripts:
+
+```bash
+curl -s -X POST https://<your-app>.fly.dev/v1/register \
+  -H "Authorization: Bearer <WORKER_TOKEN>" -H "Content-Type: application/json" \
+  -d '{"show":"myshow","kind":"other","display_name":"curl worker"}'
+curl -s --max-time 75 -X POST https://<your-app>.fly.dev/v1/await_work \
+  -H "Authorization: Bearer <WORKER_TOKEN>" -H "Content-Type: application/json" \
+  -d '{"member_id":"<id>","member_secret":"<secret>"}'
+```
+
+Same JSON arguments, same bearer split (director-only tools return
+`{status:"forbidden"}` on the worker bearer), same handlers server-side --
+the mirror is generated from the MCP tool definitions, so the two surfaces
+cannot drift. `GET /v1/protocol` returns the protocol text for sessions that
+need to bootstrap without MCP; `GET /v1/tools` lists the tools. `await_work`
+holds up to `POLL_HOLD_SECONDS`, so give your HTTP client a >60s timeout.
 
 ## Direction and takeover
 
@@ -177,6 +198,12 @@ eviction-decision surface. Eviction is durable only with `requireInvite` on.
   walls with ~10s margin) and the worker re-polls immediately after.
 - Polls return unread-only messages and pointer-style task briefs, not
   inlined specs, to keep the coordination overhead in tokens small.
+- A terminal `update_task` (completed/failed/rejected) returns
+  `next: {action: "await_work", queued, hint}` -- the required next call plus
+  live queue depth, aimed at clients that treat "task done, summarize" as
+  end-of-turn. `register` returns the same rule as a machine-readable
+  `loop_contract` (stop conditions: eviction or an explicit human stop;
+  finishing a task is never one).
 - `register({show, kind, display_name?, session_url?, resume_hint?})` --
   `session_url`/`resume_hint` are how a human opens this session's chat; only
   the session itself knows which, so it self-reports (a `session_url` must
@@ -233,6 +260,7 @@ decisions (especially answers to `input-required`) as notes.
 | `POLL_HOLD_SECONDS` | `50` | Max long-poll hold for `await_work`. |
 | `WORKER_LEASE_S` | `150` | Member liveness lease; renewed by any tool call. |
 | `TASK_LEASE_S` | `900` | Task ownership lease; renewed by `update_task`. |
+| `ESCALATION_WAIT_S` | `900` | How long an unanswered `input-required` escalation keeps its task redelivered to the escalating worker before polls start offering it other queued work (the task stays parked and assigned; the director's answer hands it back). |
 | `DIRECTION_LEASE_S` | `600` | Director lease; renewed by any director tool call. |
 | `SWEEP_INTERVAL_S` | `5` | How often the reclaim sweep runs. |
 | `NOTE_MAX_CHARS` | `2000` | Max shared-note body length. |

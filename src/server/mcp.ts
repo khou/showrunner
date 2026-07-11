@@ -383,13 +383,44 @@ function similarShowNames(a: string, b: string): boolean {
   return stripCheckoutSuffix(a) === stripCheckoutSuffix(b);
 }
 
+/** One tool's config exactly as registered on the MCP server. */
+interface ToolConfig {
+  description: string;
+  inputSchema: Record<string, z.ZodType>;
+}
+type ToolHandler = (args: any) => Promise<CallToolResult> | CallToolResult;
+type RegisterToolFn = (name: string, cfg: ToolConfig, handler: ToolHandler) => void;
+
+export interface ToolSpec {
+  name: string;
+  config: ToolConfig;
+  handler: ToolHandler;
+}
+
+/**
+ * Every tool, exactly as the MCP server registers them. The /v1 HTTP mirror (rest.ts) serves
+ * these same definitions, so the two surfaces share schemas, auth glue, and handlers and
+ * cannot drift.
+ */
+export function defineTools(store: Store, config: McpServerConfig): ToolSpec[] {
+  const tools: ToolSpec[] = [];
+  registerTools(store, config, (name, cfg, handler) => tools.push({ name, config: cfg, handler }));
+  return tools;
+}
+
 export function createMcpServer(store: Store, config: McpServerConfig): McpServer {
   const server = new McpServer({ name: "showrunner", version: "0.1.0" }, { instructions: INSTRUCTIONS });
+  registerTools(store, config, (name, cfg, handler) => server.registerTool(name, cfg, handler));
+  registerJoinPrompt(server);
+  return server;
+}
+
+function registerTools(store: Store, config: McpServerConfig, reg: RegisterToolFn): void {
   const authLevel: AuthLevel = config.authLevel ?? "director";
   const requireDirectorAuth = (): CallToolResult | null =>
     authLevel === "director" ? null : forbiddenDirector();
 
-  server.registerTool(
+  reg(
     "register",
     {
       description:
@@ -453,6 +484,17 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         rules: store.getShowRules(member.show),
         rules_trust: directorPolicyNotice(),
         protocol: INSTRUCTIONS,
+        // Machine-readable loop contract for every member (not a mode): clients that treat
+        // "task finished, summarize for the human" as end-of-turn are the failure mode this
+        // guards against, and no worker exists for whom stopping-after-complete is desirable.
+        loop_contract: {
+          after_update_task: "await_work",
+          stop_conditions: [
+            "evicted (calls return unauthorized_member and you did not rotate your secret)",
+            "the human explicitly tells you to stop",
+          ],
+          note: "completing, failing, or rejecting a task is NEVER a stop condition; a user-facing summary is an optional side effect of the loop, not an end of turn",
+        },
       };
       if (!preexisting.includes(member.show)) {
         const similar = preexisting.filter((s) => similarShowNames(s, member.show));
@@ -469,7 +511,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     },
   );
 
-  server.registerTool(
+  reg(
     "await_work",
     {
       description: "Long-poll for work: unread messages, director review items, or a claimed task.",
@@ -490,7 +532,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     },
   );
 
-  server.registerTool(
+  reg(
     "update_task",
     {
       description: "Heartbeat, journal, and/or transition a task you hold.",
@@ -517,18 +559,36 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         // Same drainInbox as await_work; omit the key rather than ship an empty array.
         const messages = store.drainInbox(resolved.member.id);
         const rules = rulesDelivery(store, resolved.member.id);
-        return jsonResult(
-          messages.length > 0
-            ? { task, messages, trust: untrustedNotice(["messages[].body"]), ...rules }
-            : { task, ...rules },
-        );
+        // Terminal report: tell the model its required next call, with the live queue depth as
+        // the reason. This lands exactly at the "am I done?" decision point -- clients that
+        // treat "task finished, summarize" as end-of-turn are the whole failure mode.
+        const terminal = args.status === "completed" || args.status === "failed" || args.status === "rejected";
+        const next = terminal
+          ? {
+              action: "await_work",
+              queued: store.queuedReleasedCount(resolved.member.show),
+              hint: "",
+            }
+          : undefined;
+        if (next) {
+          next.hint =
+            next.queued > 0
+              ? `${next.queued} released task(s) still queued -- call await_work now and claim the next one. Finishing a task is never a stop condition.`
+              : "queue is empty right now -- park on await_work; more work can arrive at any time. Do not stop or wait for the human.";
+        }
+        return jsonResult({
+          task,
+          ...(next ? { next } : {}),
+          ...(messages.length > 0 ? { messages, trust: untrustedNotice(["messages[].body"]) } : {}),
+          ...rules,
+        });
       } catch (err) {
         return jsonResult({ status: "error", message: (err as Error).message }, true);
       }
     },
   );
 
-  server.registerTool(
+  reg(
     "send_message",
     {
       description: "Send a message to a member id, 'director', 'all', or 'human'.",
@@ -552,7 +612,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     },
   );
 
-  server.registerTool(
+  reg(
     "get_board",
     {
       description: "Board summary: director card, members, task counts/columns, escalations.",
@@ -569,7 +629,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     },
   );
 
-  server.registerTool(
+  reg(
     "save_note",
     {
       description:
@@ -600,7 +660,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     },
   );
 
-  server.registerTool(
+  reg(
     "search_notes",
     {
       description: "BM25-ranked search over this member's show's shared notes.",
@@ -620,7 +680,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     },
   );
 
-  server.registerTool(
+  reg(
     "claim_direction",
     {
       description:
@@ -650,7 +710,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     },
   );
 
-  server.registerTool(
+  reg(
     "release_direction",
     {
       description:
@@ -679,7 +739,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     },
   );
 
-  server.registerTool(
+  reg(
     "create_task",
     {
       description:
@@ -732,7 +792,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     },
   );
 
-  server.registerTool(
+  reg(
     "direct_task",
     {
       description:
@@ -765,7 +825,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     },
   );
 
-  server.registerTool(
+  reg(
     "update_rules",
     {
       description:
@@ -801,7 +861,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     },
   );
 
-  server.registerTool(
+  reg(
     "mint_invite",
     {
       description:
@@ -838,7 +898,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     },
   );
 
-  server.registerTool(
+  reg(
     "evict_member",
     {
       description:
@@ -868,10 +928,18 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       const result = store.evictMember(member.show, args.target, member.id);
       if (!result) return jsonResult({ status: "error", message: `unknown member: ${args.target}` }, true);
       store.sendMessage(member.id, "all", `${args.target} was evicted by ${member.id}`);
-      return jsonResult({ status: "evicted", member_id: args.target, requeued_task_id: result.requeuedTaskId });
+      return jsonResult({
+        status: "evicted",
+        member_id: args.target,
+        requeued_task_id: result.requeuedTaskId,
+        requeued_task_ids: result.requeuedTaskIds,
+      });
     },
   );
 
+}
+
+function registerJoinPrompt(server: McpServer): void {
   server.registerPrompt(
     "join",
     {
@@ -880,8 +948,6 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     },
     async () => ({ messages: [{ role: "user", content: { type: "text", text: INSTRUCTIONS } }] }),
   );
-
-  return server;
 }
 
 /** Stateless-mode transport (PLAN.md): no session id, so WP B2 can create one per request. */
