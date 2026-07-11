@@ -102,15 +102,21 @@ drives the same `/api` the callboard reads. Shows:
   joined via an invite, an `EVICTED` badge once the director evicted it, what it
   is working on right now (task title + status, not just an id), tasks done,
   joined/seen ages, and a small ↗ when the member reported a `session_url`.
-  The current direction holder is not repeated here (it lives on the Director
-  card), and evicted members are hidden by default -- a `show evicted (N)`
-  button in the card header reveals them. A member whose poll lease lapsed
-  while it still holds a task with a live lease shows an amber "heads-down"
-  dot, not red: it's working quietly, and the reaper won't touch its task.
-  The synthetic `human` row (api's audit actor for CLI/HTTP writes) is not
-  listed -- it isn't a session anyone can talk to.
+  The roster is **sorted so members actually working float to the top** (on a
+  live task, then live-idle, then stale). The current direction holder is not
+  repeated here (it lives on the Director card); director-affiliated members
+  (role `director`, or a `director …` display name) render under the Director
+  card instead of in this roster. Evicted members, and long-stale "dormant"
+  ones (there is no eviction timer -- leases only mark staleness, so dead
+  sessions accumulate), are hidden by default behind `show evicted (N)` /
+  `show dormant (N)` buttons in the card header. A member whose poll lease
+  lapsed while it still holds a task with a live lease shows an amber
+  "heads-down" dot, not red: it's working quietly, and the reaper won't touch
+  its task. The synthetic `human` row (api's audit actor for CLI/HTTP writes)
+  is not listed -- it isn't a session anyone can talk to.
 - **Rules**: the show's current server-held rules (switches shown on/off,
   advisory policy, version) -- display only; edit via `showrunner rules set`.
+  Renders in the bottom row beside the activity feed, below the task board.
 - **Task columns** (each with a count): queued / needs input / failures.
   Queued and needs-input show the full list; failures shows the latest 20.
   Queued is ordered the way `await_work` claims (priority, then age), so
@@ -124,10 +130,10 @@ drives the same `/api` the callboard reads. Shows:
   and no live worker members are registered (heads-down counts as live), a
   banner asks you to open a worker session.
 - **Escalations pulse amber in place** (there is no red banner): any
-  `input-required` task, plus messages addressed to `human` from the past
-  24h (latest 5; there's no ack mechanism, so recency is the bound),
-  render in the needs-input column. This is the thing you actually watch
-  for; older escalations survive in the activity feed.
+  `input-required` task renders in the needs-input column. This is the thing
+  you actually watch for; once a director takes one on (`take_input`) it shows
+  a "director on it" badge. There is no `human`-message surface here -- a
+  director asks you directly in its own agent session, not through the board.
 - **Activity** (collapsed by default): shared notes, task journal entries,
   and messages in one newest-first feed, last 50.
 
@@ -205,12 +211,15 @@ eviction-decision surface. Eviction is durable only with `requireInvite` on.
   `loop_contract` (stop conditions: eviction or an explicit human stop;
   finishing a task is never one).
 - A director's idle poll (`status:"nothing"`) carries `pending_input`: every
-  task still parked `input-required`, with age, so an escalation the director
-  already saw once (the review feed shows each only once) keeps nagging until
-  it's answered with `direct_task({action:"answer"})`. Workers park an
-  unanswered escalation and move to other queued work after ~15 min
-  (`ESCALATION_WAIT_S`), leaving a draft-PR handoff; the answer re-adopts the
-  task once the worker's current work wraps.
+  task still parked `input-required`, with age and whether the director has
+  taken it on, so an escalation the director already saw once (the review feed
+  shows each only once) keeps nagging until it's answered with
+  `direct_task({action:"answer"})`. Workers park an unanswered escalation and
+  move to other queued work after ~15 min (`ESCALATION_WAIT_S`), leaving a
+  draft-PR handoff; the answer re-adopts the task once the worker's current work
+  wraps. If the director `take_input`s the escalation first, that re-bases the
+  worker's wait clock -- it keeps holding the parked task past `ESCALATION_WAIT_S`
+  while the director fetches an answer (and the worker hears "director on it").
 - `register({show, kind, display_name?, session_url?, resume_hint?})` --
   `session_url`/`resume_hint` are how a human opens this session's chat; only
   the session itself knows which, so it self-reports (a `session_url` must
@@ -304,7 +313,7 @@ showrunner status [--show <name>]
 showrunner task add --show <name> --title <t> --brief <b> [--priority <n>] [--assignee <id>] ...
 showrunner task cancel --show <name> --id <task-id>
 showrunner task release --show <name> --id <task-id>   # release a task withheld by the release gate
-showrunner message --show <name> --to <member-id|director|all|human> --body <text>
+showrunner message --show <name> --to <member-id|director|all> --body <text>
 showrunner rules --show <name>                         # print the show's server-held rules
 showrunner rules set --show <name> [--require-release on|off] [--merge-approval on|off] \
                      [--note-propagation on|off] [--require-invite on|off] \

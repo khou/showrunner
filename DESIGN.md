@@ -29,7 +29,7 @@ prior system ships.
 
 Deliberately **not**: a runner UI, a worktree manager, an A2A node, a product.
 State is one SQLite file; the dashboard is one static page; the tool surface
-is 14 tools.
+is 15 tools.
 
 ## Constraints that shaped the design (research findings)
 
@@ -118,8 +118,9 @@ notes_fts  ( FTS5 over body + tags, bm25-ranked )
 - `context_id` groups tasks belonging to one feature/thread so the director
   can cancel or reassign a whole thread at once (A2A borrow).
 - `to_id` of a message may be a member id, `director` (role-addressed —
-  resolves at delivery time, so it survives director changes), `all`, or
-  `human` (lands in the callboard's needs-input column).
+  resolves at delivery time, so it survives director changes), or `all`.
+  There is no `human` target: a director needing the human's input asks in
+  its own agent session (the human is present there), not through the server.
 
 ### Task state machine (A2A-derived)
 
@@ -127,7 +128,7 @@ notes_fts  ( FTS5 over body + tags, bm25-ranked )
 queued ──▶ assigned ──▶ working ──▶ completed
    ▲           │           │──────▶ failed
    │           │           │──────▶ rejected      (worker declines: wrong skills/env)
-   │           │           └──────▶ input-required ──▶ working   (director/human answers)
+   │           │           └──────▶ input-required ──▶ working   (director answers; take_input holds the worker meanwhile)
    │           └── lease expiry / requeue ──┘
    └── director: requeue / cancel ──▶ canceled
 ```
@@ -311,7 +312,7 @@ after finishing one, save a note if you learned something the next agent
 would want (with `files_hint` of the affected globs). Directors record
 generalizable decisions (especially answers to `input-required`) as notes.
 
-## MCP tool surface (14 tools)
+## MCP tool surface (15 tools)
 
 Everything takes/returns compact JSON. `member_id` is explicit in every call
 (the server is stateless per-request; reconnects and session restarts don't
@@ -344,8 +345,9 @@ matter).
    `messages`, so a heads-down worker hears about notes and answers on its
    ~10min heartbeat instead of only at its next `await_work`.
 4. `send_message({member_id, to, body, task_id?})` — to a member id,
-   `director`, `all`, or `human`. Delivered via the recipient's next
-   `await_work`; `human` lands in the callboard's needs-input column.
+   `director`, or `all`. Delivered via the recipient's next `await_work`.
+   There is no `human` target: a director needing the human's input asks in
+   its own agent session, where the human is present.
 5. `get_board({member_id, verbose?})` — director card, member list with
    staleness, task counts by status, in-flight task titles, escalations.
    Summary by default (~300 tokens); `verbose` adds journals.
@@ -372,14 +374,20 @@ matter).
    `requeue`, `assign {assignee}`, `answer {body}` (for `input-required` →
    flips back to `working` and delivers the answer), `approve` (records a
    director-approval journal note; no gating today).
-11. `update_rules({member_id, epoch, switches?, policy?})` → `{rules}` — set
+11. `take_input({member_id, epoch, task_id})` — take on an `input-required`
+   escalation: messages the waiting worker that an answer is coming and stamps
+   `input_taken_at` so the worker's escalation-wait clock re-bases (it keeps
+   holding the parked task past `ESCALATION_WAIT_S` while the director fetches
+   an answer). Does not resolve the task — the director still answers via
+   `direct_task`; the director's `pending_input` age stays the true blocked age.
+12. `update_rules({member_id, epoch, switches?, policy?})` → `{rules}` — set
    the show's server-held rules (machine-enforced switches and/or advisory
    policy prose). Bumps `version`, is audited (`updated_by`), and notifies the
    cast. The human's equivalent is the admin `/api` route (callboard / CLI).
-12. `mint_invite({member_id, epoch, ttl_seconds?})` → `{invite_token}` — mint a
+13. `mint_invite({member_id, epoch, ttl_seconds?})` → `{invite_token}` — mint a
    single-use, show-scoped invite (hash stored, plaintext once, expires) so a
    specific outside agent can register when `requireInvite` is on.
-13. `evict_member({member_id, epoch, target})` — revoke a member's credential
+14. `evict_member({member_id, epoch, target})` — revoke a member's credential
    (all later calls `unauthorized_member`), requeue its in-flight task
    (attempt+1, journal kept), stamp the membership evicted, notify the cast.
 
@@ -425,7 +433,14 @@ every 2s. No build step, no framework — one file, fetch + DOM.
 - Members (the hero card: who is on, and on what): freshness dot, memorable
   id, kind + role badges, the current task rendered by **title and status**
   (joined from the task list, not an opaque id), tasks done, joined/seen
-  ages, ↗ when a session_url was reported.
+  ages, ↗ when a session_url was reported. **Sorted so whoever is actually
+  working floats to the top** (on a live task, then live-idle, then stale).
+  Director-affiliated members (role `director`, or the `director …`
+  display-name convention) render under the director card, not here — a
+  best-effort split, since there is no server-side "spawned by the director"
+  flag. Long-stale sessions ("dormant") and evicted ones collapse behind
+  toggles: leases only mark staleness (there is no eviction timer), so an
+  8h-old row would otherwise bury the live cast.
 - Task columns, each with a count: **queued** / **needs input** /
   **failures**. Queued and needs-input grow to the full list; failures
   shows the latest 20. Queued is ordered the way `await_work` claims
@@ -437,9 +452,13 @@ every 2s. No build step, no framework — one file, fetch + DOM.
   merged; both stay visible as totals in the tasks header. Click a task →
   journal.
 - **Escalations pulse amber in place** (no banner): `input-required` tasks
-  and messages addressed to `human` (the latest 5 from the past 24h; there
-  is no ack mechanism, so recency is the bound) both render in the
-  needs-input column, so decisions waiting on the human have one home.
+  render in the needs-input column, so decisions waiting on the director have
+  one home. Once a director has `take_input`-ed one, it shows a "director on
+  it" badge (being handled, not just sitting). There is no `human`-message
+  surface — a director asks the human directly in its own session.
+- Rules and activity share the bottom row below the task board: rules in the
+  narrow rail (display-only switches + advisory policy), the activity feed
+  beside it.
 - Activity (one demoted feed, collapsed by default): shared notes, task
   journal entries, and messages interleaved newest-first, last 50. The
   audit trail; the page stays read-only.

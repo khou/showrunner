@@ -380,6 +380,57 @@ describe("epoch fencing surfaces as a tool result", () => {
   });
 });
 
+describe("take_input tool", () => {
+  it("director takes on an escalation: worker is messaged and the task is marked taken", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const dir = reg(store, "myshow");
+    const worker = reg(store, "myshow");
+    const claim = await callTool(client, "claim_direction", { member_id: dir.id, member_secret: dir.secret, takeover: true });
+    const epoch = (claim.data as { epoch: number }).epoch;
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: dir.id });
+    store.claimNextTask(worker.id);
+    store.updateTask(worker.id, task.id, { status: "input-required", note: "blocked" });
+    store.drainInbox(worker.id);
+
+    const res = await callTool(client, "take_input", { member_id: dir.id, member_secret: dir.secret, epoch, task_id: task.id });
+    expect(res.isError).toBe(false);
+    expect(res.data).toMatchObject({ status: "taken", task: { id: task.id, status: "input-required" } });
+    expect((res.data as { task: { inputTakenAt: number | null } }).task.inputTakenAt).not.toBeNull();
+
+    const inbox = store.drainInbox(worker.id);
+    expect(inbox.some((m) => m.fromId === dir.id && /on your blocker/i.test(m.body))).toBe(true);
+
+    const board = await callTool(client, "get_board", { member_id: dir.id, member_secret: dir.secret, verbose: true });
+    const escalations = (board.data as { escalations: Record<string, unknown> }).escalations;
+    expect(escalations).not.toHaveProperty("humanMessages"); // the human channel is gone
+    const inputRequired = escalations.inputRequired as { id: string; inputTakenAt: number | null }[];
+    expect(inputRequired.find((t) => t.id === task.id)?.inputTakenAt).not.toBeNull();
+  });
+
+  it("is director-token gated: a worker-authLevel caller is forbidden", async () => {
+    const { store } = newStore();
+    const workerClient = await connectClient(store, { ...FAST_CONFIG, authLevel: "worker" });
+    const registered = await callTool(workerClient, "register", { show: "authshow", kind: "claude-local" });
+    const { member_id: memberId, member_secret: secret } = registered.data as { member_id: string; member_secret: string };
+    const res = await callTool(workerClient, "take_input", { member_id: memberId, member_secret: secret, epoch: 1, task_id: "t-x" });
+    expect(res.isError).toBe(true);
+    expect(res.data).toMatchObject({ status: "forbidden", reason: "director token required" });
+  });
+
+  it("errors when the task is not awaiting input", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const dir = reg(store, "myshow");
+    const claim = await callTool(client, "claim_direction", { member_id: dir.id, member_secret: dir.secret, takeover: true });
+    const epoch = (claim.data as { epoch: number }).epoch;
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: dir.id });
+    const res = await callTool(client, "take_input", { member_id: dir.id, member_secret: dir.secret, epoch, task_id: task.id });
+    expect(res.isError).toBe(true);
+    expect((res.data as { message: string }).message).toMatch(/not awaiting input/);
+  });
+});
+
 describe("save_note / search_notes tools", () => {
   it("save_note pushes to a live overlapping member, and search_notes finds it back", async () => {
     const { store } = newStore();

@@ -1578,6 +1578,84 @@ describe("escalation parking (input-required)", () => {
   });
 });
 
+describe("take_input (director takes on an escalation)", () => {
+  function setup() {
+    const { store, clock } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const claimed = store.claimDirection(director.id, true);
+    if (!claimed.ok) throw new Error("claim_direction failed");
+    return { store, clock, director, worker, epoch: claimed.epoch };
+  }
+
+  it("resets the worker's escalation-wait clock so it keeps holding the parked task", () => {
+    const { store, clock, director, worker, epoch } = setup();
+    const a = store.createTask({ show: "myshow", title: "A", brief: "b", createdBy: director.id }).task;
+    const b = store.createTask({ show: "myshow", title: "B", brief: "b", createdBy: director.id }).task;
+    expect(store.claimNextTask(worker.id)!.id).toBe(a.id);
+    store.updateTask(worker.id, a.id, { status: "input-required", note: "renew or 410?" });
+
+    clock.t += 800_000; // most of ESCALATION_WAIT_S has elapsed
+    store.takeInput(director.id, epoch, a.id); // director takes it on: clock re-bases to now
+    clock.t += 800_000; // 800s past the ORIGINAL park would have offered B; but take_input reset it
+
+    // Still redelivers the parked task, not B: the take-on extended the worker's patience.
+    expect(store.claimNextTask(worker.id)!.id).toBe(a.id);
+
+    clock.t += 900_001; // now past ESCALATION_WAIT_S measured from the take-on
+    expect(store.claimNextTask(worker.id)!.id).toBe(b.id);
+  });
+
+  it("messages the waiting worker and marks the task taken; the director's age stays true", () => {
+    const { store, clock, director, worker, epoch } = setup();
+    const a = store.createTask({ show: "myshow", title: "A", brief: "b", createdBy: director.id }).task;
+    expect(store.claimNextTask(worker.id)!.id).toBe(a.id);
+    store.updateTask(worker.id, a.id, { status: "input-required", note: "blocked" });
+    store.drainInbox(worker.id); // clear the register/claim noise
+
+    clock.t += 120_000; // 2 min really blocked
+    store.takeInput(director.id, epoch, a.id);
+
+    const inbox = store.drainInbox(worker.id);
+    expect(inbox.some((m) => m.fromId === director.id && /on your blocker/i.test(m.body))).toBe(true);
+
+    const view = store.getBoard("myshow").tasks.find((t) => t.id === a.id)!;
+    expect(view.inputTakenAt).not.toBeNull();
+    // Age keeps counting from the true park time, not the take-on (still the director's to-do).
+    const pending = store.pendingInputRequired("myshow");
+    expect(pending[0].takenAt).not.toBeNull();
+    expect(pending[0].ageMs).toBeGreaterThanOrEqual(120_000);
+  });
+
+  it("clears the take-on marker when the escalation is answered", () => {
+    const { store, director, worker, epoch } = setup();
+    const a = store.createTask({ show: "myshow", title: "A", brief: "b", createdBy: director.id }).task;
+    store.claimNextTask(worker.id);
+    store.updateTask(worker.id, a.id, { status: "input-required", note: "blocked" });
+    store.takeInput(director.id, epoch, a.id);
+    store.directTask(director.id, epoch, a.id, { type: "answer", body: "go left" });
+    const view = store.getBoard("myshow").tasks.find((t) => t.id === a.id)!;
+    expect(view.status).toBe("working");
+    expect(view.inputTakenAt).toBeNull();
+  });
+
+  it("rejects taking on a task that is not awaiting input", () => {
+    const { store, director, worker, epoch } = setup();
+    const a = store.createTask({ show: "myshow", title: "A", brief: "b", createdBy: director.id }).task;
+    store.claimNextTask(worker.id);
+    store.updateTask(worker.id, a.id, { status: "working", note: "on it" });
+    expect(() => store.takeInput(director.id, epoch, a.id)).toThrow(/not awaiting input/);
+  });
+});
+
+describe("message targets", () => {
+  it("rejects a 'human' target -- a director asks the human in its own session, not via the server", () => {
+    const { store } = newStore();
+    const worker = store.register("myshow", "claude-local");
+    expect(() => store.sendMessage(worker.id, "human", "please decide")).toThrow(/unknown member: human/);
+  });
+});
+
 describe("adminCancelTask stamps status_changed_at", () => {
   it("advances status_changed_at so a canceled task's escalation-clock semantics are consistent", () => {
     const { store, clock } = newStore();

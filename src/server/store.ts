@@ -122,7 +122,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   released INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  status_changed_at INTEGER
+  status_changed_at INTEGER,
+  input_taken_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS tasks_show_status_idx ON tasks(show, status);
 
@@ -172,10 +173,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(id UNINDEXED, show UNIND
 const TERMINAL_STATUSES = new Set<TaskStatus>(["completed", "failed", "rejected", "canceled"]);
 const IN_FLIGHT_STATUSES: TaskStatus[] = ["queued", "assigned", "working", "input-required"];
 
-// getBoard summary-mode bounds (DESIGN.md "Summary by default (~300 tokens)"): only the tail
-// of finished-task/human-message history is kept; everything still in flight is unbounded.
+// getBoard summary-mode bound (DESIGN.md "Summary by default (~300 tokens)"): only the tail of
+// finished-task history is kept; everything still in flight is unbounded.
 const NON_VERBOSE_TASK_LIMIT = 20;
-const NON_VERBOSE_MESSAGE_LIMIT = 20;
 
 // search_notes token discipline (DESIGN.md "search results compact"): caller-supplied limit is
 // clamped here so it can't return the whole notes table with full bodies regardless of caller.
@@ -336,6 +336,10 @@ interface TaskRow {
   // When the status last transitioned. The escalation clock (claimNextTask parkedPastWait)
   // keys on this, NOT updated_at, so note-only heartbeats/handoff notes don't reset it.
   status_changed_at: number | null;
+  // When a director took on this input-required escalation (take_input). While set, it -- not
+  // status_changed_at -- is the base of the worker's escalation-wait clock, so a taken-on
+  // escalation keeps the worker holding. Cleared on any status transition (mapped in updateTask).
+  input_taken_at: number | null;
 }
 
 interface MessageRow {
@@ -420,6 +424,7 @@ function mapTask(r: TaskRow): Task {
     leaseExpiresAt: r.lease_expires_at,
     artifacts: JSON.parse(r.artifacts_json) as TaskArtifact[],
     released: r.released !== 0,
+    inputTakenAt: r.input_taken_at,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -488,6 +493,7 @@ export class Store {
     this.migrateMemberSecretColumn();
     this.migrateTaskReleasedColumn();
     this.migrateTaskStatusChangedAtColumn();
+    this.migrateTaskInputTakenAtColumn();
     this.migrateMemberRulesSeenColumn();
     this.migrateMemberInviteEvictionColumns();
     this.now = now;
@@ -556,6 +562,15 @@ export class Store {
     if (!cols.some((c) => c.name === "status_changed_at")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN status_changed_at INTEGER");
       this.db.exec("UPDATE tasks SET status_changed_at = updated_at WHERE status_changed_at IS NULL");
+    }
+  }
+
+  /** Guarded upgrade-in-place: tasks predates director "take on" of an escalation. Nullable, no
+   * backfill (an existing input-required task simply reads as not-yet-taken until a director does). */
+  private migrateTaskInputTakenAtColumn(): void {
+    const cols = this.db.pragma("table_info(tasks)") as { name: string }[];
+    if (!cols.some((c) => c.name === "input_taken_at")) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN input_taken_at INTEGER");
     }
   }
 
@@ -823,7 +838,7 @@ export class Store {
       for (const task of held) {
         this.db
           .prepare(
-            "UPDATE tasks SET status = 'queued', assignee = NULL, lease_expires_at = NULL, attempt = attempt + 1, updated_at = ?, status_changed_at = ? WHERE id = ?",
+            "UPDATE tasks SET status = 'queued', assignee = NULL, lease_expires_at = NULL, attempt = attempt + 1, updated_at = ?, status_changed_at = ?, input_taken_at = NULL WHERE id = ?",
           )
           .run(at, at, task.id);
         this.insertNote(task.id, "system", `requeued: ${targetId} evicted by ${actor} (attempt ${task.attempt + 1})`, at);
@@ -1018,8 +1033,8 @@ export class Store {
       "input-required": 0,
       canceled: 0,
     };
-    // Counts always cover every task regardless of verbosity; only the returned `tasks` list
-    // (and human-addressed messages below) are bounded in summary mode.
+    // Counts always cover every task regardless of verbosity; only the returned `tasks` list is
+    // bounded in summary mode.
     const allTasks: BoardTaskView[] = taskRows.map((t) => {
       const status = t.status as TaskStatus;
       taskCounts[status]++;
@@ -1035,6 +1050,7 @@ export class Store {
         updatedAt: t.updated_at,
         released: t.released !== 0,
         leaseExpiresAt: t.lease_expires_at,
+        inputTakenAt: t.input_taken_at,
       };
       if (verbose) view.notes = this.getNotes(t.id);
       return view;
@@ -1052,9 +1068,6 @@ export class Store {
       tasks = [...inFlight, ...done.slice(0, NON_VERBOSE_TASK_LIMIT)];
     }
 
-    const { humanMessages: allHumanMessages } = this.humanBanner(show);
-    const humanMessages = verbose ? allHumanMessages : allHumanMessages.slice(-NON_VERBOSE_MESSAGE_LIMIT);
-
     return {
       show,
       director,
@@ -1062,8 +1075,8 @@ export class Store {
       taskCounts,
       tasks,
       escalations: {
+        // input-required is always in-flight, so it's present in full even in summary mode.
         inputRequired: tasks.filter((t) => t.status === "input-required"),
-        humanMessages,
       },
       rules: this.getShowRules(show),
       ...(verbose ? { recentMessages: this.getRecentMessages(show) } : {}),
@@ -1320,16 +1333,28 @@ export class Store {
    * age since they were parked (status_changed_at). The director's idle polls surface these as
    * a standing reminder -- the review cursor shows each escalation only once, but a pending
    * decision must keep nagging until it's answered. */
-  pendingInputRequired(show: string): { id: string; title: string; assignee: string | null; parkedAt: number; ageMs: number }[] {
+  pendingInputRequired(
+    show: string,
+  ): { id: string; title: string; assignee: string | null; parkedAt: number; ageMs: number; takenAt: number | null }[] {
     const now = this.now();
     const rows = this.db
       .prepare(
-        "SELECT id, title, assignee, status_changed_at, updated_at FROM tasks WHERE show = ? AND status = 'input-required' ORDER BY COALESCE(status_changed_at, updated_at) ASC",
+        "SELECT id, title, assignee, status_changed_at, updated_at, input_taken_at FROM tasks WHERE show = ? AND status = 'input-required' ORDER BY COALESCE(status_changed_at, updated_at) ASC",
       )
-      .all(show) as { id: string; title: string; assignee: string | null; status_changed_at: number | null; updated_at: number }[];
+      .all(show) as {
+      id: string;
+      title: string;
+      assignee: string | null;
+      status_changed_at: number | null;
+      updated_at: number;
+      input_taken_at: number | null;
+    }[];
+    // Age stays keyed to the true park time (status_changed_at), so a taken-on escalation still
+    // shows the director how long the worker has really been blocked -- take_input reassures the
+    // worker, it doesn't hide the wait from the director's standing to-do.
     return rows.map((r) => {
       const parkedAt = r.status_changed_at ?? r.updated_at;
-      return { id: r.id, title: r.title, assignee: r.assignee, parkedAt, ageMs: now - parkedAt };
+      return { id: r.id, title: r.title, assignee: r.assignee, parkedAt, ageMs: now - parkedAt, takenAt: r.input_taken_at };
     });
   }
 
@@ -1360,7 +1385,9 @@ export class Store {
           // unanswered past escalationWaitS, fall through so the member can progress other
           // queued work. The parked task stays assigned to this member -- the director's
           // answer flips it back to working and re-adoption below returns it.
-          const parkedSince = current.status_changed_at ?? current.updated_at;
+          // input_taken_at (a director took it on via take_input) re-bases the clock: a
+          // taken-on escalation keeps the worker holding while the director fetches an answer.
+          const parkedSince = current.input_taken_at ?? current.status_changed_at ?? current.updated_at;
           const parkedPastWait =
             current.status === "input-required" && parkedSince + this.leases.escalationWaitS * 1000 < now;
           if (!parkedPastWait) {
@@ -1499,11 +1526,14 @@ export class Store {
       }
 
       const statusChangedAt = status !== row.status ? at : row.status_changed_at;
+      // A status transition clears any director "take on" marker: it was scoped to the prior
+      // input-required parking (an answer -> working, or a fresh re-escalation, both start clean).
+      const inputTakenAt = status !== row.status ? null : row.input_taken_at;
       this.db
         .prepare(
-          "UPDATE tasks SET status = ?, assignee = ?, lease_expires_at = ?, artifacts_json = ?, updated_at = ?, status_changed_at = ? WHERE id = ?",
+          "UPDATE tasks SET status = ?, assignee = ?, lease_expires_at = ?, artifacts_json = ?, updated_at = ?, status_changed_at = ?, input_taken_at = ? WHERE id = ?",
         )
-        .run(status, assignee, leaseExpiresAt, JSON.stringify(artifacts), at, statusChangedAt, taskId);
+        .run(status, assignee, leaseExpiresAt, JSON.stringify(artifacts), at, statusChangedAt, inputTakenAt, taskId);
 
       if (patch.status && patch.status !== row.status) {
         this.insertNote(taskId, memberId, `status: ${row.status} -> ${patch.status}`, at);
@@ -1543,7 +1573,7 @@ export class Store {
             throw new Error(`task ${taskId} is already ${status}; cannot cancel a finished task`);
           }
           this.db
-            .prepare("UPDATE tasks SET status = 'canceled', lease_expires_at = NULL, updated_at = ?, status_changed_at = ? WHERE id = ?")
+            .prepare("UPDATE tasks SET status = 'canceled', lease_expires_at = NULL, updated_at = ?, status_changed_at = ?, input_taken_at = NULL WHERE id = ?")
             .run(at, at, taskId);
           if (row.assignee) {
             this.db.prepare("UPDATE members SET current_task_id = NULL WHERE id = ? AND current_task_id = ?").run(row.assignee, taskId);
@@ -1567,7 +1597,7 @@ export class Store {
           }
           this.db
             .prepare(
-              "UPDATE tasks SET status = 'queued', assignee = NULL, lease_expires_at = NULL, attempt = attempt + 1, updated_at = ?, status_changed_at = ? WHERE id = ?",
+              "UPDATE tasks SET status = 'queued', assignee = NULL, lease_expires_at = NULL, attempt = attempt + 1, updated_at = ?, status_changed_at = ?, input_taken_at = NULL WHERE id = ?",
             )
             .run(at, at, taskId);
           if (row.assignee) {
@@ -1583,7 +1613,7 @@ export class Store {
               this.db.prepare("UPDATE members SET current_task_id = NULL WHERE id = ? AND current_task_id = ?").run(row.assignee, taskId);
             }
             this.db
-              .prepare("UPDATE tasks SET assignee = ?, status = 'queued', lease_expires_at = NULL, updated_at = ?, status_changed_at = ? WHERE id = ?")
+              .prepare("UPDATE tasks SET assignee = ?, status = 'queued', lease_expires_at = NULL, updated_at = ?, status_changed_at = ?, input_taken_at = NULL WHERE id = ?")
               .run(action.assignee, at, at, taskId);
           } else {
             this.db.prepare("UPDATE tasks SET assignee = ?, updated_at = ? WHERE id = ?").run(action.assignee, at, taskId);
@@ -1597,7 +1627,7 @@ export class Store {
             throw new Error(`task ${taskId} is not awaiting input (status: ${status}); answer is only valid for input-required tasks`);
           }
           this.db
-            .prepare("UPDATE tasks SET status = 'working', lease_expires_at = ?, updated_at = ?, status_changed_at = ? WHERE id = ?")
+            .prepare("UPDATE tasks SET status = 'working', lease_expires_at = ?, updated_at = ?, status_changed_at = ?, input_taken_at = NULL WHERE id = ?")
             .run(at + this.leases.taskLeaseS * 1000, at, at, taskId);
           this.insertNote(taskId, memberId, `answer: ${action.body}`, at);
           if (row.assignee) {
@@ -1610,6 +1640,44 @@ export class Store {
           this.insertNote(taskId, memberId, "approved by director", at);
           break;
         }
+      }
+      return mapTask(this.getTaskRowRaw(taskId)!);
+    });
+  }
+
+  /**
+   * Director "takes on" an input-required escalation (the take_input tool). Stamps input_taken_at
+   * so the worker's escalation-wait clock re-bases (claimNextTask keeps redelivering the parked
+   * task instead of offering other work after ESCALATION_WAIT_S), messages the waiting worker that
+   * an answer is coming, and wakes it so a parked poll surfaces the reassurance now. Status stays
+   * input-required and neither updated_at nor status_changed_at moves -- the director's own
+   * pending-input reminder must keep showing the true blocked age, and the review feed must not
+   * re-surface a task the director just acted on. Epoch-fenced; the journal note carries the audit.
+   */
+  takeInput(memberId: string, epoch: number, taskId: string): Task {
+    return this.txn(() => {
+      const row = this.getTaskRowRaw(taskId);
+      if (!row) throw new Error(`unknown task: ${taskId}`);
+      this.checkEpoch(row.show, memberId, epoch);
+      if (row.status !== "input-required") {
+        throw new Error(
+          `task ${taskId} is not awaiting input (status: ${row.status}); take_input applies only to input-required tasks`,
+        );
+      }
+      const at = this.now();
+      this.db.prepare("UPDATE tasks SET input_taken_at = ? WHERE id = ?").run(at, taskId);
+      this.insertNote(taskId, memberId, "director took on this escalation; answer coming", at);
+      if (row.assignee) {
+        this.insertMessageRow(
+          this.generateMessageId(),
+          row.show,
+          memberId,
+          row.assignee,
+          taskId,
+          "The director is on your blocker -- keep holding this task, an answer is coming.",
+          at,
+        );
+        this.events.emit(`wake:${row.assignee}`);
       }
       return mapTask(this.getTaskRowRaw(taskId)!);
     });
@@ -1630,7 +1698,7 @@ export class Store {
       if (!TERMINAL_STATUSES.has(status)) {
         const at = this.now();
         this.db
-          .prepare("UPDATE tasks SET status = 'canceled', lease_expires_at = NULL, updated_at = ?, status_changed_at = ? WHERE id = ?")
+          .prepare("UPDATE tasks SET status = 'canceled', lease_expires_at = NULL, updated_at = ?, status_changed_at = ?, input_taken_at = NULL WHERE id = ?")
           .run(at, at, taskId);
         if (row.assignee) {
           this.db.prepare("UPDATE members SET current_task_id = NULL WHERE id = ? AND current_task_id = ?").run(row.assignee, taskId);
@@ -1650,8 +1718,9 @@ export class Store {
       if (!from) throw new Error(`unknown member: ${fromId}`);
 
       // A typo'd or stale member id would otherwise black-hole the message: it inserts fine,
-      // nothing ever wakes for it, and drainInbox never matches it against any live inbox.
-      if (to !== "director" && to !== "all" && to !== "human") {
+      // nothing ever wakes for it, and drainInbox never matches it against any live inbox. There
+      // is no "human" target -- a director asks the human in its own session (see MessageTarget).
+      if (to !== "director" && to !== "all") {
         const target = this.getMemberRowRaw(to);
         if (!target || target.show !== from.show) throw new Error(`unknown member: ${to}`);
       }
@@ -1666,7 +1735,7 @@ export class Store {
         const dir = this.getDirectionRow(from.show);
         if (dir?.director_id) this.events.emit(`wake:${dir.director_id}`);
         this.events.emit(`wake:show:${from.show}`);
-      } else if (to !== "human") {
+      } else {
         this.events.emit(`wake:${to}`);
       }
       return mapMessage(this.getMessageRowRaw(id)!);
@@ -1694,16 +1763,6 @@ export class Store {
       for (const r of rows) insertRead.run(r.id, memberId);
       return rows.map(mapMessage);
     });
-  }
-
-  humanBanner(show: string): { inputRequired: Task[]; humanMessages: Message[] } {
-    const inputRequired = (
-      this.db.prepare("SELECT * FROM tasks WHERE show = ? AND status = 'input-required' ORDER BY updated_at ASC").all(show) as TaskRow[]
-    ).map(mapTask);
-    const humanMessages = (
-      this.db.prepare("SELECT * FROM messages WHERE show = ? AND to_id = 'human' ORDER BY created_at ASC").all(show) as MessageRow[]
-    ).map(mapMessage);
-    return { inputRequired, humanMessages };
   }
 
   // --- notes (DESIGN.md "Shared notes: realtime memory") ---
@@ -1953,7 +2012,7 @@ export class Store {
         if (shouldRequeue) {
           this.db
             .prepare(
-              "UPDATE tasks SET status = 'queued', assignee = NULL, lease_expires_at = NULL, attempt = attempt + 1, updated_at = ?, status_changed_at = ? WHERE id = ?",
+              "UPDATE tasks SET status = 'queued', assignee = NULL, lease_expires_at = NULL, attempt = attempt + 1, updated_at = ?, status_changed_at = ?, input_taken_at = NULL WHERE id = ?",
             )
             .run(now, now, t.id);
           if (t.assignee) {

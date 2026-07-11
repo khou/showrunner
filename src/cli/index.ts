@@ -92,13 +92,11 @@ function printBoard(state: BoardState): void {
     }
   }
 
-  if (state.escalations.inputRequired.length > 0 || state.escalations.humanMessages.length > 0) {
+  if (state.escalations.inputRequired.length > 0) {
     lines.push("escalations:");
     for (const t of state.escalations.inputRequired) {
-      lines.push(`  INPUT-REQUIRED  ${t.id}  "${t.title}"  (assignee: ${t.assignee ?? "-"})`);
-    }
-    for (const m of state.escalations.humanMessages) {
-      lines.push(`  MESSAGE from ${m.fromId}: ${m.body}`);
+      const taken = t.inputTakenAt ? "  [director on it]" : "";
+      lines.push(`  INPUT-REQUIRED  ${t.id}  "${t.title}"  (assignee: ${t.assignee ?? "-"})${taken}`);
     }
   }
 
@@ -363,7 +361,7 @@ async function cmdMessage(argv: string[]): Promise<void> {
   });
   const cfg = requireConfig(values);
   if (!values.show) throw new UsageError("message requires --show");
-  if (!values.to) throw new UsageError("message requires --to <member-id|director|all|human>");
+  if (!values.to) throw new UsageError("message requires --to <member-id|director|all>");
   if (!values.body) throw new UsageError("message requires --body");
 
   const payload: { to: MessageTarget; body: string } = { to: values.to as MessageTarget, body: values.body };
@@ -422,7 +420,8 @@ edit policy by editing a repo file.
 ## Escalation
 
 - Decisions the director may make alone: <...>
-- Decisions that must go to the human (\`send_message\` to \`human\`): <...>
+- Decisions that need the human (director asks them directly in its own
+  session, then relays via direct_task answer): <...>
 - Design/product references the director should consult to answer worker
   questions before escalating: <docs/..., design files, prior decisions>
 `;
@@ -642,7 +641,7 @@ Usage:
                        [--priority <n>] [--assignee <id>] [--url <url>] [--token <token>]
   showrunner task cancel --show <name> --id <task-id> [--url <url>] [--token <token>]
   showrunner task release --show <name> --id <task-id> [--url <url>] [--token <token>]
-  showrunner message --show <name> --to <member-id|director|all|human> --body <text>
+  showrunner message --show <name> --to <member-id|director|all> --body <text>
                       [--url <url>] [--token <token>]
   showrunner rules --show <name>                    # print the show's server-held rules
   showrunner rules set --show <name> [--require-release on|off] [--merge-approval on|off]
