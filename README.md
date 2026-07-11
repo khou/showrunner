@@ -27,24 +27,20 @@ A worker session, after the sentence:
 ⏺ showrunner:await_work(…)   ← the director's answer arrives here
 ```
 
-## Quickstart
+## Setup: one prompt
 
-```bash
-fly launch --no-deploy   # creates the app from fly.toml, skips first deploy
-export SHOWRUNNER_TOKEN=$(openssl rand -hex 24)   # keep this shell open
-fly secrets set SHOWRUNNER_TOKEN=$SHOWRUNNER_TOKEN
-fly deploy
-```
+Paste this into any coding agent with shell access (Claude Code, Cursor),
+from inside the project repo you want coordinated:
 
-Connect a local Claude Code session (same shell, so `$SHOWRUNNER_TOKEN` is still set):
+> Set up showrunner for me. Fetch
+> https://raw.githubusercontent.com/khou/showrunner/main/docs/SETUP.md
+> and follow it: deploy the server to my Fly account, verify it, connect
+> the agent clients I use, and initialize this repo as a show. Ask me
+> before anything that costs money or edits config outside this repo.
 
-```bash
-claude mcp add --transport http showrunner https://<your-app>.fly.dev/mcp \
-  --header "Authorization: Bearer $SHOWRUNNER_TOKEN"
-```
-
-For Cursor, see the `.cursor/mcp.json` snippet in [examples/](examples/)
-(every client's setup is in [docs/OPERATING.md](docs/OPERATING.md)).
+The agent deploys the server (one small always-on Fly machine, ~$3/mo),
+wires your clients, and scaffolds this repo. Prefer doing it by hand?
+[docs/SETUP.md](docs/SETUP.md) is the same runbook, human-readable.
 
 Now open a session in any project repo and say:
 
