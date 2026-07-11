@@ -8,6 +8,7 @@ import type { Store } from "./store.js";
 import { INSTRUCTIONS } from "./instructions.js";
 import {
   SupersededError,
+  type AuthLevel,
   type BoardTaskView,
   type DirectTaskAction,
   type Member,
@@ -20,6 +21,19 @@ import {
 /** Subset of EnvConfig this module needs; a full EnvConfig satisfies it structurally. */
 export interface McpServerConfig {
   pollHoldSeconds: number;
+  /** Defaults to director so in-memory tests keep full access. */
+  authLevel?: AuthLevel;
+}
+
+function forbiddenDirector(): CallToolResult {
+  return jsonResult(
+    {
+      status: "forbidden",
+      reason: "director token required",
+      hint: "claim_direction, create_task, and direct_task need the showrunner-director MCP entry (SHOWRUNNER_TOKEN). The committed worker token cannot direct.",
+    },
+    true,
+  );
 }
 
 const MEMBER_KIND = z.enum(["claude-local", "claude-cloud", "cursor-local", "cursor-cloud", "other"]);
@@ -276,6 +290,9 @@ function similarShowNames(a: string, b: string): boolean {
 
 export function createMcpServer(store: Store, config: McpServerConfig): McpServer {
   const server = new McpServer({ name: "showrunner", version: "0.1.0" }, { instructions: INSTRUCTIONS });
+  const authLevel: AuthLevel = config.authLevel ?? "director";
+  const requireDirectorAuth = (): CallToolResult | null =>
+    authLevel === "director" ? null : forbiddenDirector();
 
   server.registerTool(
     "register",
@@ -458,13 +475,16 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
   server.registerTool(
     "claim_direction",
     {
-      description: "Claim (or take over) the direction lease for this member's show.",
+      description:
+        "Claim (or take over) the direction lease for this member's show. Requires the director bearer token (showrunner-director MCP).",
       inputSchema: {
         member_id: z.string().min(1),
         takeover: z.boolean().optional(),
       },
     },
     async (args) => {
+      const denied = requireDirectorAuth();
+      if (denied) return denied;
       const resolved = resolveMember(store, args.member_id);
       if ("result" in resolved) return resolved.result;
       const result = store.claimDirection(resolved.member.id, args.takeover);
@@ -478,7 +498,8 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
   server.registerTool(
     "create_task",
     {
-      description: "Director-only: create a task. Epoch-fenced; a stale epoch returns {status:'superseded'}.",
+      description:
+        "Director-only: create a task. Epoch-fenced; a stale epoch returns {status:'superseded'}. Requires the director bearer token.",
       inputSchema: {
         member_id: z.string().min(1),
         epoch: z.number().int(),
@@ -492,6 +513,8 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       },
     },
     async (args) => {
+      const denied = requireDirectorAuth();
+      if (denied) return denied;
       const resolved = resolveMember(store, args.member_id);
       if ("result" in resolved) return resolved.result;
       const { member } = resolved;
@@ -519,7 +542,8 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
   server.registerTool(
     "direct_task",
     {
-      description: "Director-only: cancel/requeue/assign/answer/approve a task. Epoch-fenced.",
+      description:
+        "Director-only: cancel/requeue/assign/answer/approve a task. Epoch-fenced. Requires the director bearer token.",
       inputSchema: {
         member_id: z.string().min(1),
         epoch: z.number().int(),
@@ -530,6 +554,8 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       },
     },
     async (args) => {
+      const denied = requireDirectorAuth();
+      if (denied) return denied;
       const resolved = resolveMember(store, args.member_id);
       if ("result" in resolved) return resolved.result;
       const { member } = resolved;

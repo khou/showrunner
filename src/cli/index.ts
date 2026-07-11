@@ -339,8 +339,12 @@ direct-to-main.
 
 ## Dedicated workers (optional)
 
-By default assign any idle registered worker. Soft preferences only
-(\`assignee\` when a matching worker is registered):
+Use this when some sessions have tools others lack (laptop with local secrets,
+GPU, browser, or a running stack vs a cloud VM). Soft preferences only:
+list lanes below, open a role-focused worker with a clear \`display_name\`, and
+the director pins matching tasks with \`assignee\`.
+
+By default assign any idle registered worker:
 
 - *(none)* — example: prefer one worker for visual/art; prefer one for verify/playtest
 
@@ -374,6 +378,37 @@ function scaffold(path: string, content: string): void {
   process.stdout.write(`  wrote ${path}\n`);
 }
 
+function dualMcpConfigs(base: string, workerToken: string): { mcpEntry: object; cursorEntry: object } {
+  const mcpUrl = `${base}/mcp`;
+  const mcpEntry = {
+    mcpServers: {
+      showrunner: {
+        type: "http",
+        url: mcpUrl,
+        headers: { Authorization: `Bearer ${workerToken}` },
+      },
+      "showrunner-director": {
+        type: "http",
+        url: mcpUrl,
+        headers: { Authorization: "Bearer ${SHOWRUNNER_TOKEN}" },
+      },
+    },
+  };
+  const cursorEntry = {
+    mcpServers: {
+      showrunner: {
+        url: mcpUrl,
+        headers: { Authorization: `Bearer ${workerToken}` },
+      },
+      "showrunner-director": {
+        url: mcpUrl,
+        headers: { Authorization: "Bearer ${env:SHOWRUNNER_TOKEN}" },
+      },
+    },
+  };
+  return { mcpEntry, cursorEntry };
+}
+
 function cmdInit(argv: string[]): void {
   const { values } = parseArgs({
     args: argv,
@@ -382,58 +417,70 @@ function cmdInit(argv: string[]): void {
       url: { type: "string" },
       dir: { type: "string" },
       token: { type: "string" },
+      "worker-token": { type: "string" },
     },
     allowPositionals: false,
   });
   if (!values.show) throw new UsageError("init requires --show <name>");
   const dir = values.dir ?? process.cwd();
   const base = optionalUrl(values) ?? "https://<your-app>.fly.dev";
-  const mcpEntry = {
-    mcpServers: {
-      showrunner: {
-        type: "http",
-        url: `${base}/mcp`,
-        headers: { Authorization: "Bearer ${SHOWRUNNER_TOKEN}" },
-      },
-    },
-  };
-  const cursorEntry = {
-    mcpServers: {
-      showrunner: {
-        url: `${base}/mcp`,
-        headers: { Authorization: "Bearer ${env:SHOWRUNNER_TOKEN}" },
-      },
-    },
-  };
+  const directorToken = values.token ?? process.env.SHOWRUNNER_TOKEN;
+  const workerToken = values["worker-token"] ?? process.env.SHOWRUNNER_WORKER_TOKEN;
+  if (!directorToken) {
+    throw new UsageError(
+      "init requires the director token: set SHOWRUNNER_TOKEN or pass --token (goes in gitignored .env; never commit it)",
+    );
+  }
+  if (!workerToken) {
+    throw new UsageError(
+      "init requires the worker token: set SHOWRUNNER_WORKER_TOKEN or pass --worker-token (hardcoded into committed MCP configs)",
+    );
+  }
+  if (workerToken === directorToken) {
+    throw new UsageError(
+      "worker token must differ from director token; generate a separate SHOWRUNNER_WORKER_TOKEN on the server",
+    );
+  }
+
+  const { mcpEntry, cursorEntry } = dualMcpConfigs(base, workerToken);
 
   process.stdout.write(`initializing showrunner for show "${values.show}" in ${dir}\n`);
   scaffold(join(dir, ".showrunner"), values.show + "\n");
   scaffold(join(dir, "SHOWRUNNER.md"), PLAYBOOK_TEMPLATE);
   scaffold(join(dir, "SHOWRUNNER.rules.md"), RULES_TEMPLATE);
   scaffold(join(dir, ".mcp.json"), JSON.stringify(mcpEntry, null, 2) + "\n");
-  // Local convenience only: MCP config ${VAR} interpolation reads process env, not .env
-  // files, so this feeds shells/direnv/tooling. Never committed; .gitignore is amended.
-  const token = values.token ?? process.env.SHOWRUNNER_TOKEN;
-  if (token) {
-    scaffold(join(dir, ".env"), `SHOWRUNNER_TOKEN=${token}\nSHOWRUNNER_URL=${base}\n`);
-    const giPath = join(dir, ".gitignore");
-    const gi = existsSync(giPath) ? readFileSync(giPath, "utf8") : "";
-    if (!gi.split("\n").some((l) => l.trim() === ".env")) {
-      writeFileSync(giPath, gi + (gi.endsWith("\n") || gi === "" ? "" : "\n") + ".env\n");
-      process.stdout.write(`  added .env to ${giPath}\n`);
-    }
-  } else {
-    process.stdout.write("  skipped .env (no --token and SHOWRUNNER_TOKEN unset)\n");
+  // Director token only: MCP ${VAR} interpolation reads process env, not .env files,
+  // so this feeds shells/direnv/tooling for showrunner-director. Never committed.
+  scaffold(join(dir, ".env"), `SHOWRUNNER_TOKEN=${directorToken}\nSHOWRUNNER_URL=${base}\n`);
+  const giPath = join(dir, ".gitignore");
+  const gi = existsSync(giPath) ? readFileSync(giPath, "utf8") : "";
+  if (!gi.split("\n").some((l) => l.trim() === ".env")) {
+    writeFileSync(giPath, gi + (gi.endsWith("\n") || gi === "" ? "" : "\n") + ".env\n");
+    process.stdout.write(`  added .env to ${giPath}\n`);
   }
   mkdirSync(join(dir, ".cursor"), { recursive: true });
   scaffold(join(dir, ".cursor", "mcp.json"), JSON.stringify(cursorEntry, null, 2) + "\n");
+
+  const callboardQs = new URLSearchParams({ token: directorToken, show: values.show });
+  const callboard = `${base}/?${callboardQs.toString()}`;
   process.stdout.write(`
 next steps:
-  1. Fill in SHOWRUNNER.md (playbook) and edit SHOWRUNNER.rules.md (automation defaults), then commit.
-  2. Make sure SHOWRUNNER_TOKEN is set in the environment of every client
-     (shell env for local sessions, environment settings for cloud sessions).
-  3. Open the callboard: showrunner open
-  4. In any session in this repo: "You're a showrunner worker." / "You're the showrunner director."
+  1. Fill in SHOWRUNNER.md and edit SHOWRUNNER.rules.md, then commit
+     (.showrunner, playbook, rules, .mcp.json, .cursor/mcp.json — never .env).
+  2. Callboard (director token): ${callboard}
+  3. Director session (needs showrunner-director MCP + SHOWRUNNER_TOKEN in env):
+       You're the showrunner director.
+
+  Workers (anyone with the repo — no secrets; worker token is in committed MCP):
+       You're a showrunner worker.
+
+  Ways to run:
+    A. Simple fleet — one director + N general workers (default).
+    B. Dedicated lanes (optional) — edit SHOWRUNNER.rules.md "Dedicated workers",
+       then open role-focused sessions, e.g.:
+         You're a showrunner worker focused on art. Register display_name art.
+       Why: some sessions have tools others lack (laptop .env / GPU / browser /
+       local stack vs cloud). Director pins matching tasks with assignee.
 `);
 }
 
@@ -483,59 +530,35 @@ function cmdSnippets(argv: string[]): void {
     args: argv,
     options: {
       url: { type: "string" },
+      "worker-token": { type: "string" },
     },
     allowPositionals: false,
   });
   const base = optionalUrl(values) ?? "https://<your-app>.fly.dev";
   const mcpUrl = `${base}/mcp`;
+  const workerToken = values["worker-token"] ?? process.env.SHOWRUNNER_WORKER_TOKEN ?? "<WORKER_TOKEN>";
+  const { mcpEntry, cursorEntry } = dualMcpConfigs(base, workerToken);
 
-  const mcpJson = JSON.stringify(
-    {
-      mcpServers: {
-        showrunner: {
-          type: "http",
-          url: mcpUrl,
-          headers: { Authorization: "Bearer ${SHOWRUNNER_TOKEN}" },
-        },
-      },
-    },
-    null,
-    2,
-  );
+  const out = `# Dual-token MCP (commit worker Bearer; keep director in env)
 
-  const cursorJson = JSON.stringify(
-    {
-      mcpServers: {
-        showrunner: {
-          url: mcpUrl,
-          headers: { Authorization: "Bearer ${env:SHOWRUNNER_TOKEN}" },
-        },
-      },
-    },
-    null,
-    2,
-  );
+# Claude Code (local): worker MCP (or rely on committed .mcp.json)
+claude mcp add --transport http showrunner ${mcpUrl} --header "Authorization: Bearer ${workerToken}"
 
-  const out = `# Claude Code (local): one-time, user scope
-claude mcp add --transport http showrunner ${mcpUrl} --header "Authorization: Bearer $SHOWRUNNER_TOKEN"
+# Claude Code: committed .mcp.json
+# showrunner = hardcoded worker token; showrunner-director = \${SHOWRUNNER_TOKEN} from env
+${JSON.stringify(mcpEntry, null, 2)}
 
-# Claude Code (local or cloud): committed .mcp.json
-# \${SHOWRUNNER_TOKEN} is interpolated from the environment at connect time.
-${mcpJson}
-
-Claude Code cloud: commit the .mcp.json above, set SHOWRUNNER_TOKEN as an env var in the
-cloud environment's secrets, and add this server's host to the network allowlist. No OAuth
-in cloud sessions, bearer token only.
+Claude Code cloud: commit .mcp.json above. Workers need no cloud secret.
+Director sessions set SHOWRUNNER_TOKEN (director) in cloud env + allowlist the host.
 
 # Cursor (local): .cursor/mcp.json
-${cursorJson}
+${JSON.stringify(cursorEntry, null, 2)}
 
 Cursor 3.0+ required. Allowlist/auto-run the showrunner tools, or the poll loop stalls on
 approval prompts.
 
-Cursor cloud: config is dashboard-only (cursor.com/agents), not read from the repo. Paste the
-same URL and a hardcoded token there (no \${env:...} interpolation works in that surface as of
-Cursor 3.8). Treat Cursor-cloud workers as best-effort.
+Cursor cloud: dashboard-only as of 3.8 — paste URL + hardcoded *worker* token for workers;
+director sessions need the director token pasted (or Runtime Secret) separately.
 `;
   process.stdout.write(out);
 }
@@ -555,14 +578,15 @@ Usage:
                       [--url <url>] [--token <token>]
   showrunner direction clear --show <name> [--url <url>] [--token <token>]
   showrunner show delete --show <name> [--url <url>] [--token <token>]
-  showrunner init --show <name> [--url <url>] [--dir <path>] [--token <token>]
+  showrunner init --show <name> --url <url> --token <director> --worker-token <worker> [--dir <path>]
   showrunner open [--show <name>] [--url <url>] [--token <token>] [--print]
   showrunner instructions
-  showrunner snippets [--url <url>]
+  showrunner snippets [--url <url>] [--worker-token <token>]
 
 Env:
-  SHOWRUNNER_URL     base URL of the showrunner server (e.g. https://my-showrunner.fly.dev)
-  SHOWRUNNER_TOKEN   bearer token (required for status/task add/message)
+  SHOWRUNNER_URL            base URL (e.g. https://my-showrunner.fly.dev)
+  SHOWRUNNER_TOKEN          director/admin bearer (CLI admin + showrunner-director MCP)
+  SHOWRUNNER_WORKER_TOKEN   worker bearer (committed into MCP configs by init)
 `);
 }
 

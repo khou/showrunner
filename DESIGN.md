@@ -347,10 +347,13 @@ director translates intent into tasks. Manual escape hatches live in the
 CLI (`showrunner task add`, `message`, and the rest), which drives the
 same `/api` endpoints the callboard reads.
 
-Auth: `Authorization: Bearer` (or `?token=` once → cookie). One token, env
-`SHOWRUNNER_TOKEN`, gates /mcp and /api alike. v1 keeps a single token
-(documented risk: cloud env editors can see it; it's revocable by rotating
-the Fly secret).
+Auth: `Authorization: Bearer` (or `?token=` once → cookie). Two tokens:
+
+- `SHOWRUNNER_TOKEN` (required) — **director/admin**. Gates
+  `claim_direction` / `create_task` / `direct_task` and mutating `/api`.
+- `SHOWRUNNER_WORKER_TOKEN` (optional) — **worker**. When unset, equals the
+  director token (single-token fallback). Safe to commit into project MCP
+  configs so clones can register as workers without cloud secrets.
 
 ## Server & deploy
 
@@ -358,10 +361,11 @@ the Fly secret).
   HTTP, stateless mode), Hono for routing, better-sqlite3, Vitest.
 - **Fly.io:** `shared-cpu-1x`, one machine, `auto_stop_machines = "off"`
   (autostop + long-poll is exactly the wrong pair), 1GB volume mounted at
-  `/data` for SQLite. `fly launch && fly secrets set SHOWRUNNER_TOKEN=...`.
-- **Env knobs:** `SHOWRUNNER_TOKEN` (required), `PORT`, `DATA_DIR`,
-  `POLL_HOLD_SECONDS=25`, `WORKER_LEASE_S=90`, `TASK_LEASE_S=900`,
-  `DIRECTION_LEASE_S=600`, `NOTE_MAX_CHARS=2000`, `NOTES_PER_TASK=4`.
+  `/data` for SQLite. `fly secrets set SHOWRUNNER_TOKEN=... SHOWRUNNER_WORKER_TOKEN=...`.
+- **Env knobs:** `SHOWRUNNER_TOKEN` (required), `SHOWRUNNER_WORKER_TOKEN`
+  (optional), `PORT`, `DATA_DIR`, `POLL_HOLD_SECONDS=25`, `WORKER_LEASE_S=90`,
+  `TASK_LEASE_S=900`, `DIRECTION_LEASE_S=600`, `NOTE_MAX_CHARS=2000`,
+  `NOTES_PER_TASK=4`.
 - **Reclaim sweep:** one `setInterval` (5s) expires leases, requeues tasks,
   wakes relevant waiters. Restart-safe because all state is in SQLite.
 
@@ -369,18 +373,19 @@ the Fly secret).
 
 | Client | How | Notes |
 |---|---|---|
-| Claude Code local | `claude mcp add --transport http showrunner <url>/mcp --header "Authorization: Bearer $SHOWRUNNER_TOKEN"` (user scope) or committed `.mcp.json` with `${SHOWRUNNER_TOKEN}` | v2.1.2xx+; 25s poll needs zero timeout tuning |
-| Claude Code cloud | committed `.mcp.json` + env var in the cloud environment + network allowlist for the Fly domain | no OAuth in cloud; bearer only |
-| Cursor local | `.cursor/mcp.json` with `url` + `headers: {"Authorization": "Bearer ${env:SHOWRUNNER_TOKEN}"}` | 3.0+ required; allowlist/auto-run showrunner tools or the poll loop stalls on approval prompts |
-| Cursor cloud | cursor.com/agents dashboard MCP config, token hardcoded there | best-effort: env interpolation broken there, config ignored from repo (as of 3.8) |
+| Claude Code local/cloud | committed `.mcp.json`: hardcoded worker Bearer on `showrunner`; `${SHOWRUNNER_TOKEN}` on `showrunner-director` | workers need no env; director sessions set director token |
+| Cursor local | `.cursor/mcp.json` same split (`${env:SHOWRUNNER_TOKEN}` for director) | 3.0+; allowlist/auto-run tools |
+| Cursor cloud | dashboard MCP: paste URL + hardcoded *worker* token | best-effort; director needs director token separately (as of 3.8) |
 
-## Security posture (v1, honest)
+## Security posture
 
-Single shared bearer token; anyone with it can read/write every show on the
-deployment. Acceptable for one-person use; rotate via `fly secrets set`.
-Non-goals in v1: per-member tokens, show-level ACLs, task-content encryption.
-The server holds task titles/briefs and journals — keep secrets out of
-briefs; point at repo files instead (which also saves tokens).
+Dual bearer tokens. The worker token is intended to be committed so remote
+agents can join; anyone with it can register, pull tasks, and write notes on
+every show on the deployment, but cannot claim direction or mutate admin API.
+Keep the director token secret (`.env` / Fly secret / cloud Runtime Secret)
+and rotate via `fly secrets set`. Non-goals: per-member tokens, show-level
+ACLs, task-content encryption. Keep secrets out of task briefs; point at
+repo files instead.
 
 ## What v1 explicitly skips
 

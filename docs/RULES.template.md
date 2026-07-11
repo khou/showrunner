@@ -25,8 +25,12 @@ direct-to-main.
 
 ## Dedicated workers (optional)
 
-By default assign any idle registered worker. Soft preferences only
-(`assignee` when a matching worker is registered):
+Use this when some sessions have tools others lack (laptop with local secrets,
+GPU, browser, or a running stack vs a cloud VM). Soft preferences only: list
+lanes below, open a role-focused worker with a clear `display_name`, and the
+director pins matching tasks with `assignee`.
+
+By default assign any idle registered worker:
 
 - *(none)* — example: prefer one worker for visual/art; prefer one for verify/playtest
 

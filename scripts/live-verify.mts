@@ -5,11 +5,12 @@ import { homedir } from 'node:os'
 
 const URL_BASE = process.env.SR_URL ?? (() => { throw new Error('set SR_URL to your deployment, e.g. SR_URL=https://my-app.fly.dev') })()
 const TOKEN = process.env.SR_TOKEN ?? readFileSync(`${homedir()}/.showrunner-token`, 'utf8').trim()
+const WORKER_TOKEN = process.env.SR_WORKER_TOKEN
 
-async function connect(name: string) {
+async function connect(name: string, token: string = TOKEN) {
   const client = new Client({ name, version: '0.0.1' })
   await client.connect(new StreamableHTTPClientTransport(new URL(`${URL_BASE}/mcp`), {
-    requestInit: { headers: { Authorization: `Bearer ${TOKEN}` } },
+    requestInit: { headers: { Authorization: `Bearer ${token}` } },
   }))
   return client
 }
@@ -137,6 +138,21 @@ const page = await fetch(`${URL_BASE}/?token=${TOKEN}`, { redirect: 'follow' })
 ok('callboard page', page.status === 200 && (await page.text()).toLowerCase().includes('<html'))
 const unauth = await fetch(`${URL_BASE}/api/shows`)
 ok('unauth rejected', unauth.status === 401)
+
+if (WORKER_TOKEN) {
+  const workerOnly = await connect('worker-token-only', WORKER_TOKEN)
+  const regWo = await call(workerOnly, 'register', { show: SHOW, kind: 'other', display_name: 'worker-token probe' })
+  const forbidden = await call(workerOnly, 'claim_direction', { member_id: regWo.member_id, takeover: true })
+  ok('worker token cannot claim_direction', forbidden.status === 'forbidden', forbidden)
+  const apiWrite = await fetch(`${URL_BASE}/api/shows/${SHOW}/direction/clear`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${WORKER_TOKEN}` },
+  })
+  ok('worker token cannot mutate /api', apiWrite.status === 403)
+  await workerOnly.close()
+} else {
+  console.log('SKIP  worker-token checks (set SR_WORKER_TOKEN to exercise dual-token)')
+}
 
 await Promise.all([dir1, dir2, worker].map(c => c.close()))
 console.log('\nLive verify complete.')

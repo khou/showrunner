@@ -1,7 +1,6 @@
 // Entrypoint: env config, Store, Hono app (bearer auth, /mcp, /api, static callboard) and
 // the lease-reclaim sweep. See PLAN.md "HTTP routes" and "Env knobs" for the pinned contract.
 
-import { timingSafeEqual } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,7 +9,7 @@ import { serveStatic } from "@hono/node-server/serve-static";
 import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import { Hono, type MiddlewareHandler } from "hono";
 import { getCookie, setCookie } from "hono/cookie";
-import { readEnvConfig, type EnvConfig } from "../types.js";
+import { readEnvConfig, resolveAuthLevel, type AuthLevel, type EnvConfig } from "../types.js";
 import { createApiRoutes } from "./api.js";
 import { createMcpServer, createStatelessTransport } from "./mcp.js";
 import { Store } from "./store.js";
@@ -26,31 +25,34 @@ const webRoot = path.join(moduleDir, "..", "..", "web");
 
 const COOKIE_NAME = "showrunner_token";
 
-function timingSafeEqualStr(a: string, b: string): boolean {
-  const abuf = Buffer.from(a);
-  const bbuf = Buffer.from(b);
-  if (abuf.length !== bbuf.length) return false;
-  return timingSafeEqual(abuf, bbuf);
-}
+type AppVars = {
+  authLevel: AuthLevel;
+  presentedToken: string;
+};
 
 /**
  * Bearer auth for /mcp and /api: Authorization header, or ?token= which validates once, sets
  * an httpOnly cookie, and redirects to the same URL without the token (so it never sits in
- * browser history beyond the first hit).
+ * browser history beyond the first hit). Accepts director or worker token; sets authLevel.
  */
-function requireBearer(cfg: EnvConfig): MiddlewareHandler {
+function requireBearer(cfg: EnvConfig): MiddlewareHandler<{ Variables: AppVars; Bindings: HttpBindings }> {
   return async (c, next) => {
     const header = c.req.header("authorization");
     if (header) {
       const match = /^Bearer\s+(.+)$/i.exec(header);
-      if (match && timingSafeEqualStr(match[1], cfg.token)) return next();
-      return c.json({ error: "unauthorized" }, 401);
+      if (!match) return c.json({ error: "unauthorized" }, 401);
+      const level = resolveAuthLevel(match[1], cfg);
+      if (!level) return c.json({ error: "unauthorized" }, 401);
+      c.set("authLevel", level);
+      c.set("presentedToken", match[1]);
+      return next();
     }
 
     const queryToken = c.req.query("token");
     if (queryToken !== undefined) {
-      if (!timingSafeEqualStr(queryToken, cfg.token)) return c.json({ error: "unauthorized" }, 401);
-      setCookie(c, COOKIE_NAME, cfg.token, {
+      const level = resolveAuthLevel(queryToken, cfg);
+      if (!level) return c.json({ error: "unauthorized" }, 401);
+      setCookie(c, COOKIE_NAME, queryToken, {
         httpOnly: true,
         sameSite: "Lax",
         path: "/",
@@ -62,9 +64,29 @@ function requireBearer(cfg: EnvConfig): MiddlewareHandler {
     }
 
     const cookieToken = getCookie(c, COOKIE_NAME);
-    if (cookieToken && timingSafeEqualStr(cookieToken, cfg.token)) return next();
+    if (cookieToken) {
+      const level = resolveAuthLevel(cookieToken, cfg);
+      if (level) {
+        c.set("authLevel", level);
+        c.set("presentedToken", cookieToken);
+        return next();
+      }
+    }
 
     return c.json({ error: "unauthorized: pass Authorization: Bearer <token> or ?token=<token>" }, 401);
+  };
+}
+
+/** Mutating /api routes require the director token. */
+function requireDirectorApi(): MiddlewareHandler<{ Variables: AppVars; Bindings: HttpBindings }> {
+  return async (c, next) => {
+    if (c.req.method === "GET" || c.req.method === "HEAD" || c.req.method === "OPTIONS") {
+      return next();
+    }
+    if (c.get("authLevel") !== "director") {
+      return c.json({ error: "forbidden: director token required" }, 403);
+    }
+    return next();
   };
 }
 
@@ -78,8 +100,9 @@ function tokenCookieHandshake(cfg: EnvConfig): MiddlewareHandler {
   return async (c, next) => {
     const queryToken = c.req.query("token");
     if (queryToken === undefined) return next();
-    if (!timingSafeEqualStr(queryToken, cfg.token)) return c.json({ error: "unauthorized" }, 401);
-    setCookie(c, COOKIE_NAME, cfg.token, {
+    const level = resolveAuthLevel(queryToken, cfg);
+    if (!level) return c.json({ error: "unauthorized" }, 401);
+    setCookie(c, COOKIE_NAME, queryToken, {
       httpOnly: true,
       sameSite: "Lax",
       path: "/",
@@ -91,13 +114,12 @@ function tokenCookieHandshake(cfg: EnvConfig): MiddlewareHandler {
     // callboard JS stores it (so /api calls work) and strips it from the URL.
     // Preserve ?show= across the handshake so deep links keep working.
     const show = url.searchParams.get("show");
-    url.searchParams.delete("token");
     const showQs = show ? `?show=${encodeURIComponent(show)}` : url.search;
-    return c.redirect(`${url.pathname}${showQs}#token=${encodeURIComponent(cfg.token)}`, 302);
+    return c.redirect(`${url.pathname}${showQs}#token=${encodeURIComponent(queryToken)}`, 302);
   };
 }
 
-const app = new Hono<{ Bindings: HttpBindings }>();
+const app = new Hono<{ Bindings: HttpBindings; Variables: AppVars }>();
 
 app.get("/healthz", (c) => c.json({ ok: true }));
 
@@ -122,7 +144,7 @@ app.post("/mcp", async (c) => {
   // "Direct response from Node.js API").
   const transport = createStatelessTransport();
   try {
-    const server = createMcpServer(store, config);
+    const server = createMcpServer(store, { pollHoldSeconds: config.pollHoldSeconds, authLevel: c.get("authLevel") });
     await server.connect(transport);
     await transport.handleRequest(c.env.incoming, c.env.outgoing);
   } catch (err) {
@@ -136,6 +158,7 @@ app.post("/mcp", async (c) => {
 });
 
 app.use("/api/*", requireBearer(config));
+app.use("/api/*", requireDirectorApi());
 app.route("/api", createApiRoutes(store, dbPath));
 
 // The callboard shell carries no secrets (all data comes from the gated /api), so GET / is
@@ -155,7 +178,9 @@ const sweepTimer = setInterval(() => {
 }, config.sweepIntervalS * 1000);
 
 const httpServer = serve({ fetch: app.fetch, port: config.port }, (info) => {
-  console.log(`showrunner listening on :${info.port} (data: ${dbPath})`);
+  const mode =
+    config.workerToken === config.directorToken ? "single-token" : "dual-token (worker + director)";
+  console.log(`showrunner listening on :${info.port} (data: ${dbPath}, auth: ${mode})`);
 });
 
 function shutdown(): void {
