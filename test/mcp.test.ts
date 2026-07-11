@@ -503,3 +503,45 @@ describe("update_task drains unread messages (heartbeat delivery)", () => {
     expect(secondData.messages).toBeUndefined();
   });
 });
+
+describe("register warns when creating a new show that looks like a checkout of an existing one", () => {
+  it("suffixed checkout name gets similar_existing_shows and a warning", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    await callTool(client, "register", { show: "wavecrash", kind: "claude-local" });
+    const result = await callTool(client, "register", { show: "wavecrash-w2", kind: "claude-local" });
+    expect(result.data).toMatchObject({
+      show: "wavecrash-w2",
+      created_new_show: true,
+      similar_existing_shows: ["wavecrash"],
+    });
+    expect((result.data as { warning: string }).warning).toContain("wavecrash");
+  });
+
+  it("registering on an existing show never warns", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    await callTool(client, "register", { show: "wavecrash", kind: "claude-local" });
+    const result = await callTool(client, "register", { show: "wavecrash", kind: "claude-local" });
+    expect(result.data).not.toHaveProperty("warning");
+    expect(result.data).not.toHaveProperty("similar_existing_shows");
+  });
+
+  it("a genuinely different show name does not warn", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    await callTool(client, "register", { show: "wavecrash", kind: "claude-local" });
+    const result = await callTool(client, "register", { show: "wavecrash-analytics", kind: "claude-local" });
+    expect(result.data).not.toHaveProperty("warning");
+  });
+
+  it("copy/worktree/numeric suffixes all normalize to the base show", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    await callTool(client, "register", { show: "mygame", kind: "claude-local" });
+    for (const name of ["mygame-copy", "mygame_2", "mygame-worktree-fix", "mygame-wt1"]) {
+      const result = await callTool(client, "register", { show: name, kind: "claude-local" });
+      expect(result.data, name).toHaveProperty("similar_existing_shows");
+    }
+  });
+});

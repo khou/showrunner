@@ -256,6 +256,24 @@ function buildDirectTaskAction(args: {
   }
 }
 
+// "wavecrash-w2" and "wavecrash" are almost certainly the same project checked out
+// twice; warn at register so the agent can self-correct instead of starving on a
+// ghost show. Equality after suffix-stripping only: "wavecrash-analytics" is a
+// legitimately different show and must not warn.
+function stripCheckoutSuffix(name: string): string {
+  let s = name.toLowerCase();
+  for (;;) {
+    const t = s.replace(/[-_.](?:wt?\d*|worker\d*|copy\d*|clone\d*|worktree[\w-]*|tmp\d*|\d+)$/, "");
+    if (t === s || t.length === 0) return s;
+    s = t;
+  }
+}
+
+function similarShowNames(a: string, b: string): boolean {
+  if (a === b) return false;
+  return stripCheckoutSuffix(a) === stripCheckoutSuffix(b);
+}
+
 export function createMcpServer(store: Store, config: McpServerConfig): McpServer {
   const server = new McpServer({ name: "showrunner", version: "0.1.0" }, { instructions: INSTRUCTIONS });
 
@@ -264,7 +282,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     {
       description: "Join a show as a new member; returns member_id and the worker/director protocol.",
       inputSchema: {
-        show: z.string().min(1).describe("Show name; by convention the repo name (git origin basename, else directory name) unless the user names one explicitly."),
+        show: z.string().min(1).describe("Show name. Priority: user-named, else .showrunner file at repo root, else git origin basename, else directory name."),
         kind: MEMBER_KIND,
         display_name: z.string().optional(),
         capabilities: z.array(z.string()).optional(),
@@ -273,6 +291,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       },
     },
     async (args) => {
+      const preexisting = store.showNames();
       const member = store.register(
         args.show,
         args.kind,
@@ -283,7 +302,25 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       );
       const board_summary = store.getBoard(member.show);
       const director = store.directionState(member.show).directorId ?? null;
-      return jsonResult({ member_id: member.id, show: member.show, director, board_summary, protocol: INSTRUCTIONS });
+      const result: Record<string, unknown> = {
+        member_id: member.id,
+        show: member.show,
+        director,
+        board_summary,
+        protocol: INSTRUCTIONS,
+      };
+      if (!preexisting.includes(member.show)) {
+        const similar = preexisting.filter((s) => similarShowNames(s, member.show));
+        if (similar.length > 0) {
+          result.created_new_show = true;
+          result.similar_existing_shows = similar;
+          result.warning =
+            `You created brand-new show "${member.show}", but similar show(s) already exist: ${similar.join(", ")}. ` +
+            `Checkout directories often carry suffixes (-w1, -copy, worktrees); if this session belongs to one of those shows, ` +
+            `register again with that name and use the new member_id.`;
+        }
+      }
+      return jsonResult(result);
     },
   );
 

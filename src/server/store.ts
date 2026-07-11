@@ -527,6 +527,13 @@ export class Store {
     });
   }
 
+  showNames(): string[] {
+    return this.db
+      .prepare("SELECT name FROM shows ORDER BY name")
+      .all()
+      .map((r) => (r as { name: string }).name);
+  }
+
   touchMember(memberId: string): Member | undefined {
     return this.txn(() => {
       const row = this.getMemberRowRaw(memberId);

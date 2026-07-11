@@ -87,6 +87,13 @@ drives the same `/api` the callboard reads. Shows:
 
 ## How it works
 
+- The show name a session joins resolves in priority order: user-named in
+  the prompt, else a committed one-line `.showrunner` file at the repo root,
+  else the git origin basename, else the directory name. Registering a NEW
+  show whose name looks like a checkout of an existing one (`mygame-w2`,
+  `mygame-copy`) returns `similar_existing_shows` plus a warning, and the
+  protocol tells the agent to re-register on the existing show. Multi-checkout
+  and worktree setups should commit `.showrunner` to make this a non-issue.
 - State is one SQLite file (`better-sqlite3`, WAL) on a Fly volume. Nothing
   else is stateful.
 - Every claim is a lease with a TTL: worker liveness, task ownership,

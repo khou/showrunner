@@ -54,6 +54,10 @@ Open a second one and say:
 
 > "You're the showrunner director."
 
+The show name comes from the repo: a committed one-line `.showrunner` file
+if present, else the git remote or directory name. If your checkouts carry
+suffixed names (`mygame-w2`, worktrees), pin it: `echo mygame > .showrunner`.
+
 See [DESIGN.md](DESIGN.md) for why it's built this way, and
 [docs/OPERATING.md](docs/OPERATING.md) for everything operational: client
 setup, the callboard tour, shared notes, env knobs, the CLI, verifying a

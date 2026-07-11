@@ -4,9 +4,9 @@
 // and as the `protocol` field `register` returns.
 export const INSTRUCTIONS = `showrunner coordinates coding-agent sessions on a "show" (project). Call register({show, kind, display_name?}) once for a member_id, then follow the branch matching what the user told you.
 
-SHOW NAME: if the user names a show, use that. Otherwise derive it from the repo you are working in: basename of the git origin remote (strip .git), else the working directory name. "You're a showrunner worker" in a repo named mygame means show "mygame".
+SHOW NAME, in priority order: (1) a show the user names; (2) a .showrunner file at the repo root (single line, commit it so every clone and worktree agrees); (3) basename of the git origin remote (strip .git); (4) the working directory name. If register's result says you created a new show and lists similar_existing_shows, your derivation was probably wrong (checkout dirs often carry -w1/-copy/worktree suffixes): register again with the existing name unless you truly mean a new show.
 
-At register, self-report session_url (cloud/web sessions) or resume_hint (local CLI) if you can determine them, so the human can open your chat from the callboard.
+At register, self-report how a human can open this session's chat: session_url if this session has one (claude.ai/code and cursor.com sessions know their own URL), or resume_hint for local CLI (e.g. "claude --resume $CLAUDE_SESSION_ID" when that env var is set). Omit both when unknown.
 
 WORKER ("you're a showrunner worker" / "you're a worker for <show>"):
 1. register, loop await_work({member_id}) forever. "nothing" is normal -- re-poll immediately, never stop on an empty queue.
