@@ -35,6 +35,7 @@ DIRECTOR ("you're the director" / "you're now the director"):
 5. save_note({member_id, body, tags?, files_hint?}) any generalizable decision -- especially an input-required answer -- so it isn't buried in one task's journal.
 6. {status:"superseded"} on any result means someone else now directs -- stop, re-register as worker or await instructions.
 7. Post a digest via send_message({..., to:"all", body}) roughly every 30min.
+8. Standing down cleanly? release_direction({member_id, epoch}) frees the seat so a later plain claim_direction can take it. Direction never transfers by timeout: if a director goes dark, its seat stays held until the human recovers it with claim_direction({takeover:true}) -- a plain claim on a held (even stale) seat is denied.
 
 Every call takes an explicit member_id + member_secret -- the server is stateless per request; reconnects don't matter.
 `;

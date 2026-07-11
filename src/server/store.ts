@@ -11,6 +11,9 @@ import {
   type Member,
   type MemberKind,
   type MemberRole,
+  type DirectionEvent,
+  type DirectionMethod,
+  type DirectionProvenance,
   type Message,
   type MessageKind,
   type MessageTarget,
@@ -72,6 +75,16 @@ CREATE TABLE IF NOT EXISTS direction (
   epoch INTEGER NOT NULL DEFAULT 0,
   lease_expires_at INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS direction_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  show TEXT NOT NULL REFERENCES shows(name),
+  actor TEXT NOT NULL,
+  method TEXT NOT NULL,
+  epoch INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS direction_events_show_idx ON direction_events(show, created_at);
 
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
@@ -305,6 +318,15 @@ interface DirectionRow {
   director_id: string | null;
   epoch: number;
   lease_expires_at: number;
+}
+
+interface DirectionEventRow {
+  id: number;
+  show: string;
+  actor: string;
+  method: string;
+  epoch: number;
+  created_at: number;
 }
 
 // task_notes: a task's append-only journal (TaskNote). Not to be confused with NoteRow below,
@@ -744,6 +766,7 @@ export class Store {
       this.db.prepare("DELETE FROM tasks WHERE show = ?").run(show);
       this.db.prepare("DELETE FROM members WHERE show = ?").run(show);
       this.db.prepare("DELETE FROM direction WHERE show = ?").run(show);
+      this.db.prepare("DELETE FROM direction_events WHERE show = ?").run(show);
       this.db.prepare("DELETE FROM show_rules WHERE show = ?").run(show);
       this.db.prepare("DELETE FROM shows WHERE name = ?").run(show);
       // Parked polls of deleted members resolve on their next check with unknown_member.
@@ -776,6 +799,7 @@ export class Store {
     const now = this.now();
     const dir = this.getDirectionRow(show);
     const directorMemberRow = dir?.director_id ? this.getMemberRowRaw(dir.director_id) : undefined;
+    const provenance = dir && dir.director_id ? this.directionProvenance(show, dir.director_id, dir.epoch) : undefined;
     const director =
       dir && dir.director_id
         ? {
@@ -785,6 +809,7 @@ export class Store {
             stale: dir.lease_expires_at < now,
             ...(directorMemberRow?.session_url ? { sessionUrl: directorMemberRow.session_url } : {}),
             ...(directorMemberRow?.resume_hint ? { resumeHint: directorMemberRow.resume_hint } : {}),
+            ...(provenance ? { provenance } : {}),
           }
         : null;
 
@@ -869,16 +894,33 @@ export class Store {
 
   // --- direction ---
 
+  private recordDirectionEvent(show: string, actor: string, method: DirectionMethod, epoch: number, at: number): void {
+    this.db
+      .prepare("INSERT INTO direction_events (show, actor, method, epoch, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run(show, actor, method, epoch, at);
+  }
+
+  /**
+   * Claim (or take over) the direction seat.
+   *
+   * Non-takeover: succeeds ONLY when the seat is unheld (never claimed, explicitly released, or
+   * admin-cleared -> director_id IS NULL) or the caller already holds it (renewal). A merely
+   * expired lease does NOT open the seat -- expiry is a liveness signal (callboard staleness,
+   * headless show), never a claimability signal, so authority never transfers implicitly by
+   * timeout. takeover:true is the explicit human-authority path and displaces any holder
+   * unconditionally. Every successful claim bumps epoch and writes an audit event.
+   */
   claimDirection(memberId: string, takeover = false): ClaimDirectionResult {
     return this.txn(() => {
       const member = this.getMemberRowRaw(memberId);
       if (!member) throw new Error(`unknown member: ${memberId}`);
       const now = this.now();
       const dir = this.getDirectionRow(member.show)!;
-      const currentValid = dir.director_id !== null && dir.lease_expires_at > now;
+      const unheld = dir.director_id === null;
+      const isSelf = dir.director_id === memberId;
       const isNewHolder = dir.director_id !== memberId;
 
-      if (takeover || !currentValid || dir.director_id === memberId) {
+      if (takeover || unheld || isSelf) {
         const newEpoch = dir.epoch + 1;
         this.db
           .prepare("UPDATE direction SET director_id = ?, epoch = ?, lease_expires_at = ? WHERE show = ?")
@@ -893,11 +935,42 @@ export class Store {
           // replay the show's entire done-history in its first await_work.
           this.db.prepare("UPDATE members SET review_cursor = ? WHERE id = ?").run(now, memberId);
         }
+        // Audit: takeover only when actually displacing a *different* holder; a takeover of an
+        // unheld seat or a self-renewal is a plain claim.
+        const method: DirectionMethod = takeover && dir.director_id !== null && !isSelf ? "takeover" : "claimed";
+        this.recordDirectionEvent(member.show, memberId, method, newEpoch, now);
         return { ok: true, epoch: newEpoch };
       }
 
+      // Seat is held by someone else and this is not a takeover: denied, even if the lease is
+      // stale. The caller must use takeover:true (human authority) or wait for a release.
       const holder = mapMember(this.getMemberRowRaw(dir.director_id!)!);
       return { ok: false, holder, epoch: dir.epoch };
+    });
+  }
+
+  /**
+   * The current director explicitly gives up the seat (epoch-fenced). Creates the legitimate
+   * "given up" state a later plain claim can take. Throws SupersededError if the caller is not the
+   * current holder at `epoch`. Bumps epoch, clears the holder, demotes to worker, records an audit
+   * event, and wakes the show so headless workers keep draining. Returns the new (unheld) epoch.
+   */
+  releaseDirection(memberId: string, epoch: number): { epoch: number } {
+    return this.txn(() => {
+      const member = this.getMemberRowRaw(memberId);
+      if (!member) throw new Error(`unknown member: ${memberId}`);
+      // checkEpoch throws SupersededError unless memberId is the current holder at this epoch.
+      this.checkEpoch(member.show, memberId, epoch);
+      const now = this.now();
+      const dir = this.getDirectionRow(member.show)!;
+      const newEpoch = dir.epoch + 1;
+      this.db
+        .prepare("UPDATE direction SET director_id = NULL, epoch = ?, lease_expires_at = ? WHERE show = ?")
+        .run(newEpoch, now, member.show);
+      this.db.prepare("UPDATE members SET role = 'worker' WHERE id = ?").run(memberId);
+      this.recordDirectionEvent(member.show, memberId, "released", newEpoch, now);
+      this.events.emit(`wake:show:${member.show}`);
+      return { epoch: newEpoch };
     });
   }
 
@@ -912,10 +985,33 @@ export class Store {
       if (dir.director_id) {
         this.db.prepare("UPDATE members SET role = 'worker' WHERE id = ?").run(dir.director_id);
       }
+      const newEpoch = dir.epoch + 1;
       this.db
-        .prepare("UPDATE direction SET director_id = NULL, epoch = epoch + 1, lease_expires_at = ? WHERE show = ?")
-        .run(now, show);
+        .prepare("UPDATE direction SET director_id = NULL, epoch = ?, lease_expires_at = ? WHERE show = ?")
+        .run(newEpoch, now, show);
+      this.recordDirectionEvent(show, "human", "admin_clear", newEpoch, now);
+      this.events.emit(`wake:show:${show}`);
     });
+  }
+
+  /** Direction audit log for a show, newest-last. */
+  directionEvents(show: string): DirectionEvent[] {
+    const rows = this.db
+      .prepare("SELECT * FROM direction_events WHERE show = ? ORDER BY id ASC")
+      .all(show) as DirectionEventRow[];
+    return rows.map((r) => ({ method: r.method as DirectionMethod, actor: r.actor, epoch: r.epoch, at: r.created_at }));
+  }
+
+  /** How the current holder got the seat: the acquiring event (claimed|takeover) at the current
+   * epoch. Returns undefined if there's no holder or no matching event (e.g. pre-audit rows). */
+  private directionProvenance(show: string, directorId: string, epoch: number): DirectionProvenance | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM direction_events WHERE show = ? AND actor = ? AND epoch = ? AND method IN ('claimed', 'takeover') ORDER BY id DESC LIMIT 1",
+      )
+      .get(show, directorId, epoch) as DirectionEventRow | undefined;
+    if (!row) return undefined;
+    return { method: row.method as DirectionMethod, actor: row.actor, epoch: row.epoch, at: row.created_at };
   }
 
   getReviewCursor(memberId: string): number {
@@ -1593,10 +1689,20 @@ export class Store {
         }
       }
 
+      // Expired direction is a liveness signal only: the holder STAYS held (director_id
+      // untouched), so a plain claim by anyone else still fails -- authority never transfers by
+      // timeout. We only note the expiry in the audit log, once per holding (idempotent on the
+      // current epoch), so provenance/history shows when a seat went stale.
       const expiredDirectionRows = this.db
-        .prepare("SELECT show FROM direction WHERE director_id IS NOT NULL AND lease_expires_at < ?")
-        .all(now) as { show: string }[];
+        .prepare("SELECT show, director_id, epoch FROM direction WHERE director_id IS NOT NULL AND lease_expires_at < ?")
+        .all(now) as { show: string; director_id: string; epoch: number }[];
       const expiredDirectionShows = expiredDirectionRows.map((d) => d.show);
+      for (const d of expiredDirectionRows) {
+        const already = this.db
+          .prepare("SELECT 1 FROM direction_events WHERE show = ? AND epoch = ? AND method = 'expired' LIMIT 1")
+          .get(d.show, d.epoch);
+        if (!already) this.recordDirectionEvent(d.show, d.director_id, "expired", d.epoch, now);
+      }
 
       for (const show of showsTouched) this.events.emit(`wake:show:${show}`);
 

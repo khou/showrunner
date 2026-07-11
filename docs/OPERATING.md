@@ -122,6 +122,14 @@ decomposing *this* project (advisory). Sessions may fan out subagents freely.
   leases and requeues their tasks; nothing is trusted to say goodbye.
 - Director-only calls carry an `epoch` integer; the server bumps it on every
   claim and rejects stale epochs. That's the entire fencing mechanism.
+- **Direction never transfers by timeout.** An expired direction lease is a
+  liveness signal only (the callboard shows the holder stale); it does not open
+  the seat. A plain `claim_direction` succeeds only if the seat is unheld
+  (nobody claimed it, the holder called `release_direction`, or the human
+  cleared it) or you already hold it. To displace a live-or-stale holder, the
+  human uses `claim_direction` with `takeover:true`. Every transition is audited
+  (`claimed | released | takeover | admin_clear | expired`) and the current
+  holder's provenance shows on the board and callboard.
 - Workers can't receive pushes (cloud sessions are outbound-only), so
   `await_work` is a long-poll: it blocks up to `POLL_HOLD_SECONDS` (default
   25, chosen to clear Cursor/Fly/Claude Code's independent ~60s connection
@@ -309,9 +317,10 @@ The controls, strongest first:
    `member_id` on every call (the DB stores only its hash). `member_id` is a
    board handle, not a credential, so one member can't act as another.
 2. **Human release gate** (the show's `requireTaskRelease` rule, on). Director-
-   created tasks are withheld until a human releases them on the callboard -- the
-   check against a malicious/compromised director. Fleet rules are server-held
-   per-show state (not a repo file), edited via `update_rules` / the callboard.
+   created tasks are withheld until a human releases them with `showrunner task
+   release` (the read-only callboard only badges them) -- the check against a
+   malicious/compromised director. Fleet rules are server-held per-show state
+   (not a repo file), edited via `update_rules` / `showrunner rules set`.
 3. **Runtime containment** (not enforced by showrunner). Run untrusted workers
    with repo-scoped filesystem access, a network allowlist, and no host
    secrets. This is the real boundary against host exfiltration; showrunner

@@ -164,6 +164,25 @@ export interface DirectionState {
   leaseExpiresAt?: number;
 }
 
+/**
+ * How a direction transition happened, for the audit log. `claimed` = took an unheld seat (or a
+ * renewal by the same holder); `takeover` = displaced a different live-or-stale holder (the
+ * explicit human-authority path); `released` = the holder gave the seat up; `admin_clear` = the
+ * human cleared it via the API; `expired` = the lease lapsed (liveness only -- this NEVER opens
+ * the seat for a plain claim, it just marks the holder stale).
+ */
+export type DirectionMethod = "claimed" | "released" | "takeover" | "admin_clear" | "expired";
+
+export interface DirectionEvent {
+  method: DirectionMethod;
+  actor: string;
+  epoch: number;
+  at: number;
+}
+
+/** How the current holder got the seat, surfaced on the board so a human can see provenance. */
+export type DirectionProvenance = DirectionEvent;
+
 export type ClaimDirectionResult = { ok: true; epoch: number } | { ok: false; holder: Member; epoch: number };
 
 export interface SweepResult {
@@ -207,7 +226,16 @@ export interface BoardTaskView {
 export interface BoardState {
   show: string;
   director:
-    | { memberId: string; epoch: number; leaseExpiresAt: number; stale: boolean; sessionUrl?: string; resumeHint?: string }
+    | {
+        memberId: string;
+        epoch: number;
+        leaseExpiresAt: number;
+        stale: boolean;
+        sessionUrl?: string;
+        resumeHint?: string;
+        // How this holder got the seat (method + when), from the direction audit log.
+        provenance?: DirectionProvenance;
+      }
     | null;
   members: BoardMemberView[];
   taskCounts: Record<TaskStatus, number>;

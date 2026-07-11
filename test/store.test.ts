@@ -377,14 +377,41 @@ describe("direction: CAS, takeover, stale epoch", () => {
     expect(takeover).toEqual({ ok: true, epoch: 2 });
   });
 
-  it("claim succeeds again once the lease has expired", () => {
+  it("an expired lease does NOT open the seat for a plain claim (no implicit transfer by timeout)", () => {
     const { store, clock } = newStore();
     const a = store.register("myshow", "claude-local");
     const b = store.register("myshow", "claude-local");
     store.claimDirection(a.id);
-    clock.t += 600_001; // past default DIRECTION_LEASE_S (600s)
+    clock.t += 600_001; // past default DIRECTION_LEASE_S (600s): a's lease is now stale
     const result = store.claimDirection(b.id);
-    expect(result).toEqual({ ok: true, epoch: 2 });
+    expect(result.ok).toBe(false); // still held by a; staleness is liveness-only
+    if (!result.ok) expect(result.holder.id).toBe(a.id);
+    // b must use takeover (human authority) to displace a stale holder.
+    expect(store.claimDirection(b.id, true)).toEqual({ ok: true, epoch: 2 });
+  });
+
+  it("release_direction opens the seat so a later plain claim succeeds", () => {
+    const { store } = newStore();
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
+    store.claimDirection(a.id); // epoch 1
+    const released = store.releaseDirection(a.id, 1); // a stands down
+    expect(released.epoch).toBe(2);
+    expect(store.directionState("myshow").directorId).toBeUndefined();
+    expect(store.getBoard("myshow").members.find((m) => m.id === a.id)!.role).toBe("worker");
+    // Now the seat is unheld; b's plain claim (no takeover) succeeds.
+    expect(store.claimDirection(b.id)).toEqual({ ok: true, epoch: 3 });
+  });
+
+  it("release_direction is epoch-fenced: a non-holder or stale epoch is rejected", () => {
+    const { store } = newStore();
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
+    store.claimDirection(a.id); // a holds epoch 1
+    expect(() => store.releaseDirection(b.id, 1)).toThrow(SupersededError); // b isn't the holder
+    expect(() => store.releaseDirection(a.id, 99)).toThrow(SupersededError); // wrong epoch
+    // a is still the director; nothing changed.
+    expect(store.directionState("myshow").directorId).toBe(a.id);
   });
 
   it("checkEpoch throws SupersededError with the new holder once superseded", () => {
@@ -470,6 +497,57 @@ describe("clearDirection", () => {
     store.register("myshow", "claude-local");
     expect(() => store.clearDirection("myshow")).not.toThrow();
     expect(store.directionState("myshow").directorId).toBeUndefined();
+  });
+});
+
+describe("direction audit + provenance", () => {
+  it("records an event per transition with actor, method, and epoch", () => {
+    const { store } = newStore();
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
+    store.claimDirection(a.id); // claimed @1
+    store.releaseDirection(a.id, 1); // released @2
+    store.claimDirection(b.id); // claimed @3 (unheld seat)
+    store.claimDirection(a.id, true); // takeover @4 (displaces b)
+    store.clearDirection("myshow"); // admin_clear @5
+
+    const events = store.directionEvents("myshow").map((e) => ({ actor: e.actor, method: e.method, epoch: e.epoch }));
+    expect(events).toEqual([
+      { actor: a.id, method: "claimed", epoch: 1 },
+      { actor: a.id, method: "released", epoch: 2 },
+      { actor: b.id, method: "claimed", epoch: 3 },
+      { actor: a.id, method: "takeover", epoch: 4 },
+      { actor: "human", method: "admin_clear", epoch: 5 },
+    ]);
+  });
+
+  it("surfaces the current holder's provenance on the board", () => {
+    const { store, clock } = newStore();
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
+    store.claimDirection(a.id);
+    clock.t += 1000;
+    store.claimDirection(b.id, true); // takeover @2
+
+    const board = store.getBoard("myshow");
+    expect(board.director?.memberId).toBe(b.id);
+    expect(board.director?.provenance).toMatchObject({ method: "takeover", actor: b.id, epoch: 2, at: clock.t });
+  });
+
+  it("sweep logs an expired event once per holding, without opening the seat", () => {
+    const { store, clock } = newStore();
+    const a = store.register("myshow", "claude-local");
+    const b = store.register("myshow", "claude-local");
+    store.claimDirection(a.id); // epoch 1
+    clock.t += 600_001; // a's direction lease expires
+    store.sweep();
+    store.sweep(); // idempotent: still one expired event at epoch 1
+
+    const expired = store.directionEvents("myshow").filter((e) => e.method === "expired");
+    expect(expired).toHaveLength(1);
+    expect(expired[0]).toMatchObject({ actor: a.id, epoch: 1 });
+    // The seat is still held (staleness is liveness-only): a plain claim by b still fails.
+    expect(store.claimDirection(b.id).ok).toBe(false);
   });
 });
 

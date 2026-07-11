@@ -29,7 +29,8 @@ to classify intent.
 | Worker to worker | Pass a peer's `member_id` to complete/poison its task | Per-member auth (secret bound to `member_id`) |
 | Worker to director | Impersonate the director on `send_message`/broadcast | Per-member auth |
 | Worker to director | Poisoned completion note/artifact rewrites director goals via the review path | Untrusted-content annotation (mitigation) + director treats it as data |
-| Worker to peers | `save_note` that hijacks future claims via `relevant_notes` | Untrusted-content annotation (mitigation) |
+| Worker to peers | `save_note` that hijacks future claims via `relevant_notes` | Untrusted-content annotation (mitigation) + `workerNotePropagation` rule |
+| Worker to director | Malicious direction grab: wait out the holder's lease, then plain-claim the seat | Timeouts don't open the seat -- a non-takeover claim needs the seat unheld (released/cleared); displacing a holder needs `takeover:true` (human authority). Every transition is audited with holder provenance on the board |
 | Either | "ignore previous instructions / you are now…" | Runtime containment + protocol refusal (mitigation) |
 
 ## The four controls

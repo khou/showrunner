@@ -782,6 +782,59 @@ describe("update_rules (server-held rules mutation)", () => {
   });
 });
 
+describe("release_direction + timeout no longer opens the seat", () => {
+  it("is director-token gated", async () => {
+    const { store } = newStore();
+    const workerClient = await connectClient(store, { ...FAST_CONFIG, authLevel: "worker" });
+    const reg = await callTool(workerClient, "register", { show: "myshow", kind: "claude-local" });
+    const { member_id, member_secret } = reg.data as { member_id: string; member_secret: string };
+    const res = await callTool(workerClient, "release_direction", { member_id, member_secret, epoch: 1 });
+    expect(res.isError).toBe(true);
+    expect(res.data).toMatchObject({ status: "forbidden", reason: "director token required" });
+  });
+
+  it("is epoch-fenced: a stale caller gets superseded", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const a = reg(store, "myshow");
+    const b = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: a.id, member_secret: a.secret });
+    store.claimDirection(b.id, true); // a is now stale at epoch 1
+    const res = await callTool(client, "release_direction", { member_id: a.id, member_secret: a.secret, epoch: 1 });
+    expect(res.data).toMatchObject({ status: "superseded", epoch: 2 });
+  });
+
+  it("release opens the seat for a later plain claim; a stale lease does not", async () => {
+    const { store, clock } = newStore();
+    const client = await connectClient(store);
+    const a = reg(store, "myshow");
+    const b = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: a.id, member_secret: a.secret }); // epoch 1
+
+    // Lease expiry alone: b's plain claim is denied with a hint pointing at takeover/release.
+    clock.t += 600_001;
+    const denied = await callTool(client, "claim_direction", { member_id: b.id, member_secret: b.secret });
+    expect(denied.data).toMatchObject({ status: "denied" });
+    expect((denied.data as { hint: string }).hint).toMatch(/takeover|release/);
+
+    // a releases; now b's plain claim succeeds.
+    const rel = await callTool(client, "release_direction", { member_id: a.id, member_secret: a.secret, epoch: 1 });
+    expect(rel.data).toMatchObject({ status: "released", epoch: 2 });
+    const claimed = await callTool(client, "claim_direction", { member_id: b.id, member_secret: b.secret });
+    expect(claimed.data).toMatchObject({ status: "claimed", epoch: 3 });
+  });
+
+  it("takeover still displaces a live-or-stale holder", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const a = reg(store, "myshow");
+    const b = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: a.id, member_secret: a.secret });
+    const takeover = await callTool(client, "claim_direction", { member_id: b.id, member_secret: b.secret, takeover: true });
+    expect(takeover.data).toMatchObject({ status: "claimed", epoch: 2 });
+  });
+});
+
 describe("register delivers current rules as authenticated policy", () => {
   it("includes the full rules and a director-policy trust tag", async () => {
     const { store } = newStore();

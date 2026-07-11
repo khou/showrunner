@@ -28,7 +28,7 @@ prior system ships.
 
 Deliberately **not**: a runner UI, a worktree manager, an A2A node, a product.
 State is one SQLite file; the dashboard is one static page; the tool surface
-is 11 tools.
+is 12 tools.
 
 ## Constraints that shaped the design (research findings)
 
@@ -96,6 +96,7 @@ members    { id PK, show, kind, display_name, role, registered_at,
              last_seen_at, lease_expires_at, current_task_id, secret_hash,
              rules_version_seen }
 direction  { show PK, director_id, epoch, lease_expires_at }   -- one row per show
+direction_events { id PK, show, actor, method, epoch, created_at }  -- audit log
 tasks      { id PK, show, context_id, title, brief, files_hint_json,
              depends_on_json, priority, status, assignee, attempt,
              created_by, lease_expires_at, artifacts_json, released,
@@ -132,8 +133,9 @@ queued ──▶ assigned ──▶ working ──▶ completed
   honors a pinned `assignee` if the director set one).
 - **Release gate:** when the show's `requireTaskRelease` rule is on, `create_task`
   inserts the task with `released = 0`; it stays `queued` but is not claimable
-  until a human releases it (`POST /api/.../release`, or the callboard Release
-  button). Off by default (the `REQUIRE_TASK_RELEASE` env sets the seed default
+  until a human releases it (`showrunner task release`, i.e. `POST
+  /api/.../release`; the callboard is read-only and only badges it PENDING
+  RELEASE). Off by default (the `REQUIRE_TASK_RELEASE` env sets the seed default
   for new shows), so OOTB automation is unchanged; the security lever for
   untrusted workers (see Security posture).
 - `input-required` is distinct from `failed` on purpose: it means "a decision
@@ -148,7 +150,7 @@ queued ──▶ assigned ──▶ working ──▶ completed
 |---|---|---|---|
 | worker | 90s | any tool call by that member (polling is the heartbeat) | member shown stale on callboard; an `input-required` task assigned to it requeues (it's supposed to still be polling while blocked) |
 | task | 15 min | `update_task` (status/note/heartbeat) by assignee | task requeues, `attempt`+1, journal preserved |
-| direction | 10 min | any tool call by the director | show runs headless: workers keep draining the queue; callboard shows "no director"; nothing self-promotes |
+| direction | 10 min | any tool call by the director | liveness only: callboard shows the holder stale and the show effectively headless, but the seat stays held -- expiry never lets anyone else claim it (see "Direction") |
 
 A worker's `assigned`/`working` task is reaped **only** by the task lease, never by the
 worker lease alone: a worker heads-down executing may not touch any tool for long stretches
@@ -163,20 +165,35 @@ server) and the human appoints a new one with one sentence.
 
 ### Direction: election, transfer, fencing
 
-One row per show: `{director_id, epoch, lease_expires_at}`.
+One row per show: `{director_id, epoch, lease_expires_at}`, plus an append-only
+`direction_events` audit log.
 
-- `claim_direction` is a compare-and-swap: succeeds if the lease is expired,
-  unheld, or the caller already holds it — and always bumps `epoch`.
-- `claim_direction(takeover: true)` succeeds unconditionally (the human said
-  "you're now the leader"; the human is the authority — there is exactly one
-  human).
-- Every director-only tool takes the caller's `epoch`; the server rejects
-  stale epochs with a structured error: `superseded: you are no longer
-  director of <show>; <new-id> holds epoch <n>. Re-register as a worker or
-  await instructions.` That error is how "the pool figures it out amongst
-  themselves": the old director demotes itself on its next call, no gossip
-  protocol needed. The server is the sole arbiter, so fencing is one integer
-  compare.
+**Authority never transfers implicitly by timeout.** A non-takeover
+`claim_direction` succeeds only when the seat is *unheld* -- never claimed,
+explicitly released, or admin-cleared (`director_id IS NULL`) -- or when the
+caller already holds it (renewal). A merely expired lease does **not** open the
+seat: expiry keeps its liveness effects (callboard staleness, effectively
+headless show) but the recorded holder stays put, so no one else can plain-claim
+it. This closes the "wait out the lease, then grab the seat" path.
+
+Three ways the seat legitimately changes hands, all explicit:
+
+- `release_direction({epoch})` — the current holder stands down (epoch-fenced),
+  clearing the holder and creating the unheld state a later plain claim can take.
+- `claim_direction(takeover: true)` — succeeds unconditionally; the explicit
+  human-authority recovery path for a dead director, and now the *only* way to
+  displace a live-or-stale holder. The human is the authority (there is exactly
+  one human).
+- admin clear (`/api .../direction/clear`) — the human clears a runaway holder.
+
+Every director-only tool takes the caller's `epoch`; the server rejects stale
+epochs with a structured `superseded: ...` error, so the old director demotes
+itself on its next call (no gossip protocol; the server is the sole arbiter, so
+fencing is one integer compare). Every transition (`claimed | released |
+takeover | admin_clear | expired`) is appended to `direction_events` with actor,
+epoch, and timestamp; `get_board` and the callboard surface the current holder's
+provenance (how they got the seat, when), so an unexpected holder is easy to
+spot.
 
 ### The show playbook (SHOWRUNNER.md)
 
@@ -262,7 +279,7 @@ after finishing one, save a note if you learned something the next agent
 would want (with `files_hint` of the affected globs). Directors record
 generalizable decisions (especially answers to `input-required`) as notes.
 
-## MCP tool surface (11 tools)
+## MCP tool surface (12 tools)
 
 Everything takes/returns compact JSON. `member_id` is explicit in every call
 (the server is stateless per-request; reconnects and session restarts don't
@@ -308,6 +325,11 @@ matter).
 **Director-only (epoch-fenced):**
 
 8. `claim_direction({member_id, takeover?})` → `{epoch, board_summary}`.
+   Without `takeover`, succeeds only if the seat is unheld or the caller already
+   holds it; a merely expired lease does not open it. `takeover:true` displaces
+   any holder (the human-authority path). `release_direction({member_id,
+   epoch})` → `{epoch}` lets the current holder give the seat up so a later plain
+   claim can take it.
 9. `create_task({member_id, epoch, title, brief, context_id?, depends_on?,
    files_hint?, priority?, assignee?})` → `{task_id}` — brief should be
    pointers ("see docs/combat.md §3; branch off main"), not inlined specs.
@@ -444,9 +466,10 @@ The four controls, strongest first:
    oracle.
 2. **Human release gate (real boundary, opt-in).** With the show's
    `requireTaskRelease` rule on, a director-created task is withheld (not
-   claimable) until a human releases it on the callboard -- the deterministic
-   check against a malicious or compromised director admitting work no human
-   vetted. This and the other fleet rules are server-held per-show state, not a
+   claimable) until a human releases it (`showrunner task release`; the
+   read-only callboard badges it PENDING RELEASE) -- the deterministic check
+   against a malicious or compromised director admitting work no human vetted.
+   This and the other fleet rules are server-held per-show state, not a
    repo file a worker could edit (see "Showrunner rules").
 3. **Runtime containment (the real host boundary, not ours).** showrunner
    cannot stop a worker's host from running `curl`; only the agent runtime's

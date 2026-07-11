@@ -227,9 +227,14 @@
       return;
     }
     const dot = director.stale ? "stale" : "fresh";
+    // Provenance: how this holder got the seat (audit log). A stale lease no longer opens the
+    // seat, so showing "how/when" makes an unexpected holder easy to spot.
+    const p = director.provenance;
+    const prov = p ? `<div class="hint">seat: ${escapeHtml(p.method)} &middot; ${relTime(p.at)}</div>` : "";
     body.innerHTML = `
       <div><span class="dot ${dot}"></span> ${escapeHtml(director.memberId)}</div>
-      <div class="hint">epoch ${director.epoch} &middot; ${director.stale ? "lease expired" : "lease active"}</div>
+      <div class="hint">epoch ${director.epoch} &middot; ${director.stale ? "lease expired (still holds the seat)" : "lease active"}</div>
+      ${prov}
       <div class="chat-link">${chatLinkHtml(director)}</div>
     `;
   }

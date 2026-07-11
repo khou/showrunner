@@ -1,5 +1,5 @@
 // MCP tool surface for showrunner (DESIGN.md "MCP tool surface", PLAN.md "MCP tools"
-// + "Long-poll semantics"). The 11 pinned tools plus the "join" prompt.
+// + "Long-poll semantics"). The 12 pinned tools plus the "join" prompt.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -598,7 +598,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
     "claim_direction",
     {
       description:
-        "Claim (or take over) the direction lease for this member's show. Requires the director bearer token (showrunner-director MCP).",
+        "Claim the direction seat for this member's show. Without takeover, succeeds only if the seat is unheld (never claimed, released, or admin-cleared) or you already hold it (renewal) -- a merely expired lease does NOT open the seat. takeover:true (human-authority path) displaces any holder. Requires the director bearer token (showrunner-director MCP).",
       inputSchema: {
         member_id: z.string().min(1),
         member_secret: MEMBER_SECRET,
@@ -614,7 +614,42 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
       if (result.ok) {
         return jsonResult({ status: "claimed", epoch: result.epoch, board_summary: stripBoard(store.getBoard(resolved.member.show)) });
       }
-      return jsonResult({ status: "denied", holder: result.holder, epoch: result.epoch });
+      // Held by someone else and not a takeover: the seat does not open on lease expiry. Say so.
+      return jsonResult({
+        status: "denied",
+        holder: result.holder,
+        epoch: result.epoch,
+        hint: "the seat is held; a stale lease does not open it. Use takeover:true (human authority) or wait for the holder to release_direction.",
+      });
+    },
+  );
+
+  server.registerTool(
+    "release_direction",
+    {
+      description:
+        "Director-only: explicitly give up the direction seat (epoch-fenced). Clears the holder and bumps epoch so a later plain claim_direction can take the now-unheld seat. Use this when standing down cleanly; a dead director instead needs the human to claim_direction with takeover:true. Requires the director bearer token.",
+      inputSchema: {
+        member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
+        epoch: z.number().int(),
+      },
+    },
+    async (args) => {
+      const denied = requireDirectorAuth();
+      if (denied) return denied;
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
+      if ("result" in resolved) return resolved.result;
+      const { member } = resolved;
+      try {
+        const { epoch } = store.releaseDirection(member.id, args.epoch);
+        // Notify the cast: the show is headless until someone claims (existing send-to-all pattern).
+        store.sendMessage(member.id, "all", `direction released by ${member.id}; show is headless until a new claim_direction`);
+        return jsonResult({ status: "released", epoch });
+      } catch (err) {
+        if (err instanceof SupersededError) return supersededResult(err);
+        return jsonResult({ status: "error", message: (err as Error).message }, true);
+      }
     },
   );
 
@@ -649,7 +684,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         throw err;
       }
       // Release gate is a per-show rule now (not an env flag): a director-authored task is
-      // withheld until a human releases it on the callboard -- the check against a
+      // withheld until a human releases it (`showrunner task release`) -- the check against a
       // malicious/compromised director. The human's own /api create path is never withheld.
       const requireRelease = store.getShowRules(member.show).switches.requireTaskRelease;
       const { task, overlaps } = store.createTask({
@@ -665,7 +700,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         released: requireRelease ? false : undefined,
       });
       const pending = requireRelease
-        ? { pending_release: true, notice: "requireTaskRelease is on for this show: the task is withheld until a human releases it on the callboard." }
+        ? { pending_release: true, notice: "requireTaskRelease is on for this show: the task is withheld until a human releases it with `showrunner task release`." }
         : {};
       return jsonResult({ task_id: task.id, task, overlaps, ...pending });
     },
