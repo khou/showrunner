@@ -52,12 +52,9 @@ Open a second one and say:
 
 > "You're the showrunner director."
 
-To make a repo a first-class show, run `showrunner init --show mygame --url
-https://<your-app>.fly.dev` in it (CLI setup in the docs). That scaffolds
-`.showrunner` (pins the show name for every clone and worktree),
-`SHOWRUNNER.md` (the show playbook: how the director should break down THIS
-project; directors read it right after taking direction), and the two MCP
-config files. Fill in the playbook, commit.
+`showrunner init` scaffolds `.showrunner` (name pin), `SHOWRUNNER.md` (director
+playbook), `SHOWRUNNER.rules.md` (fleet automation defaults), and the two MCP
+config files. Fill in the playbook, tweak rules, commit.
 
 See [DESIGN.md](DESIGN.md) for why it's built this way, and
 [docs/OPERATING.md](docs/OPERATING.md) for everything operational: client

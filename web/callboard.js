@@ -79,13 +79,20 @@
     }
     const shows = data.shows || [];
     showEmptyHint.hidden = shows.length > 0;
-    const prev = showSelect.value || state.show;
+    const urlShowNow = new URLSearchParams(location.search).get("show");
+    const prev = urlShowNow || showSelect.value || state.show;
     showSelect.innerHTML = shows.length
       ? shows.map((s) => `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)}</option>`).join("")
       : '<option value="">(no shows yet)</option>';
     const pick = shows.find((s) => s.name === prev) ? prev : shows[0] ? shows[0].name : "";
     showSelect.value = pick;
     if (pick !== state.show) selectShow(pick);
+    else if (pick) {
+      // Ensure URL stays in sync even when localStorage already matched.
+      const url = new URL(location.href);
+      url.searchParams.set("show", pick);
+      history.replaceState(null, "", url.pathname + url.search + url.hash);
+    }
   }
 
   function selectShow(show) {
@@ -93,6 +100,11 @@
     localStorage.setItem(SHOW_KEY, show);
     state.expanded.clear();
     stopPolling();
+    // Keep ?show= in the URL for shareable deep links (never put the token back).
+    const url = new URL(location.href);
+    if (show) url.searchParams.set("show", show);
+    else url.searchParams.delete("show");
+    history.replaceState(null, "", url.pathname + url.search + url.hash);
     if (show) startPolling();
     else render(null);
   }
@@ -129,6 +141,24 @@
     renderNotes(board);
     renderActivity(board);
     renderBanner(board && board.escalations);
+    renderWorkersBanner(board);
+  }
+
+  function renderWorkersBanner(board) {
+    const workersBanner = el("workers-banner");
+    if (!workersBanner) return;
+    if (!board || !state.show) {
+      workersBanner.hidden = true;
+      return;
+    }
+    const queued = (board.tasks || []).filter((t) => t.status === "queued").length;
+    const liveWorkers = (board.members || []).filter((m) => m.role === "worker" && !m.stale).length;
+    if (queued > 0 && liveWorkers === 0) {
+      workersBanner.hidden = false;
+      workersBanner.innerHTML = `<strong>${queued} task${queued === 1 ? "" : "s"} queued</strong> — no live workers. Open a session and say: <code>You're a showrunner worker.</code>`;
+    } else {
+      workersBanner.hidden = true;
+    }
   }
 
   // Director card / member row chat link (DESIGN.md "the chat link"): session_url renders as a
@@ -325,6 +355,13 @@
 
   // --- token + show picker wiring ---
 
+  // Prefer ?show= deep link, then localStorage.
+  const urlShow = new URLSearchParams(location.search).get("show");
+  if (urlShow) {
+    state.show = urlShow;
+    localStorage.setItem(SHOW_KEY, urlShow);
+  }
+
   // ?token= handshake lands here with the token in the fragment: store it, hide it.
   if (location.hash.startsWith("#token=")) {
     saveToken(decodeURIComponent(location.hash.slice(7)));
@@ -335,9 +372,16 @@
   // stored (via the ?token= link handshake or a one-time paste) it disappears. The
   // token itself is never rendered back into the page.
   const tokenBox = el("token-box");
+  const authEmpty = el("auth-empty");
+  const boardMain = el("board-main");
   function syncAuthUi() {
     tokenBox.hidden = Boolean(state.token);
-    if (!state.token) tokenStatus.textContent = "open your ?token= link, or paste the token";
+    if (authEmpty) authEmpty.hidden = Boolean(state.token);
+    if (boardMain) boardMain.hidden = !state.token;
+    if (!state.token) {
+      tokenStatus.textContent = "open your ?token= link, run showrunner open, or paste the token";
+      showEmptyHint.hidden = true;
+    }
   }
   syncAuthUi();
   tokenInput.value = "";

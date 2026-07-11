@@ -64,7 +64,10 @@ There's one director per show, held as a lease, not tied to any session.
 ## The callboard
 
 A static page at your server's root (`https://<your-app>.fly.dev/`), polling
-every 2s. Enter the bearer token once (kept in localStorage). It's
+every 2s. Open it once via the setup magic link or `showrunner open` (stores
+the bearer token in localStorage and strips it from the URL). Without a token
+the page shows a clear sign-in empty state — not a fake empty board. Deep-link
+a show with `?show=<name>` (also accepted on the magic link). It's
 deliberately a **window, not a control panel**: no task forms, no message
 box, no admin actions. You steer by talking to the director agent in its
 own chat -- that's what the chat link opens -- and the director translates
@@ -78,12 +81,21 @@ drives the same `/api` the callboard reads. Shows:
 - **Members**: kind (claude-local, cursor-cloud, ...), role, current task,
   a staleness dot, and a small ↗ when the member reported a `session_url`.
 - **Task columns**: queued / in-flight / needs-input / done+failed. Click a
-  task to expand its journal.
+  task to expand its journal. If tasks are queued and no non-stale workers
+  are registered, a banner asks you to open a worker session.
 - **Notes panel**: the last 10 shared notes, newest first (author, tags,
   trimmed body, age).
 - **Activity feed**: last 50 journal entries and messages.
 - **Red escalation banner**: any `input-required` task, or any message
   addressed to `human`. This is the thing you actually watch for.
+
+## Showrunner rules
+
+`SHOWRUNNER.rules.md` (scaffolded by `init`) holds user-editable fleet
+defaults: open PR / squash-merge when green / verify-is-done, optional soft
+dedicated-worker preferences, and project standing rules. The director
+propagates them; workers re-read on claim. Playbook (`SHOWRUNNER.md`) stays
+about decomposing *this* project. Sessions may fan out subagents freely.
 
 ## How it works
 
@@ -188,7 +200,8 @@ showrunner task cancel --show <name> --id <task-id>
 showrunner message --show <name> --to <member-id|director|all|human> --body <text>
 showrunner direction clear --show <name>
 showrunner show delete --show <name>        # removes the show and everything under it
-showrunner init --show <name> [--url <url>] # scaffold a repo: .showrunner, SHOWRUNNER.md, mcp configs
+showrunner init --show <name> [--url <url>] # .showrunner, SHOWRUNNER.md, SHOWRUNNER.rules.md, mcp configs
+showrunner open [--show <name>] [--print]  # callboard magic link (?token=…&show=…)
 showrunner instructions
 showrunner snippets [--url <url>]
 ```
@@ -197,9 +210,13 @@ showrunner snippets [--url <url>]
 `SHOWRUNNER.md` (the show playbook: how the director should decompose work
 for THIS project, area/file map, conventions, escalation rules; the director
 protocol reads it right after `claim_direction` and it overrides the generic
-defaults), and `.mcp.json` / `.cursor/mcp.json` pointed at your server.
-Fill in the playbook, commit all four files, and every clone, worktree, and
+defaults), `SHOWRUNNER.rules.md` (fleet automation/role defaults; user-editable),
+and `.mcp.json` / `.cursor/mcp.json` pointed at your server.
+Fill in the playbook, tweak rules, commit, and every clone, worktree, and
 cloud checkout gets the same show name and direction rules.
+
+`open` builds the callboard `?token=` handshake URL (optionally `&show=`) from
+env/`~` context and opens it in the browser (`--print` to stdout only).
 
 This is a human convenience over `/api`, not something agents call. Agents
 talk MCP.
