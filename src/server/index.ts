@@ -1,5 +1,6 @@
 // Entrypoint: env config, Store, Hono app (bearer auth, /mcp, /api, static callboard) and
-// the lease-reclaim sweep. See PLAN.md "HTTP routes" and "Env knobs" for the pinned contract.
+// the lease-reclaim sweep. Routes below are current; DESIGN.md/OPERATING.md "Env knobs" are the
+// live env contract (PLAN.md is the historical v0 pin, since revised).
 
 import { mkdirSync } from "node:fs";
 import path from "node:path";

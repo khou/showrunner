@@ -17,7 +17,8 @@ over as **director** with a one-line prompt:
 > "You're a showrunner worker."
 
 The show name doesn't need saying: the session derives it from the repo it
-was opened in (git origin basename, else directory name). Naming a show
+was opened in (a committed `.showrunner` file, else git origin basename, else
+directory name). Naming a show
 explicitly ("a worker for the mygame show") always overrides.
 
 The server is the only stateful thing. Sessions are cattle: they register,
@@ -94,14 +95,15 @@ shows      { name PK, created_at, config_json }
 show_rules { show PK, version, switches_json, policy, updated_at, updated_by }
 members    { id PK, show, kind, display_name, role, registered_at,
              last_seen_at, lease_expires_at, current_task_id, secret_hash,
-             rules_version_seen, invite_id, evicted_at, evicted_by }
+             review_cursor, session_url, resume_hint, rules_version_seen,
+             invite_id, evicted_at, evicted_by }
 invites    { id PK, show, token_hash, minted_by, minted_at, expires_at,
              used_at, used_by }   -- single-use, show-scoped, hash-only
 direction  { show PK, director_id, epoch, lease_expires_at }   -- one row per show
 direction_events { id PK, show, actor, method, epoch, created_at }  -- audit log
 tasks      { id PK, show, context_id, title, brief, files_hint_json,
              depends_on_json, priority, status, assignee, attempt,
-             created_by, lease_expires_at, artifacts_json, released,
+             created_by, lease_expires_at, artifacts_json, released, status_changed_at,
              created_at, updated_at }
 task_notes { id PK, task_id, author, body, created_at }         -- append-only journal
 messages   { id PK, show, from_id, to_id, task_id, body, kind, created_at }
@@ -150,16 +152,19 @@ queued ──▶ assigned ──▶ working ──▶ completed
 
 | Lease | TTL (env) | Renewed by | On expiry |
 |---|---|---|---|
-| worker | 90s | any tool call by that member (polling is the heartbeat) | member shown stale on callboard; an `input-required` task assigned to it requeues (it's supposed to still be polling while blocked) |
-| task | 15 min | `update_task` (status/note/heartbeat) by assignee | task requeues, `attempt`+1, journal preserved |
+| worker | 150s | any tool call by that member (polling is the heartbeat) | member shown stale on callboard (amber "heads-down" while it still holds a live-leased task); a task it holds requeues only when the owner is fully gone (see below) |
+| task | 15 min | `update_task` (status/note/heartbeat) by assignee, or redelivery on the owner's next poll | task requeues, `attempt`+1, journal preserved |
 | direction | 10 min | any tool call by the director | liveness only: callboard shows the holder stale and the show effectively headless, but the seat stays held -- expiry never lets anyone else claim it (see "Direction") |
 
 A worker's `assigned`/`working` task is reaped **only** by the task lease, never by the
 worker lease alone: a worker heads-down executing may not touch any tool for long stretches
-well inside the 90s worker-lease window (it only has to heartbeat every ~10min), so treating a
+well inside the 150s worker-lease window (it only has to heartbeat every ~10min), so treating a
 stale worker lease as task abandonment would requeue -- and duplicate -- work that's still in
-progress. `input-required` is the exception: the worker is meant to be idle and polling while
-blocked, so a stale worker lease there really does mean it went dark.
+progress. `input-required` is similar under escalation parking: a parked task requeues only
+when its owner is fully gone -- stale poll lease AND holding no other live-leased task -- so an
+escalation the worker parked to take other work survives while that worker keeps making
+progress. The sweep's owner-liveness guard treats "polling, or heartbeating any live task" as
+alive.
 
 No auto-promotion of workers to director, deliberately: every field report
 says unattended swarms drift; a dead director costs nothing (state is in the
@@ -230,8 +235,8 @@ New shows are seeded with OOTB defaults (favoring automation: release gate off,
 merge approval off, notes propagate); `REQUIRE_TASK_RELEASE` is the
 deployment-wide env default for the release-gate switch on new shows. The
 director changes rules with the `update_rules` tool (director-token-gated,
-epoch-fenced); the human edits them from the callboard or `showrunner rules
-set` (admin `/api`). Every change bumps `version`, records `updated_by`, and
+epoch-fenced); the human edits them with `showrunner rules
+set` (admin `/api`); the callboard only displays them. Every change bumps `version`, records `updated_by`, and
 notifies the cast via `send_message` to `all`. Delivery has token discipline:
 `rules_version` rides on every task claim, and the full text is delivered at
 `register` and re-delivered on the first poll after the version changes.
@@ -276,7 +281,7 @@ through the machinery that already exists:
   still-in-flight task* is related: `files_hint` glob overlap, same
   `task_id`, or same `context_id`. Each gets a `kind:"note"` message in its
   inbox regardless of whether its member lease is fresh -- a worker heads-down
-  executing renews that lease only every ~10min, well inside the 90s window,
+  executing renews that lease only every ~10min, well inside the 150s window,
   and is exactly who a note about its task needs to reach. An unexpired lease
   additionally gets an immediate wake, so a parked `await_work` resolves
   within seconds; a stale one picks the note up on its next poll instead.
@@ -320,7 +325,7 @@ matter).
    is issued once and must accompany `member_id` on every later call (per-member
    auth); `rules` is the show's current server-held policy (authenticated,
    distinct from peer content); `protocol` is the full worker/director loop
-   contract in ~600 tokens, so even a client that ignored the server
+   contract (~3k tokens), so even a client that ignored the server
    instructions knows what to do next. `session_url`/`resume_hint` are how
    a human opens this session's chat: only the session knows this, so it
    self-reports (cloud sessions their URL, local CLI sessions a resume
@@ -365,8 +370,8 @@ matter).
    partition, don't lock.
 10. `direct_task({member_id, epoch, task_id, action, ...})` — `cancel`,
    `requeue`, `assign {assignee}`, `answer {body}` (for `input-required` →
-   flips back to `working` and delivers the answer), `approve` (optional
-   review gate, see config).
+   flips back to `working` and delivers the answer), `approve` (records a
+   director-approval journal note; no gating today).
 11. `update_rules({member_id, epoch, switches?, policy?})` → `{rules}` — set
    the show's server-held rules (machine-enforced switches and/or advisory
    policy prose). Bumps `version`, is audited (`updated_by`), and notifies the
@@ -380,7 +385,7 @@ matter).
 
 ### The one-line-prompt trick
 
-The server's MCP `initialize` response carries `instructions` (~1.5KB,
+The server's MCP `initialize` response carries `instructions` (~11KB,
 auto-loaded into Claude Code context; also exposed as MCP prompt
 `/showrunner:join` for Cursor and manual use):
 

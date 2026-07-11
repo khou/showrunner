@@ -1,5 +1,5 @@
-// MCP tool surface for showrunner (DESIGN.md "MCP tool surface", PLAN.md "MCP tools"
-// + "Long-poll semantics"). The 14 pinned tools plus the "join" prompt.
+// MCP tool surface for showrunner (DESIGN.md "MCP tool surface" is the current list; PLAN.md
+// "MCP tools" pinned the original 8, since grown). The tools plus the "join" prompt.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -49,7 +49,7 @@ function forbiddenDirector(): CallToolResult {
     {
       status: "forbidden",
       reason: "director token required",
-      hint: "claim_direction, create_task, and direct_task need the showrunner-director MCP entry (SHOWRUNNER_TOKEN). The committed worker token cannot direct.",
+      hint: "director-only tools (claim_direction, release_direction, create_task, direct_task, update_rules, mint_invite, evict_member) need the showrunner-director MCP entry (SHOWRUNNER_TOKEN). The committed worker token cannot direct.",
     },
     true,
   );
@@ -163,7 +163,16 @@ export type AwaitWorkResult =
   | { status: "messages"; messages: Message[] }
   | { status: "review"; items: McpTaskView[] }
   | { status: "task"; task: Task; relevant_notes: NoteHit[] }
-  | { status: "nothing"; hint: string };
+  | { status: "nothing"; hint: string; pending_input?: PendingInput[] };
+
+// A director's standing to-do: escalations still parked input-required. Surfaced on idle polls
+// (the review cursor shows each only once; a pending decision must keep nagging until answered).
+export interface PendingInput {
+  task_id: string;
+  title: string;
+  assignee: string | null;
+  age_minutes: number;
+}
 
 // DESIGN.md "Recall at claim time": bodies trimmed to ~300 chars in the claim-time payload
 // (search_notes hits, by contrast, return the full body -- that's an explicit pull, not a cap
@@ -182,8 +191,12 @@ function annotateAwaitWork(result: AwaitWorkResult): Record<string, unknown> {
     case "messages":
       return { ...result, trust: untrustedNotice(["messages[].body"]) };
     case "review":
-      return { ...result, trust: untrustedNotice(["items[].title", "items[].notes[].body"]) };
+      // Review items are stripped board views (no notes ride along), so only titles are peer text.
+      return { ...result, trust: untrustedNotice(["items[].title"]) };
     case "nothing":
+      return result.pending_input && result.pending_input.length > 0
+        ? { ...result, trust: untrustedNotice(["pending_input[].title"]) }
+        : { ...result };
     case "unknown_member":
       return { ...result };
     default: {
@@ -288,6 +301,26 @@ function checkOnce(store: Store, member: Member): AwaitWorkResult | null {
   return null;
 }
 
+// The bare "nothing" reply, plus a director's standing escalation reminder. computeReviewItems
+// shows each input-required task only ONCE (cursor advances past it), so a director that saw an
+// escalation and got busy would never be re-prompted; this re-attaches everything still parked
+// so an idle poll always shows the outstanding decisions. Directors only -- workers can't answer.
+function nothingResult(store: Store, member: Member): AwaitWorkResult {
+  if (member.role !== "director") return { status: "nothing", hint: "re-poll immediately" };
+  const pending = store.pendingInputRequired(member.show);
+  if (pending.length === 0) return { status: "nothing", hint: "re-poll immediately" };
+  return {
+    status: "nothing",
+    hint: `${pending.length} task(s) awaiting your input. Answer each with direct_task({action:"answer", body}) -- decide from the rules/playbook/design docs where you can, escalate to the human only if it truly needs their authority. Workers park these and move on after ~15min, so don't let them sit.`,
+    pending_input: pending.map((p) => ({
+      task_id: p.id,
+      title: p.title,
+      assignee: p.assignee,
+      age_minutes: Math.round(p.ageMs / 60000),
+    })),
+  };
+}
+
 /**
  * Fixed 0-2s jitter (DESIGN.md) would swamp the short holds tests inject to stay under
  * ~100ms; scale it down proportionally instead, capped at the production 2s ceiling.
@@ -336,7 +369,7 @@ export async function resolveAwaitWork(
       const result = checkOnce(store, member);
       if (result) finish(result);
     };
-    const timer = setTimeout(() => finish({ status: "nothing", hint: "re-poll immediately" }), totalMs);
+    const timer = setTimeout(() => finish(nothingResult(store, member)), totalMs);
     store.events.on(memberWake, onWake);
     store.events.on(showWake, onWake);
   });
@@ -902,7 +935,7 @@ function registerTools(store: Store, config: McpServerConfig, reg: RegisterToolF
     "evict_member",
     {
       description:
-        "Director-only: evict a member. Revokes its credential (all later calls unauthorized), requeues its in-flight task (attempt+1, journal preserved), stamps the membership evicted (actor/time), and notifies the cast. Epoch-fenced. Requires the director bearer token.",
+        "Director-only: evict a member. Revokes its credential (all later calls unauthorized), requeues every task it holds -- current plus any parked input-required task (each attempt+1, journal preserved; returns requeued_task_ids) -- stamps the membership evicted (actor/time), and notifies the cast. Epoch-fenced. Requires the director bearer token.",
       inputSchema: {
         member_id: z.string().min(1),
         member_secret: MEMBER_SECRET,

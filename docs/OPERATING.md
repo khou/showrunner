@@ -204,6 +204,13 @@ eviction-decision surface. Eviction is durable only with `requireInvite` on.
   end-of-turn. `register` returns the same rule as a machine-readable
   `loop_contract` (stop conditions: eviction or an explicit human stop;
   finishing a task is never one).
+- A director's idle poll (`status:"nothing"`) carries `pending_input`: every
+  task still parked `input-required`, with age, so an escalation the director
+  already saw once (the review feed shows each only once) keeps nagging until
+  it's answered with `direct_task({action:"answer"})`. Workers park an
+  unanswered escalation and move to other queued work after ~15 min
+  (`ESCALATION_WAIT_S`), leaving a draft-PR handoff; the answer re-adopts the
+  task once the worker's current work wraps.
 - `register({show, kind, display_name?, session_url?, resume_hint?})` --
   `session_url`/`resume_hint` are how a human opens this session's chat; only
   the session itself knows which, so it self-reports (a `session_url` must
@@ -316,8 +323,7 @@ with a **hardcoded worker** Bearer plus a `showrunner-director` entry that reads
 `SHOWRUNNER_TOKEN` from env, and a gitignored `.env` with the director token. It
 prints the callboard link and ways-to-run (simple fleet vs dedicated lanes).
 Fleet rules are server-held (seeded with OOTB defaults on the server), not
-scaffolded into the repo -- view/edit them with `showrunner rules` or on the
-callboard. Fill in the playbook, commit, and every clone, worktree, and cloud
+scaffolded into the repo -- view them on the callboard, edit with `showrunner rules set`. Fill in the playbook, commit, and every clone, worktree, and cloud
 checkout gets the same show name.
 
 `open` builds the callboard `?token=` handshake URL (optionally `&show=`) from
@@ -351,9 +357,10 @@ keep pulling from the queue. The callboard marks the director card stale once
 its 10-minute lease lapses (or run `showrunner direction clear --show <name>`
 to force "no director" immediately, e.g. to stop a runaway director without
 waiting out the lease). Say "you're the director" to any session and it calls
-`claim_direction(takeover: true)` and resumes with full board state -- a
-normal `claim_direction` (no takeover) works too once the lease has actually
-expired.
+`claim_direction(takeover: true)` and resumes with full board state. A plain
+`claim_direction` (no takeover) never opens a held seat, even after the lease
+expires -- the seat must be explicitly freed by `release_direction` or
+`showrunner direction clear` first.
 
 **The server restarts (e.g. `fly deploy`)?**
 No tasks lost, state is in SQLite on the volume. Workers notice their next
@@ -406,5 +413,6 @@ The controls, strongest first:
 For a show with untrusted members: set a distinct worker token, turn on the
 `requireTaskRelease` rule (`showrunner rules set --require-release on`, or seed
 it deployment-wide with `REQUIRE_TASK_RELEASE`), run workers locked-down, and
-keep secrets out of briefs (point at repo files). Non-goals in v1: per-member
-tokens with revocation, per-show ACLs, content encryption.
+keep secrets out of briefs (point at repo files). Non-goals in v1: per-show
+ACLs, content encryption. (Per-member secrets with revocation via `evict_member`
+shipped -- see control #1 above.)

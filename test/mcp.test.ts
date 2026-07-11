@@ -220,11 +220,17 @@ describe("review does not busy-loop on an unanswered input-required task", () =>
     const first = await resolveAwaitWork(store, director.id, undefined, 0.05);
     expect(first.status).toBe("review");
 
-    // Nothing changed since: a second poll must not re-report the same still-open blocker.
-    // With a real 50ms hold and no wake, this only resolves via the timeout path.
+    // Nothing changed since: a second poll must not re-report it in the REVIEW feed (no
+    // busy-loop) and must hold the full poll. It resolves via the timeout path, and that
+    // timeout now carries the director's standing pending_input reminder (the escalation is
+    // still open) rather than a bare "nothing".
     const started = Date.now();
     const second = await resolveAwaitWork(store, director.id, undefined, 0.05);
-    expect(second).toEqual({ status: "nothing", hint: "re-poll immediately" });
+    expect(second.status).toBe("nothing");
+    if (second.status === "nothing") {
+      expect(second.pending_input).toHaveLength(1);
+      expect(second.pending_input![0].task_id).toBe(task.id);
+    }
     expect(Date.now() - started).toBeGreaterThanOrEqual(45);
   });
 });
@@ -939,5 +945,37 @@ describe("register delivers current rules as authenticated policy", () => {
     expect(data.rules.version).toBe(1);
     expect(data.rules.switches).toBeTruthy();
     expect(data.rules_trust.trust).toBe("authenticated_director_policy");
+  });
+});
+
+describe("director idle poll surfaces pending input-required escalations", () => {
+  it("re-reminds about a parked escalation the review feed already showed once", async () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const claimed = store.claimDirection(director.id, true);
+    if (!claimed.ok) throw new Error("claim_direction failed");
+    const t = store.createTask({ show: "myshow", title: "needs a call", brief: "b", createdBy: director.id }).task;
+    store.claimNextTask(worker.id);
+    store.updateTask(worker.id, t.id, { status: "input-required", note: "renew or 410?" });
+
+    // First director poll surfaces it as a review item (cursor advances past it).
+    const first = await resolveAwaitWork(store, director.id, undefined, 0.05);
+    expect(first.status).toBe("review");
+
+    // A later idle poll no longer shows it as review, but the standing reminder does.
+    const idle = await resolveAwaitWork(store, director.id, undefined, 0.05);
+    expect(idle.status).toBe("nothing");
+    expect(idle.pending_input).toHaveLength(1);
+    expect(idle.pending_input![0].task_id).toBe(t.id);
+
+    // A worker's idle poll never carries the director-only reminder. (A fresh worker with no
+    // task and an empty queue -- the escalating worker still holds its parked task.)
+    const idleWorker = store.register("myshow", "claude-local");
+    const workerIdle = await resolveAwaitWork(store, idleWorker.id, undefined, 0.05);
+    expect(workerIdle.status).toBe("nothing");
+    if (workerIdle.status === "nothing") {
+      expect(workerIdle.pending_input).toBeUndefined();
+    }
   });
 });

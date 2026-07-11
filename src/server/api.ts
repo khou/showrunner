@@ -1,4 +1,4 @@
-// Pinned /api routes (PLAN.md "HTTP routes"). Reads and writes go through Store only;
+// /api routes (originated in PLAN.md "HTTP routes", since extended). Reads/writes go through Store only;
 // auth (bearer/cookie) is applied by index.ts before these routes are reached.
 
 import Database from "better-sqlite3";
@@ -40,8 +40,8 @@ const rulesPatchSchema = z
   });
 
 /**
- * Store's pinned API (PLAN.md) has no listShows() method; the `shows` table has no other
- * accessor. This is a narrow read-only fallback until Store grows one -- see final report.
+ * Store.showNames() returns names only; this read-only fallback also needs created_at for the
+ * callboard's show picker ordering, so it reads the `shows` table directly.
  */
 function listShows(dbPath: string): { name: string; createdAt: number }[] {
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
@@ -123,7 +123,8 @@ export function createApiRoutes(store: Store, dbPath: string): Hono {
     return c.json({ task });
   });
 
-  // Read + edit the show's rules from the callboard/CLI (director-token gated). Editing is the
+  // Read + edit the show's rules via the admin API (director-token gated; `showrunner rules set`
+  // is the CLI that drives it -- the callboard itself is read-only). Editing is the
   // human's counterpart to the director's update_rules tool: it bumps the version, is audited as
   // updated_by "human", and notifies the cast via the existing send-to-all pattern.
   api.get("/shows/:show/rules", (c) => c.json({ rules: store.getShowRules(c.req.param("show")) }));
