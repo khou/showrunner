@@ -669,12 +669,14 @@ describe("await_work annotates peer content as untrusted (defense in depth)", ()
   });
 });
 
-describe("human release gate (create_task under REQUIRE_TASK_RELEASE)", () => {
+describe("human release gate (release driven by the per-show rule)", () => {
   it("withholds a created task from workers until it is released", async () => {
     const { store } = newStore();
-    const client = await connectClient(store, { ...FAST_CONFIG, requireTaskRelease: true });
+    const client = await connectClient(store);
     const director = reg(store, "myshow");
     await callTool(client, "claim_direction", { member_id: director.id, member_secret: director.secret });
+    // The release gate is a per-show rule now, not a server flag: turn it on for this show.
+    store.updateShowRules("myshow", { switches: { requireTaskRelease: true } }, "human");
 
     const created = await callTool(client, "create_task", {
       member_id: director.id,
@@ -695,5 +697,99 @@ describe("human release gate (create_task under REQUIRE_TASK_RELEASE)", () => {
     store.releaseTask(taskId, "human");
     const poll2 = await callTool(client, "await_work", { member_id: worker.id, member_secret: worker.secret });
     expect((poll2.data as { status: string }).status).toBe("task");
+  });
+});
+
+describe("update_rules (server-held rules mutation)", () => {
+  it("is director-token gated: a worker-authLevel caller is forbidden", async () => {
+    const { store } = newStore();
+    const workerClient = await connectClient(store, { ...FAST_CONFIG, authLevel: "worker" });
+    const reg = await callTool(workerClient, "register", { show: "myshow", kind: "claude-local" });
+    const { member_id, member_secret } = reg.data as { member_id: string; member_secret: string };
+    const res = await callTool(workerClient, "update_rules", {
+      member_id,
+      member_secret,
+      epoch: 1,
+      switches: { requireTaskRelease: true },
+    });
+    expect(res.isError).toBe(true);
+    expect(res.data).toMatchObject({ status: "forbidden", reason: "director token required" });
+  });
+
+  it("is epoch-fenced: a stale epoch returns superseded and does not change rules", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const a = reg(store, "myshow");
+    const b = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: a.id, member_secret: a.secret });
+    store.claimDirection(b.id, true); // takeover -> epoch 2, a is stale at epoch 1
+
+    const res = await callTool(client, "update_rules", {
+      member_id: a.id,
+      member_secret: a.secret,
+      epoch: 1,
+      switches: { requireTaskRelease: true },
+    });
+    expect(res.data).toMatchObject({ status: "superseded", epoch: 2 });
+    expect(store.getShowRules("myshow").switches.requireTaskRelease).toBe(false);
+  });
+
+  it("the current director updates rules, bumps version, and notifies the cast", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const director = reg(store, "myshow");
+    const worker = reg(store, "myshow");
+    await callTool(client, "claim_direction", { member_id: director.id, member_secret: director.secret });
+
+    const res = await callTool(client, "update_rules", {
+      member_id: director.id,
+      member_secret: director.secret,
+      epoch: 1,
+      switches: { requireHumanMergeApproval: true },
+      policy: "squash-merge only",
+    });
+    expect(res.isError).toBe(false);
+    expect(res.data).toMatchObject({ status: "updated", rules: { version: 2, policy: "squash-merge only" } });
+    expect((res.data as { rules_trust: { trust: string } }).rules_trust.trust).toBe("authenticated_director_policy");
+
+    // The cast is notified via a send-to-all message: the worker sees it on its next poll.
+    const poll = await callTool(client, "await_work", { member_id: worker.id, member_secret: worker.secret });
+    const data = poll.data as { status: string; messages?: { body: string }[] };
+    expect(data.status).toBe("messages");
+    expect(data.messages?.some((m) => /rules updated to v2/.test(m.body))).toBe(true);
+  });
+
+  it("rules_version rides on a task claim, and the full rules re-deliver after a change", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const director = reg(store, "myshow");
+    const worker = reg(store, "myshow");
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
+
+    const claim = await callTool(client, "await_work", { member_id: worker.id, member_secret: worker.secret });
+    const claimData = claim.data as { status: string; rules_version: number; rules?: unknown };
+    expect(claimData.status).toBe("task");
+    expect(claimData.rules_version).toBe(1);
+    expect(claimData.rules).toBeUndefined(); // already seen at register; not re-sent
+
+    // A rule change re-delivers the full text on the worker's next poll.
+    store.updateShowRules("myshow", { switches: { requireTaskRelease: true } }, "human");
+    const poll = await callTool(client, "await_work", { member_id: worker.id, member_secret: worker.secret });
+    const pollData = poll.data as { rules_version: number; rules?: { version: number }; rules_trust?: { trust: string } };
+    expect(pollData.rules_version).toBe(2);
+    expect(pollData.rules?.version).toBe(2);
+    expect(pollData.rules_trust?.trust).toBe("authenticated_director_policy");
+  });
+});
+
+describe("register delivers current rules as authenticated policy", () => {
+  it("includes the full rules and a director-policy trust tag", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const res = await callTool(client, "register", { show: "myshow", kind: "claude-local" });
+    const data = res.data as { rules: { version: number; switches: unknown }; rules_trust: { trust: string } };
+    expect(data.rules.version).toBe(1);
+    expect(data.rules.switches).toBeTruthy();
+    expect(data.rules_trust.trust).toBe("authenticated_director_policy");
   });
 });

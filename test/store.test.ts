@@ -1207,3 +1207,77 @@ describe("human release gate (released column)", () => {
     expect(claimed?.id).toBe(open.id);
   });
 });
+
+describe("show rules (server-held policy)", () => {
+  it("seeds OOTB defaults on first touch (version 1, automation-friendly)", () => {
+    const { store } = newStore();
+    store.register("myshow", "claude-local");
+    const rules = store.getShowRules("myshow");
+    expect(rules.version).toBe(1);
+    expect(rules.switches.requireTaskRelease).toBe(false);
+    expect(rules.switches.requireHumanMergeApproval).toBe(false);
+    expect(rules.switches.workerNotePropagation).toBe(true);
+    expect(rules.switches.artifactTextMaxChars).toBeGreaterThan(0);
+    expect(rules.updatedBy).toBe("default");
+    // The board exposes the current rules.
+    expect(store.getBoard("myshow").rules.version).toBe(1);
+  });
+
+  it("updateShowRules merges a partial patch, bumps version, and records who", () => {
+    const { store } = newStore();
+    store.register("myshow", "claude-local");
+    const v2 = store.updateShowRules("myshow", { switches: { requireTaskRelease: true }, policy: "no force-push" }, "amber-fox");
+    expect(v2.version).toBe(2);
+    expect(v2.switches.requireTaskRelease).toBe(true);
+    expect(v2.switches.workerNotePropagation).toBe(true); // untouched fields keep their value
+    expect(v2.policy).toBe("no force-push");
+    expect(v2.updatedBy).toBe("amber-fox");
+    // A non-positive cap patch is ignored (can't disable a cap by setting 0).
+    const v3 = store.updateShowRules("myshow", { switches: { artifactTextMaxChars: 0 } }, "amber-fox");
+    expect(v3.switches.artifactTextMaxChars).toBe(v2.switches.artifactTextMaxChars);
+    expect(v3.version).toBe(3);
+  });
+
+  it("delivers full rules once per change: seeded-seen at register, re-delivered after a bump", () => {
+    const { store } = newStore();
+    const m = store.register("myshow", "claude-local");
+    // register seeds the member's cursor to current, so nothing to re-deliver yet.
+    expect(store.consumeRulesDelivery(m.id)).toEqual({ version: 1 });
+    store.updateShowRules("myshow", { switches: { requireHumanMergeApproval: true } }, "human");
+    const delivered = store.consumeRulesDelivery(m.id);
+    expect(delivered.version).toBe(2);
+    expect(delivered.rules?.switches.requireHumanMergeApproval).toBe(true);
+    // Consumed: not delivered again until the next change.
+    expect(store.consumeRulesDelivery(m.id)).toEqual({ version: 2 });
+  });
+
+  it("enforces workerNotePropagation: off suppresses push and claim-time recall, search still works", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const author = store.register("myshow", "claude-local");
+    store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: worker.id, filesHint: ["src/**"] });
+    store.claimNextTask(worker.id);
+
+    store.updateShowRules("myshow", { switches: { workerNotePropagation: false } }, "human");
+    const { deliveredTo } = store.saveNote(author.id, { body: "distinctive zebra note", filesHint: ["src/app.ts"] });
+    expect(deliveredTo).toEqual([]); // no push to the working peer
+    expect(store.notesForTask({ show: "myshow", title: "t", brief: "b", filesHint: ["src/**"] })).toEqual([]); // no claim-time recall
+    expect(store.searchNotes("myshow", "zebra").length).toBe(1); // explicit pull still works
+  });
+
+  it("enforces artifact caps in updateTask (text over the cap is rejected)", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: worker.id });
+    store.claimNextTask(worker.id);
+    store.updateShowRules("myshow", { switches: { artifactTextMaxChars: 10 } }, "human");
+    expect(() =>
+      store.updateTask(worker.id, task.id, { artifacts: [{ kind: "text", text: "x".repeat(11) }] }),
+    ).toThrow(/artifactTextMaxChars/);
+    // At the cap it's accepted.
+    const ok = store.updateTask(worker.id, task.id, { artifacts: [{ kind: "text", text: "x".repeat(10) }] });
+    expect(ok.artifacts.length).toBe(1);
+  });
+});

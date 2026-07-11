@@ -21,6 +21,23 @@ const messageSchema = z.object({
   body: z.string().min(1),
 });
 
+const rulesPatchSchema = z
+  .object({
+    switches: z
+      .object({
+        requireTaskRelease: z.boolean().optional(),
+        requireHumanMergeApproval: z.boolean().optional(),
+        workerNotePropagation: z.boolean().optional(),
+        artifactTextMaxChars: z.number().int().positive().optional(),
+        artifactDataMaxBytes: z.number().int().positive().optional(),
+      })
+      .optional(),
+    policy: z.string().optional(),
+  })
+  .refine((v) => v.switches !== undefined || v.policy !== undefined, {
+    message: "provide at least one of switches or policy",
+  });
+
 /**
  * Store's pinned API (PLAN.md) has no listShows() method; the `shows` table has no other
  * accessor. This is a narrow read-only fallback until Store grows one -- see final report.
@@ -96,13 +113,28 @@ export function createApiRoutes(store: Store, dbPath: string): Hono {
     }
   });
 
-  // Human release of a task withheld by the REQUIRE_TASK_RELEASE gate. Director-token gated (like
-  // every mutating /api route), so this is a genuine human-in-the-loop checkpoint on a brief
-  // before any worker can claim it, not something a registered agent can trigger for itself.
+  // Human release of a task withheld by the release gate. Director-token gated (like every
+  // mutating /api route), so this is a genuine human-in-the-loop checkpoint on a brief before any
+  // worker can claim it, not something a registered agent can trigger for itself.
   api.post("/shows/:show/tasks/:id/release", (c) => {
     const task = store.releaseTask(c.req.param("id"), "human");
     if (!task) return c.json({ error: `no such task: ${c.req.param("id")}` }, 404);
     return c.json({ task });
+  });
+
+  // Read + edit the show's rules from the callboard/CLI (director-token gated). Editing is the
+  // human's counterpart to the director's update_rules tool: it bumps the version, is audited as
+  // updated_by "human", and notifies the cast via the existing send-to-all pattern.
+  api.get("/shows/:show/rules", (c) => c.json({ rules: store.getShowRules(c.req.param("show")) }));
+
+  api.post("/shows/:show/rules", async (c) => {
+    const parsed = rulesPatchSchema.safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return c.json({ error: "invalid body", issues: parsed.error.issues }, 400);
+    const show = c.req.param("show");
+    const human = ensureHumanMember(store, show);
+    const rules = store.updateShowRules(show, parsed.data, "human");
+    store.sendMessage(human.id, "all", `show rules updated to v${rules.version} by human`);
+    return c.json({ rules });
   });
 
   api.delete("/shows/:show", (c) => {

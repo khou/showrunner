@@ -18,6 +18,9 @@ import {
   type NoteHit,
   type OverlapWarning,
   type SaveNoteInput,
+  type ShowRules,
+  type ShowRulesPatch,
+  type ShowRuleSwitches,
   type SweepResult,
   type Task,
   type TaskArtifact,
@@ -25,6 +28,7 @@ import {
   type TaskStatus,
   readLeaseConfig,
   readNoteConfig,
+  readRulesDefaults,
   SupersededError,
 } from "../types.js";
 
@@ -48,9 +52,19 @@ CREATE TABLE IF NOT EXISTS members (
   review_cursor INTEGER NOT NULL DEFAULT 0,
   session_url TEXT,
   resume_hint TEXT,
-  secret_hash TEXT
+  secret_hash TEXT,
+  rules_version_seen INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS members_show_idx ON members(show);
+
+CREATE TABLE IF NOT EXISTS show_rules (
+  show TEXT PRIMARY KEY REFERENCES shows(name),
+  version INTEGER NOT NULL DEFAULT 1,
+  switches_json TEXT NOT NULL,
+  policy TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL,
+  updated_by TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS direction (
   show TEXT PRIMARY KEY REFERENCES shows(name),
@@ -181,6 +195,12 @@ function timingSafeEqualHex(a: string, b: string): boolean {
   return timingSafeEqual(abuf, bbuf);
 }
 
+/** A rules cap must stay a positive integer; a non-positive or non-finite patch value keeps the
+ * current value rather than letting a caller disable a cap by setting it to 0 or a bad type. */
+function clampPositiveInt(value: number, fallback: number): number {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
 /** Longest literal prefix before the first glob metacharacter. */
 function globPrefix(glob: string): string {
   const idx = glob.search(/[*?[]/);
@@ -237,6 +257,16 @@ interface MemberRow {
   session_url: string | null;
   resume_hint: string | null;
   secret_hash: string | null;
+  rules_version_seen: number;
+}
+
+interface ShowRulesRow {
+  show: string;
+  version: number;
+  switches_json: string;
+  policy: string;
+  updated_at: number;
+  updated_by: string;
 }
 
 interface TaskRow {
@@ -372,12 +402,23 @@ function mapNoteHit(r: NoteRow): NoteHit {
   return { id: r.id, author: r.author, tags: JSON.parse(r.tags_json) as string[], body: r.body, createdAt: r.created_at };
 }
 
+function mapShowRules(r: ShowRulesRow): ShowRules {
+  return {
+    version: r.version,
+    switches: JSON.parse(r.switches_json) as ShowRuleSwitches,
+    policy: r.policy,
+    updatedAt: r.updated_at,
+    updatedBy: r.updated_by,
+  };
+}
+
 export class Store {
   readonly events = new EventEmitter();
   private readonly db: Database.Database;
   private readonly now: () => number;
   private readonly leases: ReturnType<typeof readLeaseConfig>;
   private readonly noteConfig: ReturnType<typeof readNoteConfig>;
+  private readonly rulesDefaults: ShowRuleSwitches;
 
   constructor(dbPath: string, now: () => number = Date.now) {
     this.db = new Database(dbPath);
@@ -388,9 +429,11 @@ export class Store {
     this.migrateMemberSessionColumns();
     this.migrateMemberSecretColumn();
     this.migrateTaskReleasedColumn();
+    this.migrateMemberRulesSeenColumn();
     this.now = now;
     this.leases = readLeaseConfig();
     this.noteConfig = readNoteConfig();
+    this.rulesDefaults = readRulesDefaults();
     // Every parked await_work adds a wake:* listener; a healthy show can easily have more
     // than the EventEmitter default of 10 concurrent pollers. Listener count is bounded by
     // concurrent polls and provably cleaned up (see mcp.test.ts), so unbound this rather
@@ -443,6 +486,15 @@ export class Store {
     const cols = this.db.pragma("table_info(tasks)") as { name: string }[];
     if (!cols.some((c) => c.name === "released")) {
       this.db.exec("ALTER TABLE tasks ADD COLUMN released INTEGER NOT NULL DEFAULT 1");
+    }
+  }
+
+  /** Guarded upgrade-in-place: members predates the per-member rules-version cursor. Existing rows
+   * backfill to 0, so the next await_work re-delivers the current rules once (harmless). */
+  private migrateMemberRulesSeenColumn(): void {
+    const cols = this.db.pragma("table_info(members)") as { name: string }[];
+    if (!cols.some((c) => c.name === "rules_version_seen")) {
+      this.db.exec("ALTER TABLE members ADD COLUMN rules_version_seen INTEGER NOT NULL DEFAULT 0");
     }
   }
 
@@ -562,15 +614,18 @@ export class Store {
       this.db
         .prepare("INSERT OR IGNORE INTO direction (show, director_id, epoch, lease_expires_at) VALUES (?, NULL, 0, 0)")
         .run(show);
+      // Seed the show's rules with OOTB defaults on first touch, so a new member starts already
+      // "seeing" the current version (register returns the full rules; no re-delivery needed).
+      const rules = this.ensureShowRules(show, at);
 
       const id = this.generateMemberId();
       const leaseExpiresAt = at + this.leases.workerLeaseS * 1000;
       this.db
         .prepare(
-          `INSERT INTO members (id, show, kind, display_name, role, registered_at, last_seen_at, lease_expires_at, current_task_id, session_url, resume_hint)
-           VALUES (?, ?, ?, ?, 'worker', ?, ?, ?, NULL, ?, ?)`,
+          `INSERT INTO members (id, show, kind, display_name, role, registered_at, last_seen_at, lease_expires_at, current_task_id, session_url, resume_hint, rules_version_seen)
+           VALUES (?, ?, ?, ?, 'worker', ?, ?, ?, NULL, ?, ?, ?)`,
         )
-        .run(id, show, kind, displayName ?? null, at, at, leaseExpiresAt, sessionUrl ?? null, resumeHint ?? null);
+        .run(id, show, kind, displayName ?? null, at, at, leaseExpiresAt, sessionUrl ?? null, resumeHint ?? null, rules.version);
       return mapMember(this.getMemberRowRaw(id)!);
     });
   }
@@ -598,6 +653,82 @@ export class Store {
     return timingSafeEqualHex(hashSecret(secret), row.secret_hash);
   }
 
+  // --- show rules (server-held policy; DESIGN.md "Show rules") ---
+
+  private getShowRulesRow(show: string): ShowRulesRow | undefined {
+    return this.db.prepare("SELECT * FROM show_rules WHERE show = ?").get(show) as ShowRulesRow | undefined;
+  }
+
+  /** Seed a show's rules with OOTB defaults if none exist yet; returns the current rules. Idempotent
+   * (INSERT OR IGNORE), so it doubles as the lazy migration path for shows that predate the table. */
+  private ensureShowRules(show: string, at = this.now()): ShowRules {
+    const existing = this.getShowRulesRow(show);
+    if (existing) return mapShowRules(existing);
+    // Don't persist a rules row for a show that doesn't exist (the FK would reject it, and a board
+    // read for an unknown/deleted show should still succeed): return transient defaults instead.
+    const showExists = this.db.prepare("SELECT 1 FROM shows WHERE name = ?").get(show) !== undefined;
+    if (!showExists) {
+      return { version: 1, switches: { ...this.rulesDefaults }, policy: "", updatedAt: at, updatedBy: "default" };
+    }
+    this.db
+      .prepare(
+        "INSERT OR IGNORE INTO show_rules (show, version, switches_json, policy, updated_at, updated_by) VALUES (?, 1, ?, '', ?, 'default')",
+      )
+      .run(show, JSON.stringify(this.rulesDefaults), at);
+    return mapShowRules(this.getShowRulesRow(show)!);
+  }
+
+  /** Current rules for a show (seeds defaults on first access). */
+  getShowRules(show: string): ShowRules {
+    return this.ensureShowRules(show);
+  }
+
+  /**
+   * Apply a partial rules update, bump the version, and record who/when for audit. Switch fields
+   * are validated (caps stay positive ints); unknown switch keys are ignored. Returns the new
+   * rules. Callers (update_rules tool, admin /api) are responsible for auth/epoch fencing and for
+   * notifying the cast.
+   */
+  updateShowRules(show: string, patch: ShowRulesPatch, updatedBy: string): ShowRules {
+    return this.txn(() => {
+      const current = this.ensureShowRules(show);
+      const switches: ShowRuleSwitches = { ...current.switches };
+      if (patch.switches) {
+        if (typeof patch.switches.requireTaskRelease === "boolean") switches.requireTaskRelease = patch.switches.requireTaskRelease;
+        if (typeof patch.switches.requireHumanMergeApproval === "boolean") switches.requireHumanMergeApproval = patch.switches.requireHumanMergeApproval;
+        if (typeof patch.switches.workerNotePropagation === "boolean") switches.workerNotePropagation = patch.switches.workerNotePropagation;
+        if (patch.switches.artifactTextMaxChars !== undefined) switches.artifactTextMaxChars = clampPositiveInt(patch.switches.artifactTextMaxChars, current.switches.artifactTextMaxChars);
+        if (patch.switches.artifactDataMaxBytes !== undefined) switches.artifactDataMaxBytes = clampPositiveInt(patch.switches.artifactDataMaxBytes, current.switches.artifactDataMaxBytes);
+      }
+      const policy = patch.policy !== undefined ? patch.policy : current.policy;
+      const at = this.now();
+      this.db
+        .prepare("UPDATE show_rules SET version = version + 1, switches_json = ?, policy = ?, updated_at = ?, updated_by = ? WHERE show = ?")
+        .run(JSON.stringify(switches), policy, at, updatedBy, show);
+      // A rule change is show-wide; wake everyone so the next poll delivers the new version.
+      this.events.emit(`wake:show:${show}`);
+      return mapShowRules(this.getShowRulesRow(show)!);
+    });
+  }
+
+  /**
+   * Rules delivery with token discipline: always returns the current `version`; returns the full
+   * `rules` only when this member hasn't seen the current version yet (register seeded the cursor
+   * to current, update_rules bumps the version past it), and advances the member's cursor so the
+   * full text is delivered exactly once per change. Delivered rules are authenticated director
+   * policy, distinct from the untrusted_peer envelope on peer content.
+   */
+  consumeRulesDelivery(memberId: string): { version: number; rules?: ShowRules } {
+    return this.txn(() => {
+      const member = this.getMemberRowRaw(memberId);
+      if (!member) return { version: 0 };
+      const rules = this.ensureShowRules(member.show);
+      if (member.rules_version_seen >= rules.version) return { version: rules.version };
+      this.db.prepare("UPDATE members SET rules_version_seen = ? WHERE id = ?").run(rules.version, memberId);
+      return { version: rules.version, rules };
+    });
+  }
+
   /** Deletes a show and every record under it. Returns false if the show doesn't exist. */
   deleteShow(show: string): boolean {
     return this.txn(() => {
@@ -613,6 +744,7 @@ export class Store {
       this.db.prepare("DELETE FROM tasks WHERE show = ?").run(show);
       this.db.prepare("DELETE FROM members WHERE show = ?").run(show);
       this.db.prepare("DELETE FROM direction WHERE show = ?").run(show);
+      this.db.prepare("DELETE FROM show_rules WHERE show = ?").run(show);
       this.db.prepare("DELETE FROM shows WHERE name = ?").run(show);
       // Parked polls of deleted members resolve on their next check with unknown_member.
       this.events.emit(`wake:show:${show}`);
@@ -730,6 +862,7 @@ export class Store {
         inputRequired: tasks.filter((t) => t.status === "input-required"),
         humanMessages,
       },
+      rules: this.getShowRules(show),
       ...(verbose ? { recentMessages: this.getRecentMessages(show) } : {}),
     };
   }
@@ -991,6 +1124,20 @@ export class Store {
 
       let artifacts = JSON.parse(row.artifacts_json) as TaskArtifact[];
       if (patch.artifacts && patch.artifacts.length > 0) {
+        // Artifact caps (show rule, machine-enforced): a worker->director channel bounded so a
+        // hostile completion can't ship an oversized text/data payload into the director's review.
+        const { artifactTextMaxChars, artifactDataMaxBytes } = this.getShowRules(row.show).switches;
+        for (const a of patch.artifacts) {
+          if (a.kind === "text" && a.text.length > artifactTextMaxChars) {
+            throw new Error(`artifact text exceeds artifactTextMaxChars (${artifactTextMaxChars}); got ${a.text.length}`);
+          }
+          if (a.kind === "data") {
+            const bytes = Buffer.byteLength(JSON.stringify(a.data ?? null), "utf8");
+            if (bytes > artifactDataMaxBytes) {
+              throw new Error(`artifact data exceeds artifactDataMaxBytes (${artifactDataMaxBytes}); got ${bytes}`);
+            }
+          }
+        }
         artifacts = artifacts.concat(patch.artifacts);
       }
 
@@ -1272,6 +1419,10 @@ export class Store {
 
   private pushNote(show: string, authorId: string, note: Note): string[] {
     const now = this.now();
+    // Note-propagation switch (show rule): when off, notes are stored and searchable but never
+    // auto-pushed to peers -- closing the unprompted worker->peer channel. Explicit search_notes
+    // still works (a pull the reader initiates, not a push).
+    if (!this.getShowRules(show).switches.workerNotePropagation) return [];
     // Delivery is gated on the recipient's *current task* being live, not the 90s member
     // lease: a worker heads-down executing only has to heartbeat every ~10min (see the sweep()
     // comment below), so it's routinely outside its member lease window while still genuinely
@@ -1342,6 +1493,10 @@ export class Store {
   notesForTask(task: Pick<Task, "show" | "title" | "brief" | "filesHint">, limit = this.noteConfig.notesPerTask): Note[] {
     const seen = new Set<string>();
     const result: Note[] = [];
+
+    // Note-propagation switch (show rule): when off, claim-time recall delivers nothing, so a
+    // claim never auto-surfaces peer notes. (Explicit search_notes remains available.)
+    if (!this.getShowRules(task.show).switches.workerNotePropagation) return result;
 
     if (task.filesHint.length > 0) {
       // notes is append-only and unbounded; bound the scan to the most recent slice instead of

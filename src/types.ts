@@ -216,6 +216,7 @@ export interface BoardState {
     inputRequired: BoardTaskView[];
     humanMessages: Message[];
   };
+  rules: ShowRules; // current server-held show rules (the callboard renders these)
   recentMessages?: Message[]; // present only when verbose (DESIGN.md "Activity feed": notes + messages)
 }
 
@@ -238,6 +239,51 @@ export class SupersededError extends Error {
     this.holder = holder;
     this.epoch = epoch;
   }
+}
+
+// --- Show rules (server-held policy; DESIGN.md "Show rules") ---
+
+/**
+ * Machine-enforced switches: the server reads each of these on the code path it governs, so a
+ * worker cannot override policy by editing a repo file (the whole reason rules moved server-side).
+ * Contrast `ShowRules.policy`, which is advisory prose the server delivers but NEVER enforces.
+ */
+export interface ShowRuleSwitches {
+  /** Withhold director-created tasks until a human releases them (release gate). Enforced in
+   * createTask (via the create_task tool) + claimNextTask. */
+  requireTaskRelease: boolean;
+  /** Delivered, agent-followed policy: do not merge without human approval. There is no merge
+   * through the server, so this is authenticated policy the fleet obeys, not a server-blocked
+   * action; its value over the old repo file is that a worker can't rewrite it. */
+  requireHumanMergeApproval: boolean;
+  /** When false, a member's notes are not auto-propagated to peers (no push-on-save, no
+   * claim-time relevant_notes); notes remain available via explicit search_notes. Enforced in
+   * pushNote + notesForTask. */
+  workerNotePropagation: boolean;
+  /** Max chars for a `text` artifact; enforced in updateTask. */
+  artifactTextMaxChars: number;
+  /** Max serialized-JSON bytes for a `data` artifact; enforced in updateTask. */
+  artifactDataMaxBytes: number;
+}
+
+/**
+ * A show's standing rules, held on the server (not in a repo file a worker could edit). `switches`
+ * are machine-enforced; `policy` is advisory prose delivered to the fleet but never enforced.
+ * `version` bumps on every change so delivery can be incremental; `updatedBy`/`updatedAt` make
+ * changes auditable.
+ */
+export interface ShowRules {
+  version: number;
+  switches: ShowRuleSwitches;
+  policy: string;
+  updatedAt: number;
+  updatedBy: string;
+}
+
+/** Partial update applied by update_rules / the admin API. Omitted switches keep their value. */
+export interface ShowRulesPatch {
+  switches?: Partial<ShowRuleSwitches>;
+  policy?: string;
 }
 
 // --- Env config (DESIGN.md "Env knobs") ---
@@ -267,14 +313,14 @@ export interface EnvConfig extends LeaseConfig, NoteConfig {
   dataDir: string;
   pollHoldSeconds: number;
   sweepIntervalS: number;
-  /** When true, director-created tasks are withheld until a human releases them on the callboard
-   * (REQUIRE_TASK_RELEASE). Off by default to preserve OOTB automation; turn on when admitting
-   * workers you do not fully trust, so a malicious director can't dispatch work unreviewed. */
-  requireTaskRelease: boolean;
 }
 
 const DEFAULT_LEASES: LeaseConfig = { workerLeaseS: 90, taskLeaseS: 900, directionLeaseS: 600 };
 const DEFAULT_NOTES: NoteConfig = { noteMaxChars: 2000, notesPerTask: 4 };
+// OOTB rule defaults (seeded into a new show; env vars below override deployment-wide). Automation
+// stays frictionless for solo shows: release gate off, merge approval off, notes propagate.
+const DEFAULT_ARTIFACT_TEXT_MAX = 10000;
+const DEFAULT_ARTIFACT_DATA_MAX = 16384;
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
   if (raw === undefined || raw === "") return fallback;
@@ -305,6 +351,21 @@ export function readNoteConfig(env: NodeJS.ProcessEnv = process.env): NoteConfig
 }
 
 /**
+ * Deployment-wide default switches, seeded into each new show's rules (the show's director/human
+ * can then change them via update_rules). `REQUIRE_TASK_RELEASE` is the headline knob; the rest
+ * follow the same env-as-default pattern. Same no-required-vars contract as the configs above.
+ */
+export function readRulesDefaults(env: NodeJS.ProcessEnv = process.env): ShowRuleSwitches {
+  return {
+    requireTaskRelease: parseBool(env.REQUIRE_TASK_RELEASE, false),
+    requireHumanMergeApproval: parseBool(env.REQUIRE_HUMAN_MERGE_APPROVAL, false),
+    workerNotePropagation: parseBool(env.WORKER_NOTE_PROPAGATION, true),
+    artifactTextMaxChars: parsePositiveInt(env.ARTIFACT_TEXT_MAX_CHARS, DEFAULT_ARTIFACT_TEXT_MAX),
+    artifactDataMaxBytes: parsePositiveInt(env.ARTIFACT_DATA_MAX_BYTES, DEFAULT_ARTIFACT_DATA_MAX),
+  };
+}
+
+/**
  * Full server config. Throws if SHOWRUNNER_TOKEN is unset.
  * SHOWRUNNER_WORKER_TOKEN is optional; when unset, worker == director (single-token mode).
  */
@@ -328,7 +389,6 @@ export function readEnvConfig(env: NodeJS.ProcessEnv = process.env): EnvConfig {
     dataDir: env.DATA_DIR && env.DATA_DIR.length > 0 ? env.DATA_DIR : "/data",
     pollHoldSeconds: parsePositiveInt(env.POLL_HOLD_SECONDS, 25),
     sweepIntervalS: parsePositiveInt(env.SWEEP_INTERVAL_S, 5),
-    requireTaskRelease: parseBool(env.REQUIRE_TASK_RELEASE, false),
     ...readLeaseConfig(env),
     ...readNoteConfig(env),
   };

@@ -179,6 +179,14 @@ main[hidden] { display: none; }
 .tasks-header { display: flex; align-items: baseline; gap: 10px; }
 .tasks-header #task-totals { margin-left: auto; }
 h3 .count { color: var(--dim); font-weight: 400; }
+.rule-list { list-style: none; margin: 6px 0; padding: 0; }
+.rule-list li { padding: 3px 0; font-size: 12px; display: flex; align-items: center; gap: 8px; }
+.rule-state { font-size: 10px; min-width: 28px; text-transform: uppercase; letter-spacing: 0.04em; }
+.rule-state.on { color: var(--accent); }
+.rule-state.off { color: var(--dim); }
+.rule-num { font-family: var(--mono); color: var(--amber); min-width: 32px; }
+.rule-policy { margin-top: 8px; font-size: 12px; }
+.rule-policy > div { margin-top: 2px; white-space: pre-wrap; }
 
 #task-columns {
   display: grid;

@@ -28,7 +28,7 @@ prior system ships.
 
 Deliberately **not**: a runner UI, a worktree manager, an A2A node, a product.
 State is one SQLite file; the dashboard is one static page; the tool surface
-is 10 tools.
+is 11 tools.
 
 ## Constraints that shaped the design (research findings)
 
@@ -91,8 +91,10 @@ SQLite (better-sqlite3, WAL). All rows plain JSON-friendly; `sqlite3` CLI or
 
 ```
 shows      { name PK, created_at, config_json }
+show_rules { show PK, version, switches_json, policy, updated_at, updated_by }
 members    { id PK, show, kind, display_name, role, registered_at,
-             last_seen_at, lease_expires_at, current_task_id, secret_hash }
+             last_seen_at, lease_expires_at, current_task_id, secret_hash,
+             rules_version_seen }
 direction  { show PK, director_id, epoch, lease_expires_at }   -- one row per show
 tasks      { id PK, show, context_id, title, brief, files_hint_json,
              depends_on_json, priority, status, assignee, attempt,
@@ -128,11 +130,12 @@ queued ──▶ assigned ──▶ working ──▶ completed
 - `queued → assigned` happens inside `await_work` (atomic claim in a SQLite
   transaction; dependency-unblocked, `released = 1`, priority DESC, age ASC;
   honors a pinned `assignee` if the director set one).
-- **Release gate:** with `REQUIRE_TASK_RELEASE` on, `create_task` inserts the
-  task with `released = 0`; it stays `queued` but is not claimable until a human
-  releases it (`POST /api/.../release`, or the callboard Release button). Off by
-  default, so OOTB automation is unchanged; the security lever for untrusted
-  workers (see Security posture).
+- **Release gate:** when the show's `requireTaskRelease` rule is on, `create_task`
+  inserts the task with `released = 0`; it stays `queued` but is not claimable
+  until a human releases it (`POST /api/.../release`, or the callboard Release
+  button). Off by default (the `REQUIRE_TASK_RELEASE` env sets the seed default
+  for new shows), so OOTB automation is unchanged; the security lever for
+  untrusted workers (see Security posture).
 - `input-required` is distinct from `failed` on purpose: it means "a decision
   is needed", pings the director's poll, and pulses amber on the callboard.
 - Terminal statuses are idempotent by task id: a worker whose lease was
@@ -187,18 +190,33 @@ placement means it travels with every clone, worktree, and cloud checkout,
 and a takeover director in a brand-new session picks it up with zero server
 machinery. The server never stores or parses it.
 
-### Showrunner rules (SHOWRUNNER.rules.md)
+### Showrunner rules (server-held show state)
 
 Playbook is *how to break down this project*. Rules are *how the fleet
-behaves*: PR/merge automation, optional dedicated-worker preferences, and
-short project standing rules. `showrunner init` scaffolds
-`SHOWRUNNER.rules.md` with OOTB defaults that favor full automation (open PR,
-squash-merge when green, verify is part of done). Users edit the file to
-require human merge approval or name soft assignee preferences (e.g. prefer
-one registered worker for art, one for verify). The director reads rules after
-`claim_direction`, reminds the cast via `send_message` to `all`, and workers
-re-read them when claiming a task. Same repo placement as the playbook; the
-server never stores or parses it.
+behaves*. Rules are **server-held per-show state, not a repo file** -- policy
+that governs untrusted members must not be writable by them, and every worker
+used to read `SHOWRUNNER.rules.md` from its own checkout. A show's rules split
+into two parts, and the schema is explicit about which is which:
+
+- **`switches`** -- structured, machine-enforced. The server reads each on the
+  code path it governs: `requireTaskRelease` (the release gate, in
+  `createTask`/`claimNextTask`), `workerNotePropagation` (in `pushNote` +
+  `notesForTask`), `artifactTextMaxChars`/`artifactDataMaxBytes` (in
+  `updateTask`), and `requireHumanMergeApproval` (delivered, agent-followed --
+  there is no merge through the server to block).
+- **`policy`** -- advisory prose, delivered but **never enforced**.
+
+New shows are seeded with OOTB defaults (favoring automation: release gate off,
+merge approval off, notes propagate); `REQUIRE_TASK_RELEASE` is the
+deployment-wide env default for the release-gate switch on new shows. The
+director changes rules with the `update_rules` tool (director-token-gated,
+epoch-fenced); the human edits them from the callboard or `showrunner rules
+set` (admin `/api`). Every change bumps `version`, records `updated_by`, and
+notifies the cast via `send_message` to `all`. Delivery has token discipline:
+`rules_version` rides on every task claim, and the full text is delivered at
+`register` and re-delivered on the first poll after the version changes.
+Delivered rules are tagged authenticated director policy, distinct from the
+`untrusted_peer` envelope on peer content.
 
 Sessions may fan out their own subagents to speed work; showrunner membership
 and task ownership stay with the registered session.
@@ -244,7 +262,7 @@ after finishing one, save a note if you learned something the next agent
 would want (with `files_hint` of the affected globs). Directors record
 generalizable decisions (especially answers to `input-required`) as notes.
 
-## MCP tool surface (10 tools)
+## MCP tool surface (11 tools)
 
 Everything takes/returns compact JSON. `member_id` is explicit in every call
 (the server is stateless per-request; reconnects and session restarts don't
@@ -254,9 +272,10 @@ matter).
 
 1. `register({show, kind, display_name?, capabilities?, session_url?,
    resume_hint?})` → `{member_id, member_secret, show, director,
-   board_summary, protocol}` — creates the show if new; `member_secret` is
-   issued once and must accompany `member_id` on every later call (per-member
-   auth); `protocol` is the full worker/director loop
+   board_summary, rules, protocol}` — creates the show if new; `member_secret`
+   is issued once and must accompany `member_id` on every later call (per-member
+   auth); `rules` is the show's current server-held policy (authenticated,
+   distinct from peer content); `protocol` is the full worker/director loop
    contract in ~600 tokens, so even a client that ignored the server
    instructions knows what to do next. `session_url`/`resume_hint` are how
    a human opens this session's chat: only the session knows this, so it
@@ -299,6 +318,10 @@ matter).
    `requeue`, `assign {assignee}`, `answer {body}` (for `input-required` →
    flips back to `working` and delivers the answer), `approve` (optional
    review gate, see config).
+11. `update_rules({member_id, epoch, switches?, policy?})` → `{rules}` — set
+   the show's server-held rules (machine-enforced switches and/or advisory
+   policy prose). Bumps `version`, is audited (`updated_by`), and notifies the
+   cast. The human's equivalent is the admin `/api` route (callboard / CLI).
 
 ### The one-line-prompt trick
 
@@ -384,9 +407,12 @@ Auth: `Authorization: Bearer` (or `?token=` once → cookie). Two tokens:
   (autostop + long-poll is exactly the wrong pair), 1GB volume mounted at
   `/data` for SQLite. `fly secrets set SHOWRUNNER_TOKEN=... SHOWRUNNER_WORKER_TOKEN=...`.
 - **Env knobs:** `SHOWRUNNER_TOKEN` (required), `SHOWRUNNER_WORKER_TOKEN`
-  (optional), `REQUIRE_TASK_RELEASE=false`, `PORT`, `DATA_DIR`,
-  `POLL_HOLD_SECONDS=25`, `WORKER_LEASE_S=90`, `TASK_LEASE_S=900`,
-  `DIRECTION_LEASE_S=600`, `NOTE_MAX_CHARS=2000`, `NOTES_PER_TASK=4`.
+  (optional), `PORT`, `DATA_DIR`, `POLL_HOLD_SECONDS=25`, `WORKER_LEASE_S=90`,
+  `TASK_LEASE_S=900`, `DIRECTION_LEASE_S=600`, `NOTE_MAX_CHARS=2000`,
+  `NOTES_PER_TASK=4`. Rule seed-defaults for new shows: `REQUIRE_TASK_RELEASE=false`,
+  `REQUIRE_HUMAN_MERGE_APPROVAL=false`, `WORKER_NOTE_PROPAGATION=true`,
+  `ARTIFACT_TEXT_MAX_CHARS=10000`, `ARTIFACT_DATA_MAX_BYTES=16384` (per-show
+  values live in the show's rules and are changed with `update_rules`).
 - **Reclaim sweep:** one `setInterval` (5s) expires leases, requeues tasks,
   wakes relevant waiters. Restart-safe because all state is in SQLite.
 
@@ -416,10 +442,12 @@ The four controls, strongest first:
    director, complete/poison another worker's task). Unknown member and wrong
    secret return the same `unauthorized_member` result, so there's no member-id
    oracle.
-2. **Human release gate (real boundary, opt-in).** With `REQUIRE_TASK_RELEASE`
-   on, a director-created task is withheld (not claimable) until a human
-   releases it on the callboard -- the deterministic check against a malicious
-   or compromised director admitting work no human vetted.
+2. **Human release gate (real boundary, opt-in).** With the show's
+   `requireTaskRelease` rule on, a director-created task is withheld (not
+   claimable) until a human releases it on the callboard -- the deterministic
+   check against a malicious or compromised director admitting work no human
+   vetted. This and the other fleet rules are server-held per-show state, not a
+   repo file a worker could edit (see "Showrunner rules").
 3. **Runtime containment (the real host boundary, not ours).** showrunner
    cannot stop a worker's host from running `curl`; only the agent runtime's
    own permissions can. So "can't upload host files" is enforced by running

@@ -149,9 +149,34 @@
   function render(board) {
     renderDirector(board && board.director);
     renderMembers(board);
+    renderRules(board && board.rules);
     renderTasks(board);
     renderActivity(board);
     renderQueueBanner(board);
+  }
+
+  // Server-held show rules, display-only (the callboard is a read-only window). Switches show as
+  // on/off text; the human changes them via `showrunner rules set` or the director's update_rules.
+  function renderRules(rules) {
+    const body = el("rules-body");
+    if (!body) return;
+    if (!rules) {
+      body.innerHTML = `<span class="hint">no show selected</span>`;
+      return;
+    }
+    const s = rules.switches || {};
+    const sw = (label, on) => `<li><span class="rule-state ${on ? "on" : "off"}">${on ? "on" : "off"}</span> ${label}</li>`;
+    const num = (label, val) => `<li><span class="rule-num">${escapeHtml(String(val))}</span> ${label}</li>`;
+    body.innerHTML = `
+      <div class="hint">v${rules.version} · updated by ${escapeHtml(rules.updatedBy || "?")}</div>
+      <ul class="rule-list">
+        ${sw("require human release of new tasks", !!s.requireTaskRelease)}
+        ${sw("require human merge approval", !!s.requireHumanMergeApproval)}
+        ${sw("propagate worker notes to peers", !!s.workerNotePropagation)}
+        ${num("artifact text max (chars)", s.artifactTextMaxChars)}
+        ${num("artifact data max (bytes)", s.artifactDataMaxBytes)}
+      </ul>
+      <div class="rule-policy"><span class="hint">policy (advisory)</span><div>${rules.policy ? escapeHtml(rules.policy) : '<span class="hint">none</span>'}</div></div>`;
   }
 
   function renderQueueBanner(board) {

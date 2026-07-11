@@ -147,7 +147,6 @@ app.post("/mcp", async (c) => {
     const server = createMcpServer(store, {
       pollHoldSeconds: config.pollHoldSeconds,
       authLevel: c.get("authLevel"),
-      requireTaskRelease: config.requireTaskRelease,
     });
     await server.connect(transport);
     await transport.handleRequest(c.env.incoming, c.env.outgoing);

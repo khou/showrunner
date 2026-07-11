@@ -55,12 +55,23 @@ Not yet).
 
 ### 2. Human release gate (real boundary, opt-in)
 
-Set `REQUIRE_TASK_RELEASE=on`. Director-created tasks are withheld (`released=0`,
-still `queued`) and no worker can claim them until a human releases each one on
-the callboard (or `showrunner task release`). This is the deterministic check
-against a malicious or compromised director: work no human vetted never reaches
-a worker. Off by default so out-of-the-box automation is unchanged; turn it on
-whenever the show admits workers you don't fully trust.
+Turn on the show's `requireTaskRelease` rule (`showrunner rules set
+--require-release on`, the callboard toggle, or seed it deployment-wide with the
+`REQUIRE_TASK_RELEASE` env). Director-created tasks are then withheld
+(`released=0`, still `queued`) and no worker can claim them until a human
+releases each one on the callboard (or `showrunner task release`). This is the
+deterministic check against a malicious or compromised director: work no human
+vetted never reaches a worker. Off by default so out-of-the-box automation is
+unchanged; turn it on whenever the show admits workers you don't fully trust.
+
+The release gate is one of the show's **server-held rules** -- fleet policy
+(release gate, merge approval, note propagation, artifact caps, advisory prose)
+lives in per-show server state, not a repo file, precisely because policy that
+governs untrusted members must not be writable by them. Only the director token
+(`update_rules`) or the human (callboard / `showrunner rules set`) can change
+it; changes are versioned and audited, and delivered to the fleet as
+authenticated director policy (distinct from the `untrusted_peer` tag on peer
+content).
 
 ### 3. Runtime containment (the real host boundary, and it is not ours)
 
@@ -100,7 +111,8 @@ elevated capability, and briefs point at repo docs rather than inlining shell.
 
 1. Set `SHOWRUNNER_WORKER_TOKEN` (distinct from `SHOWRUNNER_TOKEN`) so workers
    can't direct.
-2. Set `REQUIRE_TASK_RELEASE=on` and release tasks yourself after reading them.
+2. Turn on the `requireTaskRelease` rule and release tasks yourself after
+   reading them (`showrunner rules set --require-release on`, or the callboard).
 3. Run untrusted workers under a locked-down runtime (repo-scoped FS, network
    allowlist, no host secrets).
 4. Keep secrets out of task briefs and notes; point at repo files.

@@ -1,12 +1,12 @@
 // MCP tool surface for showrunner (DESIGN.md "MCP tool surface", PLAN.md "MCP tools"
-// + "Long-poll semantics"). The 10 pinned tools plus the "join" prompt.
+// + "Long-poll semantics"). The 11 pinned tools plus the "join" prompt.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { Store } from "./store.js";
 import { INSTRUCTIONS } from "./instructions.js";
-import { untrustedNotice } from "./trust.js";
+import { directorPolicyNotice, untrustedNotice } from "./trust.js";
 import {
   SupersededError,
   type AuthLevel,
@@ -41,8 +41,6 @@ export interface McpServerConfig {
   pollHoldSeconds: number;
   /** Defaults to director so in-memory tests keep full access. */
   authLevel?: AuthLevel;
-  /** When true, create_task withholds new tasks until a human releases them. Defaults false. */
-  requireTaskRelease?: boolean;
 }
 
 function forbiddenDirector(): CallToolResult {
@@ -68,6 +66,18 @@ const ARTIFACT_SCHEMA = z.discriminatedUnion("kind", [
 const UPDATE_STATUS = z.enum(["working", "input-required", "completed", "failed", "rejected"]);
 
 const DIRECT_ACTION = z.enum(["cancel", "requeue", "assign", "answer", "approve"]);
+
+// Partial rules switches for update_rules; every field optional so a caller changes one switch
+// without restating the rest. Structured switches only -- the advisory `policy` prose is separate.
+const RULES_SWITCHES = z
+  .object({
+    requireTaskRelease: z.boolean().optional(),
+    requireHumanMergeApproval: z.boolean().optional(),
+    workerNotePropagation: z.boolean().optional(),
+    artifactTextMaxChars: z.number().int().positive().optional(),
+    artifactDataMaxBytes: z.number().int().positive().optional(),
+  })
+  .optional();
 
 // register's self-reported chat link (DESIGN.md "session_url/resume_hint are how a human opens
 // this session's chat"): only the session itself knows this, so it's optional and validated at
@@ -179,6 +189,18 @@ function annotateAwaitWork(result: AwaitWorkResult): Record<string, unknown> {
       return _exhaustive;
     }
   }
+}
+
+/**
+ * Rules delivery with token discipline (DESIGN.md "Show rules"): `rules_version` always rides
+ * along so a member can tell if it's current; the full `rules` text (tagged as authenticated
+ * director policy) is included only when this member hasn't seen the current version, and exactly
+ * once per change. Merged into await_work and update_task results.
+ */
+function rulesDelivery(store: Store, memberId: string): Record<string, unknown> {
+  const { version, rules } = store.consumeRulesDelivery(memberId);
+  if (rules) return { rules_version: version, rules, rules_trust: directorPolicyNotice() };
+  return { rules_version: version };
 }
 
 function toRelevantNoteHit(note: Note): NoteHit {
@@ -400,6 +422,10 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         show: member.show,
         director,
         board_summary,
+        // Full show rules at register (authenticated director policy, distinct from untrusted peer
+        // content). rules_version rides on later task claims; the full text re-delivers on change.
+        rules: store.getShowRules(member.show),
+        rules_trust: directorPolicyNotice(),
         protocol: INSTRUCTIONS,
       };
       if (!preexisting.includes(member.show)) {
@@ -434,7 +460,7 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         return jsonResult(unauthorizedMember(args.member_id));
       }
       const result = await resolveAwaitWork(store, args.member_id, args.wait_seconds, config.pollHoldSeconds);
-      return jsonResult(annotateAwaitWork(result));
+      return jsonResult({ ...annotateAwaitWork(result), ...rulesDelivery(store, args.member_id) });
     },
   );
 
@@ -464,8 +490,11 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         // notes and answers on its ~10min heartbeat instead of only at its next await_work."
         // Same drainInbox as await_work; omit the key rather than ship an empty array.
         const messages = store.drainInbox(resolved.member.id);
+        const rules = rulesDelivery(store, resolved.member.id);
         return jsonResult(
-          messages.length > 0 ? { task, messages, trust: untrustedNotice(["messages[].body"]) } : { task },
+          messages.length > 0
+            ? { task, messages, trust: untrustedNotice(["messages[].body"]), ...rules }
+            : { task, ...rules },
         );
       } catch (err) {
         return jsonResult({ status: "error", message: (err as Error).message }, true);
@@ -619,6 +648,10 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         if (err instanceof SupersededError) return supersededResult(err);
         throw err;
       }
+      // Release gate is a per-show rule now (not an env flag): a director-authored task is
+      // withheld until a human releases it on the callboard -- the check against a
+      // malicious/compromised director. The human's own /api create path is never withheld.
+      const requireRelease = store.getShowRules(member.show).switches.requireTaskRelease;
       const { task, overlaps } = store.createTask({
         show: member.show,
         title: args.title,
@@ -629,12 +662,10 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         filesHint: args.files_hint,
         priority: args.priority,
         assignee: args.assignee,
-        // Under the release gate, a director-authored task is withheld until a human releases it
-        // on the callboard -- the deterministic check against a malicious/compromised director.
-        released: config.requireTaskRelease ? false : undefined,
+        released: requireRelease ? false : undefined,
       });
-      const pending = config.requireTaskRelease
-        ? { pending_release: true, notice: "REQUIRE_TASK_RELEASE is on: this task is withheld until a human releases it on the callboard." }
+      const pending = requireRelease
+        ? { pending_release: true, notice: "requireTaskRelease is on for this show: the task is withheld until a human releases it on the callboard." }
         : {};
       return jsonResult({ task_id: task.id, task, overlaps, ...pending });
     },
@@ -670,6 +701,42 @@ export function createMcpServer(store: Store, config: McpServerConfig): McpServe
         if (err instanceof SupersededError) return supersededResult(err);
         return jsonResult({ status: "error", message: (err as Error).message }, true);
       }
+    },
+  );
+
+  server.registerTool(
+    "update_rules",
+    {
+      description:
+        "Director-only: set this show's rules (machine-enforced switches and/or advisory policy prose). Epoch-fenced. Bumps rules_version, is audited, and notifies the cast. Requires the director bearer token.",
+      inputSchema: {
+        member_id: z.string().min(1),
+        member_secret: MEMBER_SECRET,
+        epoch: z.number().int(),
+        switches: RULES_SWITCHES,
+        policy: z.string().optional(),
+      },
+    },
+    async (args) => {
+      const denied = requireDirectorAuth();
+      if (denied) return denied;
+      const resolved = resolveMember(store, args.member_id, args.member_secret);
+      if ("result" in resolved) return resolved.result;
+      const { member } = resolved;
+      try {
+        store.checkEpoch(member.show, member.id, args.epoch);
+      } catch (err) {
+        if (err instanceof SupersededError) return supersededResult(err);
+        throw err;
+      }
+      if (args.switches === undefined && args.policy === undefined) {
+        return jsonResult({ status: "error", message: "update_rules needs at least one of switches or policy" }, true);
+      }
+      const rules = store.updateShowRules(member.show, { switches: args.switches, policy: args.policy }, member.id);
+      // Notify the cast so workers re-read (existing send_message-to-all pattern); their next poll
+      // also carries the new version and full text via the rules-delivery cursor.
+      store.sendMessage(member.id, "all", `show rules updated to v${rules.version} by ${member.id}`);
+      return jsonResult({ status: "updated", rules, rules_trust: directorPolicyNotice() });
     },
   );
 
