@@ -24,8 +24,9 @@ One SQLite file, one read-only dashboard, a small fixed MCP tool surface.
 
 2. Paste into each session opened in this repo that you want doing work:
 
-   > You're a showrunner worker. Loop forever: await_work, do the task,
-   > update_task, await_work. Finishing a task is never a reason to stop;
-   > only eviction or my stop message ends the loop.
+   > You're a showrunner worker. Loop forever: await_work, plan the task and
+   > record the plan with update_task, then execute it, update_task, await_work.
+   > Finishing a task is never a reason to stop; only eviction or my stop
+   > message ends the loop.
 
 3. Tell the director (the setup session from step 1) what you want built, and watch it happen on the callboard link it gave you.

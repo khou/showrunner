@@ -34,6 +34,7 @@ import {
   type TaskNote,
   type TaskStatus,
   DEFAULT_DIRECTIVES,
+  DEFAULT_SWITCHES,
   readLeaseConfig,
   readNoteConfig,
   readRulesDefaults,
@@ -472,7 +473,11 @@ function mapNoteHit(r: NoteRow): NoteHit {
 function mapShowRules(r: ShowRulesRow): ShowRules {
   return {
     version: r.version,
-    switches: JSON.parse(r.switches_json) as ShowRuleSwitches,
+    // Merge over the structural defaults so a row whose switches_json predates a switch still yields
+    // a complete, typed object: an older show missing requireValidationOnComplete inherits the
+    // documented default (on) rather than reading undefined -- which would silently disable the gate
+    // and hide the switch from the CLI/callboard. Stored keys always win.
+    switches: { ...DEFAULT_SWITCHES, ...(JSON.parse(r.switches_json) as Partial<ShowRuleSwitches>) },
     policy: r.policy,
     directives: JSON.parse(r.directives_json) as RuleDirective[],
     updatedAt: r.updated_at,

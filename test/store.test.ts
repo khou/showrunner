@@ -1135,6 +1135,10 @@ describe("show_rules.directives_json migration", () => {
       expect(rules.version).toBe(3); // pre-existing row untouched
       expect(rules.policy).toBe("old policy");
       expect(rules.directives).toEqual([]); // backfilled, NOT retroactively seeded with defaults
+      expect(rules.switches.requireTaskRelease).toBe(true); // stored switch survives
+      // A switch that predates this row's switches_json is backfilled from the structural default,
+      // not left undefined: the validation gate is visible + enforceable on upgraded shows.
+      expect(rules.switches.requireValidationOnComplete).toBe(true);
       // The migrated table is fully functional for new directives.
       const added = store.updateShowRules("myshow", { addDirectives: [{ text: "post-migration rule" }] }, "human");
       expect(added.directives.map((d) => d.text)).toContain("post-migration rule");
@@ -1196,6 +1200,30 @@ describe("members.session_url/resume_hint migration", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("plan before execute (worker planning phase)", () => {
+  it("records the plan as the task's opening journal entry and starts execution (assigned -> working)", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "Add combat", brief: "see docs/combat.md", createdBy: director.id });
+
+    const claimed = store.claimNextTask(worker.id)!;
+    expect(claimed.status).toBe("assigned"); // freshly claimed: not yet planned or started
+
+    // One call records the plan AND moves the task into execution -- the documented
+    // assigned -> working edge finally gets a meaning: "has a plan and is executing".
+    const plan = "Plan: 1) read docs/combat.md 2) add CombatSystem 3) wire into loop. Risk: turn-order edge cases.";
+    const updated = store.updateTask(worker.id, task.id, { status: "working", note: plan });
+    expect(updated.status).toBe("working");
+
+    // The plan is durable server state, not session-local: it lives in the task journal, so it
+    // renders on the callboard (verbose board == get_board) and a replacement worker resuming
+    // this task sees the approach instead of re-deriving it.
+    const view = store.getBoard("myshow", true).tasks.find((t) => t.id === task.id)!;
+    expect(view.notes?.some((n) => n.author === worker.id && n.body === plan)).toBe(true);
   });
 });
 
@@ -1580,6 +1608,25 @@ describe("requeue / reassign failed tasks + failure surfacing", () => {
     store.claimNextTask(worker.id);
     store.updateTask(worker.id, done.id, { status: "completed", validation: "ok" });
     expect(() => store.adminRequeueTask(done.id, "human")).toThrow(/failed, rejected, or in-flight/);
+  });
+
+  it("assign on a completed/canceled task is metadata-only: it records the assignee but does NOT reopen it", () => {
+    const { store, director, worker } = failedTask();
+    const other = store.register("myshow", "claude-local");
+    // completed stays completed
+    const { task: done } = store.createTask({ show: "myshow", title: "done", brief: "b", createdBy: director.id });
+    store.claimNextTask(worker.id);
+    store.updateTask(worker.id, done.id, { status: "completed", validation: "ok" });
+    const assignedDone = store.directTask(director.id, 1, done.id, { type: "assign", assignee: other.id });
+    expect(assignedDone.status).toBe("completed"); // NOT reopened to queued
+    expect(assignedDone.assignee).toBe(other.id);
+    expect(assignedDone.attempt).toBe(0); // no attempt bump on a final task
+
+    // canceled stays canceled
+    const { task: killed } = store.createTask({ show: "myshow", title: "killed", brief: "b", createdBy: director.id });
+    store.directTask(director.id, 1, killed.id, { type: "cancel" });
+    const assignedKilled = store.directTask(director.id, 1, killed.id, { type: "assign", assignee: other.id });
+    expect(assignedKilled.status).toBe("canceled");
   });
 });
 

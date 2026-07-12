@@ -350,11 +350,11 @@ export interface ShowRuleSwitches {
    * the director). Default off so solo shows keep the frictionless shared worker token. Enforced
    * in the register tool. Director-token registration is always exempt. */
   requireInvite: boolean;
-  /** Reject update_task status:"completed" unless the completing call carries a validation claim
-   * (a `validation` string, a text/branch artifact, or a note). The mechanical backstop for the
-   * "adversarially validate before done" directive: the server can't judge the validation, but it
-   * refuses a bare completion so "how did you validate?" is always on the record. Enforced in
-   * updateTask. */
+  /** Reject update_task status:"completed" unless the completing call carries a validation claim:
+   * a `validation` string, or failing that a `note`. (Artifacts are the deliverable, not the
+   * claim, so they do not satisfy it.) The mechanical backstop for the "adversarially validate
+   * before done" directive: the server can't judge the validation, but it refuses a bare
+   * completion so "how did you validate?" is always on the record. Enforced in updateTask. */
   requireValidationOnComplete: boolean;
 }
 
@@ -448,6 +448,23 @@ const DEFAULT_ARTIFACT_TEXT_MAX = 10000;
 const DEFAULT_ARTIFACT_DATA_MAX = 16384;
 
 /**
+ * Structural OOTB switch defaults -- the single source of truth for "what a switch is when nothing
+ * says otherwise". `readRulesDefaults` overrides these from env for NEW shows; `mapShowRules`
+ * merges a stored row over these so an old show whose switches_json predates a switch still reads a
+ * complete, typed object (not `undefined`) and inherits the documented default -- see the
+ * requireValidationOnComplete migration note in store.ts.
+ */
+export const DEFAULT_SWITCHES: ShowRuleSwitches = {
+  requireTaskRelease: false,
+  requireHumanMergeApproval: false,
+  workerNotePropagation: true,
+  requireInvite: false,
+  requireValidationOnComplete: true,
+  artifactTextMaxChars: DEFAULT_ARTIFACT_TEXT_MAX,
+  artifactDataMaxBytes: DEFAULT_ARTIFACT_DATA_MAX,
+};
+
+/**
  * Generic, domain-neutral hard rules seeded into every new show's `directives`. Kept behavioral
  * and project-agnostic so they read sensibly for any show; project-specific rules are the
  * director's to add (or these are the director's to edit/remove) via update_rules. They encode the
@@ -514,16 +531,16 @@ export function readNoteConfig(env: NodeJS.ProcessEnv = process.env): NoteConfig
  */
 export function readRulesDefaults(env: NodeJS.ProcessEnv = process.env): ShowRuleSwitches {
   return {
-    requireTaskRelease: parseBool(env.REQUIRE_TASK_RELEASE, false),
-    requireHumanMergeApproval: parseBool(env.REQUIRE_HUMAN_MERGE_APPROVAL, false),
-    workerNotePropagation: parseBool(env.WORKER_NOTE_PROPAGATION, true),
-    artifactTextMaxChars: parsePositiveInt(env.ARTIFACT_TEXT_MAX_CHARS, DEFAULT_ARTIFACT_TEXT_MAX),
-    artifactDataMaxBytes: parsePositiveInt(env.ARTIFACT_DATA_MAX_BYTES, DEFAULT_ARTIFACT_DATA_MAX),
-    requireInvite: parseBool(env.REQUIRE_INVITE, false),
+    requireTaskRelease: parseBool(env.REQUIRE_TASK_RELEASE, DEFAULT_SWITCHES.requireTaskRelease),
+    requireHumanMergeApproval: parseBool(env.REQUIRE_HUMAN_MERGE_APPROVAL, DEFAULT_SWITCHES.requireHumanMergeApproval),
+    workerNotePropagation: parseBool(env.WORKER_NOTE_PROPAGATION, DEFAULT_SWITCHES.workerNotePropagation),
+    artifactTextMaxChars: parsePositiveInt(env.ARTIFACT_TEXT_MAX_CHARS, DEFAULT_SWITCHES.artifactTextMaxChars),
+    artifactDataMaxBytes: parsePositiveInt(env.ARTIFACT_DATA_MAX_BYTES, DEFAULT_SWITCHES.artifactDataMaxBytes),
+    requireInvite: parseBool(env.REQUIRE_INVITE, DEFAULT_SWITCHES.requireInvite),
     // On by default: the fleet's headline discipline is "validate before done", so a bare
     // completion is refused out of the box. Turn off per-show (update_rules) or deployment-wide
     // (REQUIRE_VALIDATION_ON_COMPLETE=off) for frictionless solo shows.
-    requireValidationOnComplete: parseBool(env.REQUIRE_VALIDATION_ON_COMPLETE, true),
+    requireValidationOnComplete: parseBool(env.REQUIRE_VALIDATION_ON_COMPLETE, DEFAULT_SWITCHES.requireValidationOnComplete),
   };
 }
 

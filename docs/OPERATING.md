@@ -213,6 +213,17 @@ eviction-decision surface. Eviction is durable only with `requireInvite` on.
 - Polls return unread-only messages, and task briefs are substantial but bounded
   (goal, acceptance criteria, constraints; they point at docs for long specs
   rather than re-pasting them), keeping the coordination overhead in tokens small.
+- Workers plan before they execute. A brief sets the goal and acceptance
+  criteria, not the how, so the protocol has a worker expand it into a short
+  plan (approach, steps, files, risks) and record it as the task's opening
+  journal entry -- the same `update_task` call flips the task `assigned ->
+  working`. The plan is server state, not session-local, so it renders on the
+  callboard, survives the session being killed (a replacement worker resumes
+  from it rather than re-deriving the approach), and gives the director an early
+  course-correction point instead of only a completion to review. A
+  note-only/`working` `update_task` writes the journal without disturbing the
+  escalation clock or the current-task pointer, so this needs no new tool,
+  state, or schema.
 - A terminal `update_task` (completed/failed/rejected) returns
   `next: {action: "await_work", queued, hint}` -- the required next call plus
   live queue depth, aimed at clients that treat "task done, summarize" as
