@@ -1457,6 +1457,8 @@ describe("show rules: directives (named binding hard rules)", () => {
     }
     // One of them is the PR-hygiene / superseded-draft rule (the fix for orphan draft merges).
     expect(rules.directives.some((d) => /superseded/i.test(d.text))).toBe(true);
+    // And the fetch-latest-before-creating-tasks rule (stale checkouts spawn already-done tasks).
+    expect(rules.directives.some((d) => /origin\/main.*before creating tasks/i.test(d.text))).toBe(true);
   });
 
   it("add/edit/remove directives by id, bumping the version each time", () => {

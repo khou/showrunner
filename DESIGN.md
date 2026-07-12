@@ -246,7 +246,8 @@ into three layers, and the schema is explicit about which is which:
 
 New shows are seeded with OOTB defaults (automation-favoring switches: release
 gate off, merge approval off, notes propagate, validation-on-complete on) plus a
-generic set of default `directives` (plan-first + escalate design questions,
+generic set of default `directives` (pull latest main before creating tasks,
+plan-first + escalate design questions,
 adversarially validate before done, PR hygiene / no orphaned superseded drafts,
 escalate human-authority decisions) that the director can edit or remove.
 `REQUIRE_TASK_RELEASE` and `REQUIRE_VALIDATION_ON_COMPLETE` are the
