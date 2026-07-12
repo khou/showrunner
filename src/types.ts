@@ -490,7 +490,7 @@ export const DEFAULT_DIRECTIVES: { text: string; severity: "must" | "should" }[]
   },
   {
     text:
-      "Keep PRs clean: close superseded or abandoned draft PRs in the same session, referencing the superseding SHA/PR, and never end a session holding an unreconciled draft PR -- merge it, close it, or requeue the task.",
+      "Keep PRs and worktrees clean: close superseded or abandoned draft PRs in the same session (reference the superseding SHA/PR); never end a session holding an unreconciled draft PR or a committed-but-un-PR'd task branch; and if you worked the task in a dedicated git worktree, remove it once the task lands so stale per-task checkouts (each a multi-GB working tree) don't pile up on the host.",
     severity: "must",
   },
   {

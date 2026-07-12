@@ -163,7 +163,8 @@ governs untrusted members must not be editable by them). Each show has:
 New shows seed OOTB defaults (automation-favoring switches, plus a generic set of
 default directives: pull latest main before creating tasks, plan-first + escalate
 design questions, validate before done,
-close superseded/abandoned draft PRs, escalate human-authority decisions -- all
+PR + worktree hygiene (close superseded drafts, prune landed task worktrees),
+escalate human-authority decisions -- all
 editable). The director changes rules with the `update_rules` tool; the human
 edits them on the callboard-adjacent CLI (`showrunner rules set` / `rules
 directive`) or the admin API. Every change bumps a version, is audited
@@ -367,6 +368,33 @@ env/`~` context and opens it in the browser (`--print` to stdout only).
 
 This is a human convenience over `/api`, not something agents call. Agents
 talk MCP.
+
+## Disk housekeeping (per-task worktrees)
+
+showrunner state is tiny (one SQLite file). The disk cost is on the **worker
+hosts**: running a parallel local fleet, each worker typically checks out its
+task on a dedicated git worktree (`show/<task_id>-<slug>`), and a full working
+tree -- `node_modules`, a Rust `target/`, submodule builds -- is easily several
+GB. These pile up because a finished/evicted worker rarely prunes its own
+worktree. The `directives` PR+worktree-hygiene rule tells workers to remove a
+task worktree once it lands, but treat periodic host cleanup as the backstop
+(the director's freshness loop is a natural cadence):
+
+```sh
+# 1. list showrunner task worktrees and their merge state
+git worktree list
+# 2. remove worktrees whose task branch already merged (submodule repos refuse
+#    `git worktree remove`, so rm the dir then prune metadata):
+rm -rf ../<repo>-<slug> && git worktree prune
+# 3. for worktrees you keep (unmerged work), reclaim just the regeneratable
+#    build/deps -- source and uncommitted changes are untouched, ./bin build regenerates:
+rm -rf <wt>/node_modules <wt>/apps/*/node_modules <wt>/apps/*/target <wt>/apps/*/dist
+git -C <wt> submodule deinit -f <submodule>   # only if the submodule is clean
+```
+
+Never `rm -rf` or force-remove a worktree with unmerged commits or uncommitted
+source you still want -- check `git -C <wt> status` and `git -C <wt> rev-list
+--count origin/main..HEAD` first.
 
 ## Verifying a deployment
 
