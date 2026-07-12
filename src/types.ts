@@ -270,6 +270,11 @@ export interface BoardTaskView {
   // Set once a director has taken on this input-required escalation (take_input); the callboard
   // badges the card so the human sees the blocker is being handled, not just sitting.
   inputTakenAt: number | null;
+  // The task's most recent journal note, attached for failed/rejected/input-required tasks so the
+  // WHY rides along without a verbose board fetch: a director's stripped review item (no full
+  // `notes`) still carries the failure reason, and requeue is an informed decision. Peer-authored
+  // text -> the MCP layer tags it untrusted when it surfaces it.
+  lastNote?: string;
   notes?: TaskNote[]; // present only when verbose
 }
 
@@ -345,6 +350,29 @@ export interface ShowRuleSwitches {
    * the director). Default off so solo shows keep the frictionless shared worker token. Enforced
    * in the register tool. Director-token registration is always exempt. */
   requireInvite: boolean;
+  /** Reject update_task status:"completed" unless the completing call carries a validation claim:
+   * a `validation` string, or failing that a `note`. (Artifacts are the deliverable, not the
+   * claim, so they do not satisfy it.) The mechanical backstop for the "adversarially validate
+   * before done" directive: the server can't judge the validation, but it refuses a bare
+   * completion so "how did you validate?" is always on the record. Enforced in updateTask. */
+  requireValidationOnComplete: boolean;
+}
+
+/**
+ * A named, individually-addressable hard rule the director writes to the server. Delivered to
+ * every member as authenticated director policy and framed as BINDING (must-follow), distinct from
+ * `ShowRules.policy` advisory prose. The server enforces only what it mechanically can (see
+ * `requireValidationOnComplete`); the rest are authoritative behavioral requirements the fleet
+ * obeys because they arrive trust:"authenticated_director_policy", not because a code path blocks.
+ * `severity` lets a director mark a rule "should" (strong preference) vs the default "must".
+ */
+export interface RuleDirective {
+  id: string;
+  text: string;
+  severity: "must" | "should";
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
 }
 
 /**
@@ -357,14 +385,24 @@ export interface ShowRules {
   version: number;
   switches: ShowRuleSwitches;
   policy: string;
+  /** Named, binding hard rules the director CRUDs by id. Delivered as authenticated director
+   * policy and treated by the fleet as must-follow, distinct from the advisory `policy` prose. */
+  directives: RuleDirective[];
   updatedAt: number;
   updatedBy: string;
 }
 
-/** Partial update applied by update_rules / the admin API. Omitted switches keep their value. */
+/**
+ * Partial update applied by update_rules / the admin API. Omitted switches keep their value.
+ * Directive edits apply in a fixed order (remove, then edit, then add) so one call can, e.g.,
+ * replace a rule by removing its id and adding the new text; `addDirectives` mints fresh ids.
+ */
 export interface ShowRulesPatch {
   switches?: Partial<ShowRuleSwitches>;
   policy?: string;
+  addDirectives?: { text: string; severity?: "must" | "should" }[];
+  editDirectives?: { id: string; text?: string; severity?: "must" | "should" }[];
+  removeDirectives?: string[];
 }
 
 // --- Env config (DESIGN.md "Env knobs") ---
@@ -409,6 +447,54 @@ const DEFAULT_NOTES: NoteConfig = { noteMaxChars: 2000, notesPerTask: 4 };
 const DEFAULT_ARTIFACT_TEXT_MAX = 10000;
 const DEFAULT_ARTIFACT_DATA_MAX = 16384;
 
+/**
+ * Structural OOTB switch defaults -- the single source of truth for "what a switch is when nothing
+ * says otherwise". `readRulesDefaults` overrides these from env for NEW shows; `mapShowRules`
+ * merges a stored row over these so an old show whose switches_json predates a switch still reads a
+ * complete, typed object (not `undefined`) and inherits the documented default -- see the
+ * requireValidationOnComplete migration note in store.ts.
+ */
+export const DEFAULT_SWITCHES: ShowRuleSwitches = {
+  requireTaskRelease: false,
+  requireHumanMergeApproval: false,
+  workerNotePropagation: true,
+  requireInvite: false,
+  requireValidationOnComplete: true,
+  artifactTextMaxChars: DEFAULT_ARTIFACT_TEXT_MAX,
+  artifactDataMaxBytes: DEFAULT_ARTIFACT_DATA_MAX,
+};
+
+/**
+ * Generic, domain-neutral hard rules seeded into every new show's `directives`. Kept behavioral
+ * and project-agnostic so they read sensibly for any show; project-specific rules are the
+ * director's to add (or these are the director's to edit/remove) via update_rules. They encode the
+ * cross-cutting coordination discipline this fleet wants by default: plan-first + escalate design
+ * questions, adversarial validation before done, PR hygiene (no orphaned/superseded drafts), and
+ * escalating human-authority decisions rather than deciding them.
+ */
+export const DEFAULT_DIRECTIVES: { text: string; severity: "must" | "should" }[] = [
+  {
+    text:
+      "Before implementing, write a short plan (approach, files you will touch, risks) and post it as a task note; ask the director about any design decision or ambiguity the brief, docs, and rules do not settle -- escalate, do not guess.",
+    severity: "must",
+  },
+  {
+    text:
+      "Adversarially review and validate your own work before marking a task completed: drive the real user-facing surface (not a debug shortcut), try to break it, and state in the completion how you validated.",
+    severity: "must",
+  },
+  {
+    text:
+      "Keep PRs clean: close superseded or abandoned draft PRs in the same session, referencing the superseding SHA/PR, and never end a session holding an unreconciled draft PR -- merge it, close it, or requeue the task.",
+    severity: "must",
+  },
+  {
+    text:
+      "Escalate anything needing human authority -- money, irreversible or destructive actions, secrets, or design-direction changes -- to the director rather than deciding it yourself.",
+    severity: "must",
+  },
+];
+
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
   if (raw === undefined || raw === "") return fallback;
   const n = Number(raw);
@@ -445,12 +531,16 @@ export function readNoteConfig(env: NodeJS.ProcessEnv = process.env): NoteConfig
  */
 export function readRulesDefaults(env: NodeJS.ProcessEnv = process.env): ShowRuleSwitches {
   return {
-    requireTaskRelease: parseBool(env.REQUIRE_TASK_RELEASE, false),
-    requireHumanMergeApproval: parseBool(env.REQUIRE_HUMAN_MERGE_APPROVAL, false),
-    workerNotePropagation: parseBool(env.WORKER_NOTE_PROPAGATION, true),
-    artifactTextMaxChars: parsePositiveInt(env.ARTIFACT_TEXT_MAX_CHARS, DEFAULT_ARTIFACT_TEXT_MAX),
-    artifactDataMaxBytes: parsePositiveInt(env.ARTIFACT_DATA_MAX_BYTES, DEFAULT_ARTIFACT_DATA_MAX),
-    requireInvite: parseBool(env.REQUIRE_INVITE, false),
+    requireTaskRelease: parseBool(env.REQUIRE_TASK_RELEASE, DEFAULT_SWITCHES.requireTaskRelease),
+    requireHumanMergeApproval: parseBool(env.REQUIRE_HUMAN_MERGE_APPROVAL, DEFAULT_SWITCHES.requireHumanMergeApproval),
+    workerNotePropagation: parseBool(env.WORKER_NOTE_PROPAGATION, DEFAULT_SWITCHES.workerNotePropagation),
+    artifactTextMaxChars: parsePositiveInt(env.ARTIFACT_TEXT_MAX_CHARS, DEFAULT_SWITCHES.artifactTextMaxChars),
+    artifactDataMaxBytes: parsePositiveInt(env.ARTIFACT_DATA_MAX_BYTES, DEFAULT_SWITCHES.artifactDataMaxBytes),
+    requireInvite: parseBool(env.REQUIRE_INVITE, DEFAULT_SWITCHES.requireInvite),
+    // On by default: the fleet's headline discipline is "validate before done", so a bare
+    // completion is refused out of the box. Turn off per-show (update_rules) or deployment-wide
+    // (REQUIRE_VALIDATION_ON_COMPLETE=off) for frictionless solo shows.
+    requireValidationOnComplete: parseBool(env.REQUIRE_VALIDATION_ON_COMPLETE, DEFAULT_SWITCHES.requireValidationOnComplete),
   };
 }
 

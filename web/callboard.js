@@ -248,15 +248,26 @@
     const s = rules.switches || {};
     const sw = (label, on) => `<li><span class="rule-state ${on ? "on" : "off"}">${on ? "on" : "off"}</span> ${label}</li>`;
     const num = (label, val) => `<li><span class="rule-num">${escapeHtml(String(val))}</span> ${label}</li>`;
+    const directives = Array.isArray(rules.directives) ? rules.directives : [];
+    const directivesHtml = directives.length
+      ? `<ul class="rule-directives">${directives
+          .map(
+            (d) =>
+              `<li><span class="rule-sev ${d.severity === "should" ? "should" : "must"}">${escapeHtml(d.severity || "must")}</span> ${escapeHtml(d.text || "")}</li>`,
+          )
+          .join("")}</ul>`
+      : '<span class="hint">none</span>';
     body.innerHTML = `
       <div class="hint">v${rules.version} · updated by ${escapeHtml(rules.updatedBy || "?")}</div>
       <ul class="rule-list">
         ${sw("require human release of new tasks", !!s.requireTaskRelease)}
         ${sw("require human merge approval", !!s.requireHumanMergeApproval)}
         ${sw("propagate worker notes to peers", !!s.workerNotePropagation)}
+        ${sw("require validation to complete a task", !!s.requireValidationOnComplete)}
         ${num("artifact text max (chars)", s.artifactTextMaxChars)}
         ${num("artifact data max (bytes)", s.artifactDataMaxBytes)}
       </ul>
+      <div class="rule-directives-block"><span class="hint">directives (binding)</span>${directivesHtml}</div>
       <div class="rule-policy"><span class="hint">policy (advisory)</span><div>${rules.policy ? escapeHtml(rules.policy) : '<span class="hint">none</span>'}</div></div>`;
   }
 

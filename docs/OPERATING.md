@@ -115,8 +115,9 @@ drives the same `/api` the callboard reads. Shows:
   its task. The synthetic `human` row (api's audit actor for CLI/HTTP writes)
   is not listed -- it isn't a session anyone can talk to.
 - **Rules**: the show's current server-held rules (switches shown on/off,
-  advisory policy, version) -- display only; edit via `showrunner rules set`.
-  Renders in the bottom row beside the activity feed, below the task board.
+  binding directives, advisory policy, version) -- display only; edit via
+  `showrunner rules set` / `showrunner rules directive`. Renders in the bottom
+  row beside the activity feed, below the task board.
 - **Task columns** (each with a count): queued / needs input / failures.
   Queued and needs-input show the full list; failures shows the latest 20.
   Queued is ordered the way `await_work` claims (priority, then age), so
@@ -151,16 +152,23 @@ governs untrusted members must not be editable by them). Each show has:
 - **switches** (machine-enforced): `requireTaskRelease`,
   `requireHumanMergeApproval` (delivered/agent-followed; pair with repo branch
   protection for an enforced gate), `workerNotePropagation`, `requireInvite`,
-  `artifactTextMaxChars`, `artifactDataMaxBytes`.
+  `requireValidationOnComplete` (a task can't be marked `completed` without a
+  validation claim), `artifactTextMaxChars`, `artifactDataMaxBytes`.
+- **directives** (binding hard rules): a director-CRUD list of named rules
+  (`{id, text, severity}`) delivered to the fleet as must-follow policy, distinct
+  from advisory `policy`. Edit by id with `showrunner rules directive add|edit|rm`
+  or the director's `update_rules` (`add_directives`/`edit_directives`/`remove_directives`).
 - **policy** (advisory prose, delivered but never enforced).
 
-New shows seed OOTB defaults (favoring automation). The director changes rules
-with the `update_rules` tool; the human edits them on the callboard-adjacent CLI
-(`showrunner rules set`) or the admin API. Every change bumps a version, is
-audited (`updated_by`), and pings the cast; `register` delivers the full rules
-and later polls re-deliver on version change. Playbook (`SHOWRUNNER.md`) stays a
-repo file about decomposing *this* project (advisory). Sessions may fan out
-subagents freely.
+New shows seed OOTB defaults (automation-favoring switches, plus a generic set of
+default directives: plan-first + escalate design questions, validate before done,
+close superseded/abandoned draft PRs, escalate human-authority decisions -- all
+editable). The director changes rules with the `update_rules` tool; the human
+edits them on the callboard-adjacent CLI (`showrunner rules set` / `rules
+directive`) or the admin API. Every change bumps a version, is audited
+(`updated_by`), and pings the cast; `register` delivers the full rules and later
+polls re-deliver on version change. Playbook (`SHOWRUNNER.md`) stays a repo file
+about decomposing *this* project (advisory). Sessions may fan out subagents freely.
 
 ## Membership (invites and eviction)
 
@@ -202,18 +210,20 @@ eviction-decision surface. Eviction is durable only with `requireInvite` on.
   `await_work` is a long-poll: it blocks up to `POLL_HOLD_SECONDS` (default
   50, chosen to clear Cursor/Fly/Claude Code's independent ~60s connection
   walls with ~10s margin) and the worker re-polls immediately after.
-- Polls return unread-only messages and pointer-style task briefs, not
-  inlined specs, to keep the coordination overhead in tokens small.
-- Workers plan before they execute. Because the brief is a pointer, the
-  protocol has a worker expand it into a short plan (approach, steps, files,
-  risks) and record it as the task's opening journal entry -- the same
-  `update_task` call flips the task `assigned -> working`. The plan is server
-  state, not session-local, so it renders on the callboard, survives the
-  session being killed (a replacement worker resumes from it rather than
-  re-deriving the approach), and gives the director an early course-correction
-  point instead of only a completion to review. A note-only/`working`
-  `update_task` writes the journal without disturbing the escalation clock or
-  the current-task pointer, so this needs no new tool, state, or schema.
+- Polls return unread-only messages, and task briefs are substantial but bounded
+  (goal, acceptance criteria, constraints; they point at docs for long specs
+  rather than re-pasting them), keeping the coordination overhead in tokens small.
+- Workers plan before they execute. A brief sets the goal and acceptance
+  criteria, not the how, so the protocol has a worker expand it into a short
+  plan (approach, steps, files, risks) and record it as the task's opening
+  journal entry -- the same `update_task` call flips the task `assigned ->
+  working`. The plan is server state, not session-local, so it renders on the
+  callboard, survives the session being killed (a replacement worker resumes
+  from it rather than re-deriving the approach), and gives the director an early
+  course-correction point instead of only a completion to review. A
+  note-only/`working` `update_task` writes the journal without disturbing the
+  escalation clock or the current-task pointer, so this needs no new tool,
+  state, or schema.
 - A terminal `update_task` (completed/failed/rejected) returns
   `next: {action: "await_work", queued, hint}` -- the required next call plus
   live queue depth, aimed at clients that treat "task done, summarize" as
@@ -300,6 +310,7 @@ on the server and change with `showrunner rules set` / `update_rules`):
 | `REQUIRE_TASK_RELEASE` | `false` | `requireTaskRelease` — withhold director tasks until a human releases them. Turn on for untrusted workers. |
 | `REQUIRE_INVITE` | `false` | `requireInvite` — refuse worker-token registration without a director-minted invite. Turn on to control who joins. |
 | `REQUIRE_HUMAN_MERGE_APPROVAL` | `false` | `requireHumanMergeApproval` — agents leave PRs for the human. |
+| `REQUIRE_VALIDATION_ON_COMPLETE` | `true` | `requireValidationOnComplete` — refuse `completed` without a validation claim. Turn off for frictionless solo shows. |
 | `WORKER_NOTE_PROPAGATION` | `true` | `workerNotePropagation` — auto-push notes to peers' claims. |
 | `ARTIFACT_TEXT_MAX_CHARS` | `10000` | `artifactTextMaxChars` cap. |
 | `ARTIFACT_DATA_MAX_BYTES` | `16384` | `artifactDataMaxBytes` cap. |
@@ -322,12 +333,17 @@ Reading `SHOWRUNNER_URL` / `SHOWRUNNER_TOKEN` from the environment (or
 showrunner status [--show <name>]
 showrunner task add --show <name> --title <t> --brief <b> [--priority <n>] [--assignee <id>] ...
 showrunner task cancel --show <name> --id <task-id>
+showrunner task requeue --show <name> --id <task-id>   # put a failed/rejected/in-flight task back on the queue
 showrunner task release --show <name> --id <task-id>   # release a task withheld by the release gate
+showrunner failures --show <name>                      # failed/rejected tasks + why, to requeue
 showrunner message --show <name> --to <member-id|director|all> --body <text>
 showrunner rules --show <name>                         # print the show's server-held rules
 showrunner rules set --show <name> [--require-release on|off] [--merge-approval on|off] \
-                     [--note-propagation on|off] [--require-invite on|off] \
+                     [--note-propagation on|off] [--require-invite on|off] [--require-validation on|off] \
                      [--artifact-text-max <n>] [--artifact-data-max <n>] [--policy <text>]
+showrunner rules directive add  --show <name> --text <rule> [--severity must|should]
+showrunner rules directive edit --show <name> --id <dir-id> [--text <rule>] [--severity must|should]
+showrunner rules directive rm   --show <name> --id <dir-id>
 showrunner direction clear --show <name>
 showrunner show delete --show <name>        # removes the show and everything under it
 showrunner init --show <name> --url <url> --token <director> --worker-token <worker>
@@ -394,9 +410,10 @@ and any task it held requeues with `attempt` bumped once its task lease
 
 **Token cost discipline?**
 `await_work` returns unread-only; `get_board` is a ~300-token summary unless
-you ask for `verbose`. Keep task briefs as pointers into the repo ("see
-docs/combat.md §3"), not inlined specs. Cheaper, and it also keeps secrets
-out of the server.
+you ask for `verbose`. Write task briefs that are substantial but bounded (goal,
+acceptance criteria, constraints); point at repo docs for long specs ("see
+docs/combat.md §3") rather than re-pasting them. Cheaper, and it also keeps
+secrets out of the server.
 
 **Why is Cursor cloud "best-effort"?**
 Cursor's cloud dashboard doesn't read MCP config from the repo and doesn't

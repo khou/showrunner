@@ -53,8 +53,9 @@ is 15 tools.
    TTL; the server reclaims silently-abandoned work. Nothing trusts an agent
    to say goodbye.
 5. **Multi-session coordination costs ~10x tokens if you're sloppy.** Polls
-   return unread-only, task briefs are pointers into the repo (not inlined
-   specs), board reads are summaries.
+   return unread-only, task briefs are substantial but bounded (goal, acceptance
+   criteria, constraints; they point at docs for long specs rather than
+   re-pasting them, and stand on their own), board reads are summaries.
 6. **A2A is overkill** (assumes every agent is an addressable server) but its
    task state machine, taskId/contextId split, artifacts-as-typed-parts, and
    agent-card registration record are borrowed as internal data shapes.
@@ -92,7 +93,7 @@ SQLite (better-sqlite3, WAL). All rows plain JSON-friendly; `sqlite3` CLI or
 
 ```
 shows      { name PK, created_at, config_json }
-show_rules { show PK, version, switches_json, policy, updated_at, updated_by }
+show_rules { show PK, version, switches_json, policy, directives_json, updated_at, updated_by }
 members    { id PK, show, kind, display_name, role, registered_at,
              last_seen_at, lease_expires_at, current_task_id, secret_hash,
              review_cursor, session_url, resume_hint, rules_version_seen,
@@ -125,12 +126,13 @@ notes_fts  ( FTS5 over body + tags, bm25-ranked )
 ### Task state machine (A2A-derived)
 
 ```
-queued ──▶ assigned ──▶ working ──▶ completed
+queued ──▶ assigned ──▶ working ──▶ completed   (requireValidationOnComplete: needs a validation claim)
    ▲           │           │──────▶ failed
    │           │           │──────▶ rejected      (worker declines: wrong skills/env)
    │           │           └──────▶ input-required ──▶ working   (director answers; take_input holds the worker meanwhile)
    │           └── lease expiry / requeue ──┘
-   └── director: requeue / cancel ──▶ canceled
+   ├── director/human: requeue a failed|rejected|in-flight task ──▶ queued (attempt+1)
+   └── director: cancel ──▶ canceled
 ```
 
 - `queued → assigned` happens inside `await_work` (atomic claim in a SQLite
@@ -221,23 +223,37 @@ Playbook is *how to break down this project*. Rules are *how the fleet
 behaves*. Rules are **server-held per-show state, not a repo file** -- policy
 that governs untrusted members must not be writable by them, and every worker
 used to read `SHOWRUNNER.rules.md` from its own checkout. A show's rules split
-into two parts, and the schema is explicit about which is which:
+into three layers, and the schema is explicit about which is which:
 
 - **`switches`** -- structured, machine-enforced. The server reads each on the
   code path it governs: `requireTaskRelease` (the release gate, in
   `createTask`/`claimNextTask`), `workerNotePropagation` (in `pushNote` +
   `notesForTask`), `artifactTextMaxChars`/`artifactDataMaxBytes` (in
-  `updateTask`), `requireInvite` (in `register`), and `requireHumanMergeApproval`
-  (delivered, agent-followed -- there is no merge through the server to block;
-  pair with the repo's branch protection for an enforced gate).
+  `updateTask`), `requireInvite` (in `register`), `requireValidationOnComplete`
+  (in `updateTask` -- a transition into `completed` is refused without a
+  validation claim), and `requireHumanMergeApproval` (delivered, agent-followed
+  -- there is no merge through the server to block; pair with the repo's branch
+  protection for an enforced gate).
+- **`directives`** -- named, individually-addressable **binding** hard rules
+  (each `{id, text, severity: must|should, ...}`). Delivered as authenticated
+  director policy and framed to the fleet as must-follow (not suggestions); the
+  director CRUDs them by id (`add_directives`/`edit_directives`/`remove_directives`).
+  Most are behavioral (e.g. "close superseded draft PRs", a project's
+  definition-of-done): the server can't judge compliance, so `directives` are
+  authoritative *policy* the fleet obeys, with `switches` as the mechanical
+  backstop for the few rules the server can enforce.
 - **`policy`** -- advisory prose, delivered but **never enforced**.
 
-New shows are seeded with OOTB defaults (favoring automation: release gate off,
-merge approval off, notes propagate); `REQUIRE_TASK_RELEASE` is the
-deployment-wide env default for the release-gate switch on new shows. The
+New shows are seeded with OOTB defaults (automation-favoring switches: release
+gate off, merge approval off, notes propagate, validation-on-complete on) plus a
+generic set of default `directives` (plan-first + escalate design questions,
+adversarially validate before done, PR hygiene / no orphaned superseded drafts,
+escalate human-authority decisions) that the director can edit or remove.
+`REQUIRE_TASK_RELEASE` and `REQUIRE_VALIDATION_ON_COMPLETE` are the
+deployment-wide env defaults for those switches on new shows. The
 director changes rules with the `update_rules` tool (director-token-gated,
 epoch-fenced); the human edits them with `showrunner rules
-set` (admin `/api`); the callboard only displays them. Every change bumps `version`, records `updated_by`, and
+set` / `showrunner rules directive` (admin `/api`); the callboard only displays them. Every change bumps `version`, records `updated_by`, and
 notifies the cast via `send_message` to `all`. Delivery has token discipline:
 `rules_version` rides on every task claim, and the full text is delivered at
 `register` and re-delivered on the first poll after the version changes.
@@ -337,13 +353,17 @@ matter).
    review-needed notices (director), else `{status:"nothing", hint}`.
    Renews the member lease. Callers re-poll immediately; the server adds
    0–2s jitter to the hold to de-synchronize herds.
-3. `update_task({member_id, task_id, status?, note?, artifacts?})` —
+3. `update_task({member_id, task_id, status?, note?, validation?, artifacts?})` —
    heartbeats the task lease; appends to the journal; sets status
    (`working|input-required|completed|failed|rejected`). Artifacts are typed
    parts: `{kind: branch|files|text|data, ...}` — e.g. the branch the worker
-   pushed, files touched, a 3-line summary. The result carries any unread
-   `messages`, so a heads-down worker hears about notes and answers on its
-   ~10min heartbeat instead of only at its next `await_work`.
+   pushed, files touched, a 3-line summary. `validation` is a claim of how the
+   work was adversarially checked; when `requireValidationOnComplete` is on, a
+   transition into `completed` without it (or a `note`) is refused. On a
+   `failed`/`rejected` transition the reason (from `note`) becomes the task's
+   `lastNote`, which rides along to the director's review item. The result
+   carries any unread `messages`, so a heads-down worker hears about notes and
+   answers on its ~10min heartbeat instead of only at its next `await_work`.
 4. `send_message({member_id, to, body, task_id?})` — to a member id,
    `director`, or `all`. Delivered via the recipient's next `await_work`.
    There is no `human` target: a director needing the human's input asks in
@@ -365,25 +385,31 @@ matter).
    epoch})` → `{epoch}` lets the current holder give the seat up so a later plain
    claim can take it.
 9. `create_task({member_id, epoch, title, brief, context_id?, depends_on?,
-   files_hint?, priority?, assignee?})` → `{task_id}` — brief should be
-   pointers ("see docs/combat.md §3; branch off main"), not inlined specs.
+   files_hint?, priority?, assignee?})` → `{task_id}` — write a **substantial**
+   brief (goal, context, acceptance criteria, constraints, how to verify) so the
+   worker can plan and start without guessing; point at docs for the long stuff,
+   but the brief must stand on its own (a bare pointer is not enough).
    `files_hint` globs power advisory overlap warnings: creating a task whose
    globs intersect an in-flight task's returns a warning (never a block) —
    partition, don't lock.
 10. `direct_task({member_id, epoch, task_id, action, ...})` — `cancel`,
    `requeue`, `assign {assignee}`, `answer {body}` (for `input-required` →
    flips back to `working` and delivers the answer), `approve` (records a
-   director-approval journal note; no gating today).
+   director-approval journal note; no gating today). `requeue` and `assign`
+   work on a `failed`/`rejected` task (read its reason, then re-run it,
+   attempt+1) as well as an in-flight one; only `completed`/`canceled` are final.
 11. `take_input({member_id, epoch, task_id})` — take on an `input-required`
    escalation: messages the waiting worker that an answer is coming and stamps
    `input_taken_at` so the worker's escalation-wait clock re-bases (it keeps
    holding the parked task past `ESCALATION_WAIT_S` while the director fetches
    an answer). Does not resolve the task — the director still answers via
    `direct_task`; the director's `pending_input` age stays the true blocked age.
-12. `update_rules({member_id, epoch, switches?, policy?})` → `{rules}` — set
-   the show's server-held rules (machine-enforced switches and/or advisory
-   policy prose). Bumps `version`, is audited (`updated_by`), and notifies the
-   cast. The human's equivalent is the admin `/api` route (callboard / CLI).
+12. `update_rules({member_id, epoch, switches?, policy?, add_directives?,
+   edit_directives?, remove_directives?})` → `{rules}` — set the show's
+   server-held rules: machine-enforced `switches`, advisory `policy` prose,
+   and/or the binding `directives` (named hard rules, edited by id). Bumps
+   `version`, is audited (`updated_by`), and notifies the cast. The human's
+   equivalent is the admin `/api` route (`showrunner rules set` / `rules directive`).
 13. `mint_invite({member_id, epoch, ttl_seconds?})` → `{invite_token}` — mint a
    single-use, show-scoped invite (hash stored, plaintext once, expires) so a
    specific outside agent can register when `requireInvite` is on.
@@ -407,10 +433,12 @@ auto-loaded into Claude Code context; also exposed as MCP prompt
 > `input-required`, message the director, and keep polling. Do not stop
 > polling because the queue is empty. If the user tells you that you are the
 > **director**: `register` then `claim_direction(takeover: true)`; read the
-> project state; break work into 5–20 minute tasks with pointer-style briefs
-> and non-overlapping `files_hint`; then loop `await_work`, reviewing
-> completions, answering `input-required`, creating follow-on tasks, and
-> posting a digest note to the board every ~30 minutes.
+> project state; break work into 5–20 minute tasks with substantial briefs
+> (goal, acceptance criteria, constraints, how to verify) and non-overlapping
+> `files_hint`; then loop `await_work`, reviewing completions, reading the reason
+> on any `failed`/`rejected` task and requeuing or canceling it, answering
+> `input-required`, creating follow-on tasks, and posting a digest note to the
+> board every ~30 minutes.
 
 That is the entire integration: configure the MCP server once per machine or
 repo, and any future session understands "you're a showrunner worker".
@@ -418,8 +446,9 @@ repo, and any future session understands "you're a showrunner worker".
 ### Plan before execute
 
 A worker that starts editing the instant it claims a task underperforms one
-that first reasons about the whole task — and briefs here are deliberately
-*pointers*, not specs, so the reasoning has to happen somewhere. The worker
+that first reasons about the whole task — a substantial brief sets the *what*
+(goal, acceptance criteria, constraints), but the *how* still has to be worked
+out, and that reasoning should land somewhere durable. The worker
 protocol makes it explicit: with the brief, `files_hint`, and `relevant_notes`
 in hand, the worker sketches a short plan (approach, concrete steps, files it
 expects to touch, risks/unknowns) and records it as the task's **opening
@@ -496,8 +525,8 @@ every 2s. No build step, no framework — one file, fetch + DOM.
   it" badge (being handled, not just sitting). There is no `human`-message
   surface — a director asks the human directly in its own session.
 - Rules and activity share the bottom row below the task board: rules in the
-  narrow rail (display-only switches + advisory policy), the activity feed
-  beside it.
+  narrow rail (display-only switches, binding directives, and advisory policy),
+  the activity feed beside it.
 - Activity (one demoted feed, collapsed by default): shared notes, task
   journal entries, and messages interleaved newest-first, last 50. The
   audit trail; the page stays read-only.

@@ -190,6 +190,12 @@ h3 .count { color: var(--dim); font-weight: 400; }
 .rule-state.on { color: var(--accent); }
 .rule-state.off { color: var(--dim); }
 .rule-num { font-family: var(--mono); color: var(--amber); min-width: 32px; }
+.rule-directives-block { margin-top: 8px; font-size: 12px; }
+.rule-directives { list-style: none; margin: 2px 0 0; padding: 0; }
+.rule-directives li { padding: 3px 0; font-size: 12px; display: flex; align-items: baseline; gap: 8px; }
+.rule-sev { font-size: 10px; min-width: 34px; text-transform: uppercase; letter-spacing: 0.04em; font-family: var(--mono); }
+.rule-sev.must { color: var(--accent); }
+.rule-sev.should { color: var(--amber); }
 .rule-policy { margin-top: 8px; font-size: 12px; }
 .rule-policy > div { margin-top: 2px; white-space: pre-wrap; }
 
