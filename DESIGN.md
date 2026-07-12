@@ -439,9 +439,18 @@ early course-correction (the director's review loop is told to skim opening
 plans and redirect an off-track approach cheaply). Planning also front-loads
 the reject/escalate decision: a task that turns out wrong-fit or
 under-specified is caught while the plan is being sketched, before work is
-wasted, not at the end. This is a protocol/prompt change, consistent with "the
-prompt is the entire integration surface" — the server enforces nothing here
-beyond delivering the journal it already delivers.
+wasted, not at the end.
+
+Crucially, planning is **not** a stop-and-wait approval gate. The worker
+records the plan and proceeds; it never blocks on the human (who is not
+watching its session), and a plan that surfaces a genuine decision goes to the
+*director* through the ordinary `input-required` escalation — the same path as
+any blocker — never to the user. That preserves showrunner's core rule that a
+worker's only interface to the human is the director, and keeps the long-poll
+loop moving instead of parking a session on local input that will never come.
+This is a protocol/prompt change, consistent with "the prompt is the entire
+integration surface" — the server enforces nothing here beyond delivering the
+journal it already delivers.
 
 ### Worker context depletion
 
