@@ -145,9 +145,10 @@ showrunner MCP that hardcodes the director token for everyone.
   `showrunner` MCP is enough. No env var required. Paste (the loop rule goes
   in the FIRST line -- cloud clients treat "task done, summarize" as
   end-of-turn if it isn't):
-  `You're a showrunner worker. Loop forever: await_work -> do the task ->
-  update_task -> await_work. Finishing a task is never a reason to stop;
-  only eviction or my stop message ends the loop.`
+  `You're a showrunner worker. Loop forever: await_work -> plan the task
+  (record the plan with update_task) -> execute -> update_task -> await_work.
+  Finishing a task is never a reason to stop; only eviction or my stop message
+  ends the loop.`
 - **Director (this setup session and later trusted sessions):** need the
   `showrunner-director` MCP entry plus `SHOWRUNNER_TOKEN` in the process
   env (from `.env` / shell / cloud Runtime Secret). Paste:
