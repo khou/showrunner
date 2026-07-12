@@ -248,7 +248,7 @@ New shows are seeded with OOTB defaults (automation-favoring switches: release
 gate off, merge approval off, notes propagate, validation-on-complete on) plus a
 generic set of default `directives` (pull latest main before creating tasks,
 plan-first + escalate design questions,
-adversarially validate before done, PR hygiene / no orphaned superseded drafts,
+adversarially validate before done, PR + worktree hygiene (no orphaned drafts or stale per-task checkouts),
 escalate human-authority decisions) that the director can edit or remove.
 `REQUIRE_TASK_RELEASE` and `REQUIRE_VALIDATION_ON_COMPLETE` are the
 deployment-wide env defaults for those switches on new shows. The
