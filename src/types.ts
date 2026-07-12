@@ -468,11 +468,16 @@ export const DEFAULT_SWITCHES: ShowRuleSwitches = {
  * Generic, domain-neutral hard rules seeded into every new show's `directives`. Kept behavioral
  * and project-agnostic so they read sensibly for any show; project-specific rules are the
  * director's to add (or these are the director's to edit/remove) via update_rules. They encode the
- * cross-cutting coordination discipline this fleet wants by default: plan-first + escalate design
- * questions, adversarial validation before done, PR hygiene (no orphaned/superseded drafts), and
- * escalating human-authority decisions rather than deciding them.
+ * cross-cutting coordination discipline this fleet wants by default: fetch-latest-before-planning,
+ * plan-first + escalate design questions, adversarial validation before done, PR hygiene (no
+ * orphaned/superseded drafts), and escalating human-authority decisions rather than deciding them.
  */
 export const DEFAULT_DIRECTIVES: { text: string; severity: "must" | "should" }[] = [
+  {
+    text:
+      "Director: ALWAYS git fetch origin and reconcile latest origin/main BEFORE creating tasks, and periodically as you plan, so every task is based on current state -- a stale checkout spawns tasks for work that already landed or that conflicts with it. Workers: cut task branches from an up-to-date main.",
+    severity: "must",
+  },
   {
     text:
       "Before implementing, write a short plan (approach, files you will touch, risks) and post it as a task note; ask the director about any design decision or ambiguity the brief, docs, and rules do not settle -- escalate, do not guess.",

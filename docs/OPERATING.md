@@ -161,7 +161,8 @@ governs untrusted members must not be editable by them). Each show has:
 - **policy** (advisory prose, delivered but never enforced).
 
 New shows seed OOTB defaults (automation-favoring switches, plus a generic set of
-default directives: plan-first + escalate design questions, validate before done,
+default directives: pull latest main before creating tasks, plan-first + escalate
+design questions, validate before done,
 close superseded/abandoned draft PRs, escalate human-authority decisions -- all
 editable). The director changes rules with the `update_rules` tool; the human
 edits them on the callboard-adjacent CLI (`showrunner rules set` / `rules
