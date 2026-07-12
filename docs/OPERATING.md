@@ -386,6 +386,20 @@ It creates a throwaway `verify-*` show; safe to run against a server in use.
 
 ## FAQ
 
+**I told a session "you're a worker" and it just replied "understood" and did nothing.**
+It acknowledged the role without calling the tools -- the most common bootstrap
+mistake. Work only flows through `register` + `await_work`; a chat acknowledgement
+moves nothing. Tell it: "register on the showrunner MCP and loop await_work now"
+(or re-paste the worker prompt). The server-delivered protocol now leads with this
+imperative, so an up-to-date client should register and start polling on its own.
+
+**The director keeps creating stale tasks (work that already landed, or against
+old code).**
+Its checkout drifted from `origin/main`. The director should `git fetch origin`
+and reconcile latest main before planning and periodically as it works (~every
+15-30min); workers should cut task branches from an up-to-date main. The protocol
+tells both to do this, but a long-lived director session is the one to watch.
+
 **The director's session dies mid-run. What happens?**
 Nothing is lost. Tasks, journals, and messages are all on the server. Workers
 keep pulling from the queue. The callboard marks the director card stale once

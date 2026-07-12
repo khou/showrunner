@@ -632,10 +632,11 @@ next steps:
        You're the showrunner director.
 
   Workers (anyone with the repo — no secrets; worker token is in committed MCP):
-       You're a showrunner worker. Loop forever: await_work -> plan the task
-       (record the plan with update_task) -> execute -> update_task -> await_work.
-       Finishing a task is never a reason to stop; only eviction or my stop
-       message ends the loop.
+       You're a showrunner worker: register on the showrunner MCP now, then loop
+       forever: await_work -> plan the task (record the plan with update_task) ->
+       execute -> update_task -> await_work. Don't just acknowledge; start polling
+       immediately. Finishing a task is never a reason to stop; only eviction or
+       my stop message ends the loop.
 
   Ways to run:
     A. Simple fleet — one director + N general workers (default).
