@@ -76,10 +76,21 @@ const RULES_SWITCHES = z
     requireHumanMergeApproval: z.boolean().optional(),
     workerNotePropagation: z.boolean().optional(),
     requireInvite: z.boolean().optional(),
+    requireValidationOnComplete: z.boolean().optional(),
     artifactTextMaxChars: z.number().int().positive().optional(),
     artifactDataMaxBytes: z.number().int().positive().optional(),
   })
   .optional();
+
+// Directive CRUD for update_rules: add mints a new id, edit patches by id, remove drops by id.
+// Applied remove -> edit -> add server-side. Kept separate from switches (structured toggles) and
+// policy (advisory prose): directives are the binding, named hard rules.
+const DIRECTIVE_SEVERITY = z.enum(["must", "should"]);
+const ADD_DIRECTIVES = z.array(z.object({ text: z.string().min(1), severity: DIRECTIVE_SEVERITY.optional() })).optional();
+const EDIT_DIRECTIVES = z
+  .array(z.object({ id: z.string().min(1), text: z.string().min(1).optional(), severity: DIRECTIVE_SEVERITY.optional() }))
+  .optional();
+const REMOVE_DIRECTIVES = z.array(z.string().min(1)).optional();
 
 // register's self-reported chat link (DESIGN.md "session_url/resume_hint are how a human opens
 // this session's chat"): only the session itself knows this, so it's optional and validated at
@@ -163,7 +174,7 @@ export type AwaitWorkResult =
   | { status: "messages"; messages: Message[] }
   | { status: "review"; items: McpTaskView[] }
   | { status: "task"; task: Task; relevant_notes: NoteHit[] }
-  | { status: "nothing"; hint: string; pending_input?: PendingInput[] };
+  | { status: "nothing"; hint: string; pending_input?: PendingInput[]; pending_failures?: PendingFailure[] };
 
 // A director's standing to-do: escalations still parked input-required. Surfaced on idle polls
 // (the review cursor shows each only once; a pending decision must keep nagging until answered).
@@ -175,6 +186,20 @@ export interface PendingInput {
   // True once this escalation was taken on (take_input): the worker was reassured and its wait
   // clock reset, so the director still owes an answer but the worker isn't about to abandon it.
   taken: boolean;
+}
+
+// The other half of the director's standing to-do: tasks a worker reported failed/rejected that
+// nobody has requeued or canceled yet. Like pending_input, these re-surface on every idle poll
+// (the review cursor shows a failure once; the decision to requeue must keep nagging) and carry
+// the failure `reason` so the requeue is informed without a separate board fetch.
+export interface PendingFailure {
+  task_id: string;
+  title: string;
+  status: "failed" | "rejected";
+  assignee: string | null;
+  attempt: number;
+  age_minutes: number;
+  reason?: string;
 }
 
 // DESIGN.md "Recall at claim time": bodies trimmed to ~300 chars in the claim-time payload
@@ -194,12 +219,15 @@ function annotateAwaitWork(result: AwaitWorkResult): Record<string, unknown> {
     case "messages":
       return { ...result, trust: untrustedNotice(["messages[].body"]) };
     case "review":
-      // Review items are stripped board views (no notes ride along), so only titles are peer text.
-      return { ...result, trust: untrustedNotice(["items[].title"]) };
-    case "nothing":
-      return result.pending_input && result.pending_input.length > 0
-        ? { ...result, trust: untrustedNotice(["pending_input[].title"]) }
-        : { ...result };
+      // Review items are stripped board views; titles are peer text, and a failed/rejected item now
+      // carries its last journal note (the failure reason) as lastNote -- also peer-authored.
+      return { ...result, trust: untrustedNotice(["items[].title", "items[].lastNote"]) };
+    case "nothing": {
+      const peerFields: string[] = [];
+      if (result.pending_input && result.pending_input.length > 0) peerFields.push("pending_input[].title");
+      if (result.pending_failures && result.pending_failures.length > 0) peerFields.push("pending_failures[].title", "pending_failures[].reason");
+      return peerFields.length > 0 ? { ...result, trust: untrustedNotice(peerFields) } : { ...result };
+    }
     case "unknown_member":
       return { ...result };
     default: {
@@ -304,24 +332,55 @@ function checkOnce(store: Store, member: Member): AwaitWorkResult | null {
   return null;
 }
 
-// The bare "nothing" reply, plus a director's standing escalation reminder. computeReviewItems
-// shows each input-required task only ONCE (cursor advances past it), so a director that saw an
-// escalation and got busy would never be re-prompted; this re-attaches everything still parked
-// so an idle poll always shows the outstanding decisions. Directors only -- workers can't answer.
+// The bare "nothing" reply, plus a director's standing to-do. computeReviewItems shows each
+// input-required or failed task only ONCE (cursor advances past it), so a director that saw an
+// escalation/failure and got busy would never be re-prompted; this re-attaches everything still
+// unresolved -- parked input-required AND failed/rejected awaiting requeue -- so an idle poll
+// always shows the outstanding decisions. Directors only (workers can't answer or requeue).
 function nothingResult(store: Store, member: Member): AwaitWorkResult {
   if (member.role !== "director") return { status: "nothing", hint: "re-poll immediately" };
   const pending = store.pendingInputRequired(member.show);
-  if (pending.length === 0) return { status: "nothing", hint: "re-poll immediately" };
+  const failures = store.pendingFailures(member.show);
+  if (pending.length === 0 && failures.length === 0) return { status: "nothing", hint: "re-poll immediately" };
+
+  const parts: string[] = [];
+  if (pending.length > 0) {
+    parts.push(
+      `${pending.length} task(s) awaiting your input -- answer each with direct_task({action:"answer", body}); decide from the rules/playbook/design docs where you can, and only what truly needs the human's authority goes to the human (ask them directly in this session). If you can't answer at once, take_input({task_id}) reassures the worker and resets its wait clock.`,
+    );
+  }
+  if (failures.length > 0) {
+    parts.push(
+      `${failures.length} failed/rejected task(s) awaiting a decision -- read each reason and either direct_task({action:"requeue"}) to try again (optionally fix the brief first) or direct_task({action:"cancel"}) to drop it. They keep showing here until you resolve them.`,
+    );
+  }
   return {
     status: "nothing",
-    hint: `${pending.length} task(s) awaiting your input. Answer each with direct_task({action:"answer", body}) -- decide from the rules/playbook/design docs where you can, and only what truly needs the human's authority goes to the human, whom you ask directly in this session. Workers park these and move on after ~15min; if you can't answer at once, take_input({task_id}) reassures the worker and resets its wait clock while you get the answer.`,
-    pending_input: pending.map((p) => ({
-      task_id: p.id,
-      title: p.title,
-      assignee: p.assignee,
-      age_minutes: Math.round(p.ageMs / 60000),
-      taken: p.takenAt !== null,
-    })),
+    hint: parts.join(" "),
+    ...(pending.length > 0
+      ? {
+          pending_input: pending.map((p) => ({
+            task_id: p.id,
+            title: p.title,
+            assignee: p.assignee,
+            age_minutes: Math.round(p.ageMs / 60000),
+            taken: p.takenAt !== null,
+          })),
+        }
+      : {}),
+    ...(failures.length > 0
+      ? {
+          pending_failures: failures.map((f) => ({
+            task_id: f.id,
+            title: f.title,
+            status: f.status,
+            assignee: f.assignee,
+            attempt: f.attempt,
+            age_minutes: Math.round(f.ageMs / 60000),
+            ...(f.reason ? { reason: f.reason } : {}),
+          })),
+        }
+      : {}),
   };
 }
 
@@ -572,13 +631,15 @@ function registerTools(store: Store, config: McpServerConfig, reg: RegisterToolF
   reg(
     "update_task",
     {
-      description: "Heartbeat, journal, and/or transition a task you hold.",
+      description:
+        "Heartbeat, journal, and/or transition a task you hold. When completing, pass `validation`: a short statement of how you adversarially checked the work (drove the real surface, tried to break it). If the show's requireValidationOnComplete rule is on, a completion without a validation (or note) is refused.",
       inputSchema: {
         member_id: z.string().min(1),
         member_secret: MEMBER_SECRET,
         task_id: z.string().min(1),
         status: UPDATE_STATUS.optional(),
         note: z.string().optional(),
+        validation: z.string().optional(),
         artifacts: z.array(ARTIFACT_SCHEMA).optional(),
       },
     },
@@ -589,6 +650,7 @@ function registerTools(store: Store, config: McpServerConfig, reg: RegisterToolF
         const task = store.updateTask(resolved.member.id, args.task_id, {
           status: args.status,
           note: args.note,
+          validation: args.validation,
           artifacts: args.artifacts,
         });
         // DESIGN.md "The result carries any unread messages, so a heads-down worker hears about
@@ -781,7 +843,7 @@ function registerTools(store: Store, config: McpServerConfig, reg: RegisterToolF
     "create_task",
     {
       description:
-        "Director-only: create a task. Epoch-fenced; a stale epoch returns {status:'superseded'}. Requires the director bearer token.",
+        "Director-only: create a task. Write a SUBSTANTIAL brief -- goal, context, acceptance criteria, constraints, and how to verify -- so the worker can plan and start without guessing; a one-liner is rarely enough. Epoch-fenced; a stale epoch returns {status:'superseded'}. Requires the director bearer token.",
       inputSchema: {
         member_id: z.string().min(1),
         member_secret: MEMBER_SECRET,
@@ -834,7 +896,7 @@ function registerTools(store: Store, config: McpServerConfig, reg: RegisterToolF
     "direct_task",
     {
       description:
-        "Director-only: cancel/requeue/assign/answer/approve a task. Epoch-fenced. Requires the director bearer token.",
+        "Director-only: cancel/requeue/assign/answer/approve a task. requeue and assign work on a failed or rejected task (read its reason first, then re-run it, attempt+1) as well as an in-flight one; only completed/canceled are final. Epoch-fenced. Requires the director bearer token.",
       inputSchema: {
         member_id: z.string().min(1),
         member_secret: MEMBER_SECRET,
@@ -895,13 +957,16 @@ function registerTools(store: Store, config: McpServerConfig, reg: RegisterToolF
     "update_rules",
     {
       description:
-        "Director-only: set this show's rules (machine-enforced switches and/or advisory policy prose). Epoch-fenced. Bumps rules_version, is audited, and notifies the cast. Requires the director bearer token.",
+        "Director-only: set this show's rules. Three layers: `switches` (machine-enforced toggles), `policy` (advisory prose), and `directives` -- named BINDING hard rules the fleet must follow, edited by id via add_directives / edit_directives / remove_directives. Epoch-fenced. Bumps rules_version, is audited, and notifies the cast. Requires the director bearer token.",
       inputSchema: {
         member_id: z.string().min(1),
         member_secret: MEMBER_SECRET,
         epoch: z.number().int(),
         switches: RULES_SWITCHES,
         policy: z.string().optional(),
+        add_directives: ADD_DIRECTIVES,
+        edit_directives: EDIT_DIRECTIVES,
+        remove_directives: REMOVE_DIRECTIVES,
       },
     },
     async (args) => {
@@ -916,10 +981,24 @@ function registerTools(store: Store, config: McpServerConfig, reg: RegisterToolF
         if (err instanceof SupersededError) return supersededResult(err);
         throw err;
       }
-      if (args.switches === undefined && args.policy === undefined) {
-        return jsonResult({ status: "error", message: "update_rules needs at least one of switches or policy" }, true);
+      const touchesDirectives =
+        (args.add_directives && args.add_directives.length > 0) ||
+        (args.edit_directives && args.edit_directives.length > 0) ||
+        (args.remove_directives && args.remove_directives.length > 0);
+      if (args.switches === undefined && args.policy === undefined && !touchesDirectives) {
+        return jsonResult({ status: "error", message: "update_rules needs at least one of switches, policy, or a directive change (add/edit/remove)" }, true);
       }
-      const rules = store.updateShowRules(member.show, { switches: args.switches, policy: args.policy }, member.id);
+      const rules = store.updateShowRules(
+        member.show,
+        {
+          switches: args.switches,
+          policy: args.policy,
+          addDirectives: args.add_directives,
+          editDirectives: args.edit_directives,
+          removeDirectives: args.remove_directives,
+        },
+        member.id,
+      );
       // Notify the cast so workers re-read (existing send_message-to-all pattern); their next poll
       // also carries the new version and full text via the rules-delivery cursor.
       store.sendMessage(member.id, "all", `show rules updated to v${rules.version} by ${member.id}`);

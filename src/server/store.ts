@@ -23,6 +23,7 @@ import {
   type Note,
   type NoteHit,
   type OverlapWarning,
+  type RuleDirective,
   type SaveNoteInput,
   type ShowRules,
   type ShowRulesPatch,
@@ -32,6 +33,7 @@ import {
   type TaskArtifact,
   type TaskNote,
   type TaskStatus,
+  DEFAULT_DIRECTIVES,
   readLeaseConfig,
   readNoteConfig,
   readRulesDefaults,
@@ -83,6 +85,7 @@ CREATE TABLE IF NOT EXISTS show_rules (
   version INTEGER NOT NULL DEFAULT 1,
   switches_json TEXT NOT NULL,
   policy TEXT NOT NULL DEFAULT '',
+  directives_json TEXT NOT NULL DEFAULT '[]',
   updated_at INTEGER NOT NULL,
   updated_by TEXT NOT NULL
 );
@@ -311,6 +314,7 @@ interface ShowRulesRow {
   version: number;
   switches_json: string;
   policy: string;
+  directives_json: string;
   updated_at: number;
   updated_by: string;
 }
@@ -470,9 +474,31 @@ function mapShowRules(r: ShowRulesRow): ShowRules {
     version: r.version,
     switches: JSON.parse(r.switches_json) as ShowRuleSwitches,
     policy: r.policy,
+    directives: JSON.parse(r.directives_json) as RuleDirective[],
     updatedAt: r.updated_at,
     updatedBy: r.updated_by,
   };
+}
+
+/** Mint a fresh directive with a unique-within-`existing` id. `existing` guards the (negligible)
+ * chance of a randomHex collision inside one show's array. */
+function mintDirective(
+  text: string,
+  severity: "must" | "should",
+  by: string,
+  at: number,
+  existing: RuleDirective[],
+): RuleDirective {
+  let id = `dir-${randomHex(4)}`;
+  while (existing.some((d) => d.id === id)) id = `dir-${randomHex(4)}`;
+  return { id, text, severity, createdBy: by, createdAt: at, updatedAt: at };
+}
+
+/** The generic OOTB directives, minted with stable ids for a new show. */
+function seedDefaultDirectives(by: string, at: number): RuleDirective[] {
+  const out: RuleDirective[] = [];
+  for (const d of DEFAULT_DIRECTIVES) out.push(mintDirective(d.text, d.severity, by, at, out));
+  return out;
 }
 
 export class Store {
@@ -496,6 +522,7 @@ export class Store {
     this.migrateTaskInputTakenAtColumn();
     this.migrateMemberRulesSeenColumn();
     this.migrateMemberInviteEvictionColumns();
+    this.migrateShowRulesDirectivesColumn();
     this.now = now;
     this.leases = readLeaseConfig();
     this.noteConfig = readNoteConfig();
@@ -574,6 +601,16 @@ export class Store {
     }
   }
 
+  /** Guarded upgrade-in-place: show_rules predates named hard-rule directives. Existing rows
+   * backfill to '[]' (a show that predates directives simply has none until the director adds
+   * some; we do NOT retroactively seed DEFAULT_DIRECTIVES into old shows). */
+  private migrateShowRulesDirectivesColumn(): void {
+    const cols = this.db.pragma("table_info(show_rules)") as { name: string }[];
+    if (!cols.some((c) => c.name === "directives_json")) {
+      this.db.exec("ALTER TABLE show_rules ADD COLUMN directives_json TEXT NOT NULL DEFAULT '[]'");
+    }
+  }
+
   /** Guarded upgrade-in-place: members predates the per-member rules-version cursor. Existing rows
    * backfill to 0, so the next await_work re-delivers the current rules once (harmless). */
   private migrateMemberRulesSeenColumn(): void {
@@ -623,6 +660,19 @@ export class Store {
       .prepare("SELECT * FROM task_notes WHERE task_id = ? ORDER BY created_at ASC")
       .all(taskId) as TaskNoteRow[];
     return rows.map(mapTaskNote);
+  }
+
+  /** The task's most recent journal note body (the failure reason for a failed/rejected task, the
+   * latest heartbeat/answer otherwise). Cheap single-row read; used to carry the WHY onto a
+   * non-verbose board view and the director's failure to-do. */
+  private lastNoteBody(taskId: string): string | undefined {
+    // rowid DESC breaks ties among same-millisecond inserts (a status transition note and its
+    // failure note land in one transaction): without it, ORDER BY created_at alone could return
+    // the "status: ... -> failed" line instead of the actual failure reason.
+    const row = this.db
+      .prepare("SELECT body FROM task_notes WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1")
+      .get(taskId) as { body: string } | undefined;
+    return row?.body;
   }
 
   /** Most recent messages of any kind (not just human-addressed) for the callboard activity feed. */
@@ -871,13 +921,21 @@ export class Store {
     // read for an unknown/deleted show should still succeed): return transient defaults instead.
     const showExists = this.db.prepare("SELECT 1 FROM shows WHERE name = ?").get(show) !== undefined;
     if (!showExists) {
-      return { version: 1, switches: { ...this.rulesDefaults }, policy: "", updatedAt: at, updatedBy: "default" };
+      return {
+        version: 1,
+        switches: { ...this.rulesDefaults },
+        policy: "",
+        directives: seedDefaultDirectives("default", at),
+        updatedAt: at,
+        updatedBy: "default",
+      };
     }
+    const directives = seedDefaultDirectives("default", at);
     this.db
       .prepare(
-        "INSERT OR IGNORE INTO show_rules (show, version, switches_json, policy, updated_at, updated_by) VALUES (?, 1, ?, '', ?, 'default')",
+        "INSERT OR IGNORE INTO show_rules (show, version, switches_json, policy, directives_json, updated_at, updated_by) VALUES (?, 1, ?, '', ?, ?, 'default')",
       )
-      .run(show, JSON.stringify(this.rulesDefaults), at);
+      .run(show, JSON.stringify(this.rulesDefaults), JSON.stringify(directives), at);
     return mapShowRules(this.getShowRulesRow(show)!);
   }
 
@@ -901,14 +959,42 @@ export class Store {
         if (typeof patch.switches.requireHumanMergeApproval === "boolean") switches.requireHumanMergeApproval = patch.switches.requireHumanMergeApproval;
         if (typeof patch.switches.workerNotePropagation === "boolean") switches.workerNotePropagation = patch.switches.workerNotePropagation;
         if (typeof patch.switches.requireInvite === "boolean") switches.requireInvite = patch.switches.requireInvite;
+        if (typeof patch.switches.requireValidationOnComplete === "boolean") switches.requireValidationOnComplete = patch.switches.requireValidationOnComplete;
         if (patch.switches.artifactTextMaxChars !== undefined) switches.artifactTextMaxChars = clampPositiveInt(patch.switches.artifactTextMaxChars, current.switches.artifactTextMaxChars);
         if (patch.switches.artifactDataMaxBytes !== undefined) switches.artifactDataMaxBytes = clampPositiveInt(patch.switches.artifactDataMaxBytes, current.switches.artifactDataMaxBytes);
       }
       const policy = patch.policy !== undefined ? patch.policy : current.policy;
       const at = this.now();
+      // Directive edits apply remove -> edit -> add so one call can replace a rule by id and the
+      // added rule can't be immediately re-removed. Unknown remove/edit ids are silently no-ops
+      // (idempotent: re-removing an already-gone rule is fine). Blank-text edits are ignored.
+      let directives = [...current.directives];
+      if (patch.removeDirectives && patch.removeDirectives.length > 0) {
+        const drop = new Set(patch.removeDirectives);
+        directives = directives.filter((d) => !drop.has(d.id));
+      }
+      if (patch.editDirectives) {
+        for (const edit of patch.editDirectives) {
+          directives = directives.map((d) => {
+            if (d.id !== edit.id) return d;
+            const text = edit.text !== undefined && edit.text.trim() !== "" ? edit.text : d.text;
+            const severity = edit.severity ?? d.severity;
+            if (text === d.text && severity === d.severity) return d;
+            return { ...d, text, severity, updatedAt: at };
+          });
+        }
+      }
+      if (patch.addDirectives) {
+        for (const add of patch.addDirectives) {
+          if (add.text.trim() === "") continue;
+          directives.push(mintDirective(add.text, add.severity ?? "must", updatedBy, at, directives));
+        }
+      }
       this.db
-        .prepare("UPDATE show_rules SET version = version + 1, switches_json = ?, policy = ?, updated_at = ?, updated_by = ? WHERE show = ?")
-        .run(JSON.stringify(switches), policy, at, updatedBy, show);
+        .prepare(
+          "UPDATE show_rules SET version = version + 1, switches_json = ?, policy = ?, directives_json = ?, updated_at = ?, updated_by = ? WHERE show = ?",
+        )
+        .run(JSON.stringify(switches), policy, JSON.stringify(directives), at, updatedBy, show);
       // A rule change is show-wide; wake everyone so the next poll delivers the new version.
       this.events.emit(`wake:show:${show}`);
       return mapShowRules(this.getShowRulesRow(show)!);
@@ -1052,6 +1138,13 @@ export class Store {
         leaseExpiresAt: t.lease_expires_at,
         inputTakenAt: t.input_taken_at,
       };
+      // Carry the WHY for the statuses a director acts on: a failed/rejected task's last note is its
+      // failure reason (so a stripped review item can be requeued informed), and an input-required
+      // task's is its latest context. Cheap enough to fetch per such task; skipped for the rest.
+      if (status === "failed" || status === "rejected" || status === "input-required") {
+        const ln = this.lastNoteBody(t.id);
+        if (ln) view.lastNote = ln;
+      }
       if (verbose) view.notes = this.getNotes(t.id);
       return view;
     });
@@ -1358,6 +1451,42 @@ export class Store {
     });
   }
 
+  /** Failed/rejected tasks still sitting terminal-but-unresolved: the director's standing
+   * "requeue or cancel" to-do, mirroring pendingInputRequired. Carries the last journal note (the
+   * failure reason) and how long it's been sitting, so an idle poll surfaces WHY and a requeue is
+   * an informed decision -- failures no longer vanish after the one review that first showed them. */
+  pendingFailures(
+    show: string,
+  ): { id: string; title: string; status: "failed" | "rejected"; assignee: string | null; attempt: number; ageMs: number; reason?: string }[] {
+    const now = this.now();
+    const rows = this.db
+      .prepare(
+        "SELECT id, title, status, assignee, attempt, status_changed_at, updated_at FROM tasks WHERE show = ? AND status IN ('failed', 'rejected') ORDER BY COALESCE(status_changed_at, updated_at) ASC",
+      )
+      .all(show) as {
+      id: string;
+      title: string;
+      status: string;
+      assignee: string | null;
+      attempt: number;
+      status_changed_at: number | null;
+      updated_at: number;
+    }[];
+    return rows.map((r) => {
+      const failedAt = r.status_changed_at ?? r.updated_at;
+      const reason = this.lastNoteBody(r.id);
+      return {
+        id: r.id,
+        title: r.title,
+        status: r.status as "failed" | "rejected",
+        assignee: r.assignee,
+        attempt: r.attempt,
+        ageMs: now - failedAt,
+        ...(reason ? { reason } : {}),
+      };
+    });
+  }
+
   /** Released, claimable queue depth for a show -- the `next.queued` pointer update_task
    * returns after a terminal report, so a worker sees work remains before deciding to stop. */
   queuedReleasedCount(show: string): number {
@@ -1456,7 +1585,7 @@ export class Store {
   updateTask(
     memberId: string,
     taskId: string,
-    patch: { status?: TaskStatus; note?: string; artifacts?: TaskArtifact[] },
+    patch: { status?: TaskStatus; note?: string; artifacts?: TaskArtifact[]; validation?: string },
   ): Task {
     return this.txn(() => {
       const row = this.getTaskRowRaw(taskId);
@@ -1482,6 +1611,26 @@ export class Store {
       // cancel or resurrect a completed task.
       if (TERMINAL_STATUSES.has(row.status as TaskStatus) && patch.status && patch.status !== row.status) {
         throw new Error(`task ${taskId} is already ${row.status}; ignoring status change to ${patch.status}`);
+      }
+
+      // Validation gate (requireValidationOnComplete): a fresh transition into `completed` must
+      // carry a validation claim -- an explicit `validation` string or, failing that, a `note`.
+      // The server can't judge whether the work was really validated; it just refuses a bare
+      // completion so "how did you validate?" is always on the record (the mechanical backstop for
+      // the adversarial-validate-before-done directive). Idempotent completed->completed re-reports
+      // are exempt (already gated once). Artifacts are the deliverable, not the claim.
+      if (
+        patch.status === "completed" &&
+        row.status !== "completed" &&
+        this.getShowRules(row.show).switches.requireValidationOnComplete
+      ) {
+        const claim = (patch.validation ?? "").trim() || (patch.note ?? "").trim();
+        if (claim === "") {
+          throw new Error(
+            `task ${taskId}: this show requires a validation claim to complete (requireValidationOnComplete). ` +
+              `Re-send update_task with a 'validation' describing how you adversarially checked the work (drove the real surface, tried to break it), or turn the rule off.`,
+          );
+        }
       }
 
       const at = this.now();
@@ -1541,6 +1690,11 @@ export class Store {
       if (patch.note) {
         this.insertNote(taskId, memberId, patch.note, at);
       }
+      // Record an explicit validation claim as its own journal line so it survives on the board and
+      // in the failure/lastNote surface even when it rode in on the same call as a completion.
+      if (patch.validation && patch.validation.trim() !== "") {
+        this.insertNote(taskId, memberId, `validated: ${patch.validation}`, at);
+      }
 
       if (TERMINAL_STATUSES.has(status)) {
         this.db.prepare("UPDATE members SET current_task_id = NULL WHERE current_task_id = ?").run(taskId);
@@ -1592,8 +1746,12 @@ export class Store {
           break;
         }
         case "requeue": {
-          if (TERMINAL_STATUSES.has(status)) {
-            throw new Error(`task ${taskId} is already ${status}; cannot requeue a finished task`);
+          // failed/rejected ARE requeuable: the whole point is that a director reads the failure
+          // reason (now carried on the review item as lastNote) and puts the task back for another
+          // attempt. Only completed/canceled are final -- those are deliberate end states, not
+          // outcomes a director re-runs by requeue (re-open a completed task via a fresh task).
+          if (status === "completed" || status === "canceled") {
+            throw new Error(`task ${taskId} is ${status}; only failed, rejected, or in-flight tasks can be requeued (completed and canceled are final)`);
           }
           this.db
             .prepare(
@@ -1603,22 +1761,32 @@ export class Store {
           if (row.assignee) {
             this.db.prepare("UPDATE members SET current_task_id = NULL WHERE id = ? AND current_task_id = ?").run(row.assignee, taskId);
           }
-          this.insertNote(taskId, memberId, "requeued by director", at);
+          const from = status === "failed" || status === "rejected" ? ` from ${status}` : "";
+          this.insertNote(taskId, memberId, `requeued${from} by director (attempt ${row.attempt + 1})`, at);
           this.events.emit(`wake:show:${row.show}`);
           break;
         }
         case "assign": {
-          if (!TERMINAL_STATUSES.has(row.status as TaskStatus)) {
+          // Re-open + assign covers in-flight AND failed/rejected: assigning a failed task should
+          // re-run it under the named worker (attempt+1), not silently pin an assignee onto a task
+          // that stays terminal and is never claimed. completed/canceled keep the old behavior
+          // (metadata-only assignee touch; they aren't re-run).
+          const reopenable = status === "failed" || status === "rejected" || !TERMINAL_STATUSES.has(status);
+          if (reopenable) {
             if (row.assignee && row.assignee !== action.assignee) {
               this.db.prepare("UPDATE members SET current_task_id = NULL WHERE id = ? AND current_task_id = ?").run(row.assignee, taskId);
             }
+            const bumpAttempt = status === "failed" || status === "rejected";
             this.db
-              .prepare("UPDATE tasks SET assignee = ?, status = 'queued', lease_expires_at = NULL, updated_at = ?, status_changed_at = ?, input_taken_at = NULL WHERE id = ?")
+              .prepare(
+                `UPDATE tasks SET assignee = ?, status = 'queued', lease_expires_at = NULL${bumpAttempt ? ", attempt = attempt + 1" : ""}, updated_at = ?, status_changed_at = ?, input_taken_at = NULL WHERE id = ?`,
+              )
               .run(action.assignee, at, at, taskId);
           } else {
             this.db.prepare("UPDATE tasks SET assignee = ?, updated_at = ? WHERE id = ?").run(action.assignee, at, taskId);
           }
-          this.insertNote(taskId, memberId, `assigned to ${action.assignee}`, at);
+          const from = status === "failed" || status === "rejected" ? ` (from ${status})` : "";
+          this.insertNote(taskId, memberId, `assigned to ${action.assignee}${from}`, at);
           this.events.emit(`wake:${action.assignee}`);
           break;
         }
@@ -1706,6 +1874,33 @@ export class Store {
         }
         this.insertNote(taskId, actor, "canceled via admin API", at);
       }
+      return mapTask(this.getTaskRowRaw(taskId)!);
+    });
+  }
+
+  /** Human counterpart to the director's direct_task requeue: put a failed/rejected/in-flight task
+   * back on the queue (attempt+1, journal preserved). completed/canceled are final. Returns the
+   * task, or throws for an unknown id / a final task. */
+  adminRequeueTask(taskId: string, actor: string): Task {
+    return this.txn(() => {
+      const row = this.getTaskRowRaw(taskId);
+      if (!row) throw new Error(`unknown task: ${taskId}`);
+      const status = row.status as TaskStatus;
+      if (status === "completed" || status === "canceled") {
+        throw new Error(`task ${taskId} is ${status}; only failed, rejected, or in-flight tasks can be requeued`);
+      }
+      const at = this.now();
+      this.db
+        .prepare(
+          "UPDATE tasks SET status = 'queued', assignee = NULL, lease_expires_at = NULL, attempt = attempt + 1, updated_at = ?, status_changed_at = ?, input_taken_at = NULL WHERE id = ?",
+        )
+        .run(at, at, taskId);
+      if (row.assignee) {
+        this.db.prepare("UPDATE members SET current_task_id = NULL WHERE id = ? AND current_task_id = ?").run(row.assignee, taskId);
+      }
+      const from = status === "failed" || status === "rejected" ? ` from ${status}` : "";
+      this.insertNote(taskId, actor, `requeued${from} via admin API (attempt ${row.attempt + 1})`, at);
+      this.events.emit(`wake:show:${row.show}`);
       return mapTask(this.getTaskRowRaw(taskId)!);
     });
   }

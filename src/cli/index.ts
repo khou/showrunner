@@ -259,12 +259,17 @@ function printRules(rules: ShowRules): void {
   const lines = [
     `rules v${rules.version} (updated by ${rules.updatedBy})`,
     "switches (machine-enforced):",
-    `  requireTaskRelease        ${s.requireTaskRelease}`,
-    `  requireHumanMergeApproval ${s.requireHumanMergeApproval}`,
-    `  workerNotePropagation     ${s.workerNotePropagation}`,
-    `  requireInvite             ${s.requireInvite}`,
-    `  artifactTextMaxChars      ${s.artifactTextMaxChars}`,
-    `  artifactDataMaxBytes      ${s.artifactDataMaxBytes}`,
+    `  requireTaskRelease          ${s.requireTaskRelease}`,
+    `  requireHumanMergeApproval   ${s.requireHumanMergeApproval}`,
+    `  workerNotePropagation       ${s.workerNotePropagation}`,
+    `  requireInvite               ${s.requireInvite}`,
+    `  requireValidationOnComplete ${s.requireValidationOnComplete}`,
+    `  artifactTextMaxChars        ${s.artifactTextMaxChars}`,
+    `  artifactDataMaxBytes        ${s.artifactDataMaxBytes}`,
+    "directives (binding hard rules, delivered as must-follow policy):",
+    ...(rules.directives.length > 0
+      ? rules.directives.map((d) => `  [${d.id}] (${d.severity}) ${d.text}`)
+      : ["  (none)"]),
     `policy (advisory prose, delivered but never enforced):`,
     rules.policy ? `  ${rules.policy.replace(/\n/g, "\n  ")}` : "  (none)",
   ];
@@ -300,6 +305,7 @@ async function cmdRulesSet(argv: string[]): Promise<void> {
       "merge-approval": { type: "string" },
       "note-propagation": { type: "string" },
       "require-invite": { type: "string" },
+      "require-validation": { type: "string" },
       "artifact-text-max": { type: "string" },
       "artifact-data-max": { type: "string" },
       policy: { type: "string" },
@@ -314,6 +320,7 @@ async function cmdRulesSet(argv: string[]): Promise<void> {
   if (values["merge-approval"] !== undefined) switches.requireHumanMergeApproval = parseOnOff("--merge-approval", values["merge-approval"]);
   if (values["note-propagation"] !== undefined) switches.workerNotePropagation = parseOnOff("--note-propagation", values["note-propagation"]);
   if (values["require-invite"] !== undefined) switches.requireInvite = parseOnOff("--require-invite", values["require-invite"]);
+  if (values["require-validation"] !== undefined) switches.requireValidationOnComplete = parseOnOff("--require-validation", values["require-validation"]);
   if (values["artifact-text-max"] !== undefined) switches.artifactTextMaxChars = Number(values["artifact-text-max"]);
   if (values["artifact-data-max"] !== undefined) switches.artifactDataMaxBytes = Number(values["artifact-data-max"]);
 
@@ -321,11 +328,96 @@ async function cmdRulesSet(argv: string[]): Promise<void> {
   if (Object.keys(switches).length > 0) payload.switches = switches;
   if (values.policy !== undefined) payload.policy = values.policy;
   if (payload.switches === undefined && payload.policy === undefined) {
-    throw new UsageError("rules set needs at least one switch flag or --policy");
+    throw new UsageError("rules set needs at least one switch flag or --policy (directives: `rules directive add|edit|rm`)");
   }
 
   const { rules } = await apiRequest<{ rules: ShowRules }>(cfg, "POST", `/api/shows/${encodeURIComponent(values.show)}/rules`, payload);
   printRules(rules);
+}
+
+// --- rules directive (add/edit/remove the binding hard rules) ---
+
+async function cmdRulesDirective(argv: string[]): Promise<void> {
+  const sub = argv[0];
+  if (sub !== "add" && sub !== "edit" && sub !== "rm") {
+    throw new UsageError(`unknown "rules directive" subcommand: ${sub ?? "(none)"} (expected: add|edit|rm)`);
+  }
+  const { values } = parseArgs({
+    args: argv.slice(1),
+    options: {
+      show: { type: "string" },
+      url: { type: "string" },
+      token: { type: "string" },
+      id: { type: "string" },
+      text: { type: "string" },
+      severity: { type: "string" },
+    },
+    allowPositionals: false,
+  });
+  const cfg = requireConfig(values);
+  if (!values.show) throw new UsageError("rules directive requires --show");
+  if (values.severity !== undefined && values.severity !== "must" && values.severity !== "should") {
+    throw new UsageError(`--severity expects must|should, got "${values.severity}"`);
+  }
+  const severity = values.severity as "must" | "should" | undefined;
+
+  const payload: Record<string, unknown> = {};
+  if (sub === "add") {
+    if (!values.text) throw new UsageError("rules directive add requires --text");
+    payload.addDirectives = [{ text: values.text, ...(severity ? { severity } : {}) }];
+  } else if (sub === "edit") {
+    if (!values.id) throw new UsageError("rules directive edit requires --id");
+    if (values.text === undefined && severity === undefined) throw new UsageError("rules directive edit needs --text and/or --severity");
+    payload.editDirectives = [{ id: values.id, ...(values.text !== undefined ? { text: values.text } : {}), ...(severity ? { severity } : {}) }];
+  } else {
+    if (!values.id) throw new UsageError("rules directive rm requires --id");
+    payload.removeDirectives = [values.id];
+  }
+
+  const { rules } = await apiRequest<{ rules: ShowRules }>(cfg, "POST", `/api/shows/${encodeURIComponent(values.show)}/rules`, payload);
+  printRules(rules);
+}
+
+// --- failures (failed/rejected tasks awaiting a requeue/cancel decision) ---
+
+async function cmdFailures(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: { show: { type: "string" }, url: { type: "string" }, token: { type: "string" } },
+    allowPositionals: false,
+  });
+  const cfg = requireConfig(values);
+  if (!values.show) throw new UsageError("failures requires --show");
+  const state = await apiRequest<{
+    tasks: { id: string; title: string; status: string; attempt: number; lastNote?: string }[];
+  }>(cfg, "GET", `/api/shows/${encodeURIComponent(values.show)}/state`);
+  const failed = state.tasks.filter((t) => t.status === "failed" || t.status === "rejected");
+  if (failed.length === 0) {
+    process.stdout.write("no failed or rejected tasks\n");
+    return;
+  }
+  const lines = failed.map((t) => {
+    const reason = t.lastNote ? `\n    reason: ${t.lastNote.replace(/\n/g, "\n    ")}` : "";
+    return `${t.id}  [${t.status}]  attempt ${t.attempt}  "${t.title}"${reason}`;
+  });
+  process.stdout.write(lines.join("\n") + `\n\nrequeue one with: showrunner task requeue --show ${values.show} --id <id>\n`);
+}
+
+async function cmdTaskRequeue(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: { show: { type: "string" }, id: { type: "string" }, url: { type: "string" }, token: { type: "string" } },
+    allowPositionals: false,
+  });
+  const cfg = requireConfig(values);
+  if (!values.show) throw new UsageError("task requeue requires --show");
+  if (!values.id) throw new UsageError("task requeue requires --id");
+  const result = await apiRequest<{ task: Task }>(
+    cfg,
+    "POST",
+    `/api/shows/${encodeURIComponent(values.show)}/tasks/${encodeURIComponent(values.id)}/requeue`,
+  );
+  process.stdout.write(`requeued task ${result.task.id}: "${result.task.title}" (attempt ${result.task.attempt}, status: ${result.task.status})\n`);
 }
 
 async function cmdShowDelete(argv: string[]): Promise<void> {
@@ -393,10 +485,13 @@ async function cmdDirectionClear(argv: string[]): Promise<void> {
 const PLAYBOOK_TEMPLATE = `# Show playbook
 
 Read by the director right after \`claim_direction\`. Advisory context that
-overrides the generic protocol defaults. Keep it short; briefs should point at
-docs, not duplicate them. Fleet automation/role rules are NOT here -- they are
-server-held show rules (see update_rules / the callboard), so a worker can't
-edit policy by editing a repo file.
+overrides the generic protocol defaults. Write SUBSTANTIAL task briefs: each
+brief should carry goal, context, acceptance criteria, constraints, and how to
+verify, so a worker can plan and start without guessing (point at docs for the
+long stuff, but the brief itself must stand on its own). Binding fleet rules are
+NOT here -- they are server-held show rules: \`switches\` (enforced), \`directives\`
+(named must-follow hard rules), and advisory \`policy\` (see update_rules / the
+callboard), so a worker can't edit policy by editing a repo file.
 
 ## What this project is
 
@@ -412,6 +507,10 @@ edit policy by editing a repo file.
 ## Conventions workers must follow
 
 - Branch per task: \`show/<task_id>-<slug>\` (protocol default).
+- Plan before implementing: post a short plan as a task note, then build; ask
+  the director about any design/ambiguity the brief and docs don't settle.
+- Validate before done: adversarially check your own work (drive the real
+  surface, try to break it) and say how in the completion.
 - Subagents: fan out freely inside your session, but a subagent never
   registers as a member -- it reports to the session that spawned it.
 - <build/test command a task is not done without>
@@ -546,7 +645,8 @@ next steps:
        local stack vs cloud). Director pins matching tasks with assignee.
 
   Fleet rules (release gate, merge approval, note propagation, artifact caps,
-  policy) are server-held: view on the callboard, edit with 'showrunner rules [set]'.
+  validation-on-complete, binding directives, policy) are server-held: view on
+  the callboard, edit with 'showrunner rules [set|directive]'.
 `);
 }
 
@@ -640,13 +740,19 @@ Usage:
                        [--context-id <id>] [--depends-on <id,id>] [--files-hint <glob,glob>]
                        [--priority <n>] [--assignee <id>] [--url <url>] [--token <token>]
   showrunner task cancel --show <name> --id <task-id> [--url <url>] [--token <token>]
+  showrunner task requeue --show <name> --id <task-id> [--url <url>] [--token <token>]
   showrunner task release --show <name> --id <task-id> [--url <url>] [--token <token>]
+  showrunner failures --show <name>                 # failed/rejected tasks + why, to requeue
   showrunner message --show <name> --to <member-id|director|all> --body <text>
                       [--url <url>] [--token <token>]
   showrunner rules --show <name>                    # print the show's server-held rules
   showrunner rules set --show <name> [--require-release on|off] [--merge-approval on|off]
                        [--note-propagation on|off] [--require-invite on|off]
+                       [--require-validation on|off]
                        [--artifact-text-max <n>] [--artifact-data-max <n>] [--policy <text>]
+  showrunner rules directive add --show <name> --text <rule> [--severity must|should]
+  showrunner rules directive edit --show <name> --id <dir-id> [--text <rule>] [--severity must|should]
+  showrunner rules directive rm --show <name> --id <dir-id>
   showrunner direction clear --show <name> [--url <url>] [--token <token>]
   showrunner show delete --show <name> [--url <url>] [--token <token>]
   showrunner init --show <name> --url <url> --token <director> --worker-token <worker> [--dir <path>]
@@ -671,14 +777,19 @@ async function main(): Promise<void> {
       case "task":
         if (rest[0] === "add") await cmdTaskAdd(rest.slice(1));
         else if (rest[0] === "cancel") await cmdTaskCancel(rest.slice(1));
+        else if (rest[0] === "requeue") await cmdTaskRequeue(rest.slice(1));
         else if (rest[0] === "release") await cmdTaskRelease(rest.slice(1));
-        else throw new UsageError(`unknown "task" subcommand: ${rest[0] ?? "(none)"} (expected: task add|cancel|release)`);
+        else throw new UsageError(`unknown "task" subcommand: ${rest[0] ?? "(none)"} (expected: task add|cancel|requeue|release)`);
+        break;
+      case "failures":
+        await cmdFailures(rest);
         break;
       case "message":
         await cmdMessage(rest);
         break;
       case "rules":
         if (rest[0] === "set") await cmdRulesSet(rest.slice(1));
+        else if (rest[0] === "directive") await cmdRulesDirective(rest.slice(1));
         else await cmdRules(rest);
         break;
       case "direction":

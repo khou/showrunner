@@ -67,13 +67,18 @@ vetted never reaches a worker. Off by default so out-of-the-box automation is
 unchanged; turn it on whenever the show admits workers you don't fully trust.
 
 The release gate is one of the show's **server-held rules** -- fleet policy
-(release gate, merge approval, note propagation, artifact caps, advisory prose)
-lives in per-show server state, not a repo file, precisely because policy that
-governs untrusted members must not be writable by them. Only the director token
-(`update_rules`) or the human (`showrunner rules set` / admin `/api`) can change
-it; changes are versioned and audited, and delivered to the fleet as
-authenticated director policy (distinct from the `untrusted_peer` tag on peer
-content).
+(release gate, merge approval, note propagation, artifact caps, validation-on-
+complete, the binding `directives`, and advisory prose) lives in per-show server
+state, not a repo file, precisely because policy that governs untrusted members
+must not be writable by them. Only the director token (`update_rules`) or the
+human (`showrunner rules set` / `rules directive` / admin `/api`) can change it;
+changes are versioned and audited, and delivered to the fleet as authenticated
+director policy (distinct from the `untrusted_peer` tag on peer content).
+`directives` are binding hard rules the fleet follows, so a *compromised*
+director could set a harmful one -- the same threat as a malicious brief or
+policy, contained the same way: runtime permissions (below) plus the human-
+authority rule that money/irreversible/secret actions never proceed on
+authenticated policy alone.
 
 ### 3. Runtime containment (the real host boundary, and it is not ours)
 

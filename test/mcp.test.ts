@@ -243,7 +243,7 @@ describe("a takeover director doesn't replay the show's completed-task history",
     const worker = store.register("myshow", "claude-local");
     const { task: oldTask } = store.createTask({ show: "myshow", title: "old", brief: "b", createdBy: director1.id });
     store.claimNextTask(worker.id);
-    store.updateTask(worker.id, oldTask.id, { status: "completed" });
+    store.updateTask(worker.id, oldTask.id, { status: "completed", validation: "verified" });
     clock.t += 1000;
 
     const director2 = store.register("myshow", "claude-local");
@@ -1028,5 +1028,123 @@ describe("director idle poll surfaces pending input-required escalations", () =>
     if (workerIdle.status === "nothing") {
       expect(workerIdle.pending_input).toBeUndefined();
     }
+  });
+});
+
+describe("director sees failures: review lastNote + idle pending_failures", () => {
+  it("a failed task's review item carries the reason as lastNote (tagged untrusted)", async () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const claimed = store.claimDirection(director.id, true);
+    if (!claimed.ok) throw new Error("claim_direction failed");
+    const t = store.createTask({ show: "myshow", title: "risky", brief: "b", createdBy: director.id }).task;
+    store.claimNextTask(worker.id);
+    store.updateTask(worker.id, t.id, { status: "failed", note: "segfault in the parser" });
+
+    const review = await resolveAwaitWork(store, director.id, undefined, 0.05);
+    expect(review.status).toBe("review");
+    if (review.status === "review") {
+      const item = review.items.find((i) => i.id === t.id)!;
+      expect(item.status).toBe("failed");
+      expect(item.lastNote).toMatch(/segfault/);
+    }
+  });
+
+  it("an idle director poll re-surfaces failed tasks as pending_failures with reason + attempt", async () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const claimed = store.claimDirection(director.id, true);
+    if (!claimed.ok) throw new Error("claim_direction failed");
+    const t = store.createTask({ show: "myshow", title: "risky", brief: "b", createdBy: director.id }).task;
+    store.claimNextTask(worker.id);
+    store.updateTask(worker.id, t.id, { status: "failed", note: "OOM at 2GB" });
+
+    // First poll shows it as a review item; the cursor advances past it.
+    await resolveAwaitWork(store, director.id, undefined, 0.05);
+    // A later idle poll keeps nagging via the standing failures to-do.
+    const idle = await resolveAwaitWork(store, director.id, undefined, 0.05);
+    expect(idle.status).toBe("nothing");
+    if (idle.status === "nothing") {
+      expect(idle.pending_failures).toHaveLength(1);
+      expect(idle.pending_failures![0].task_id).toBe(t.id);
+      expect(idle.pending_failures![0].reason).toMatch(/OOM/);
+      expect(idle.pending_failures![0].attempt).toBe(0);
+    }
+  });
+});
+
+describe("update_rules manages binding directives", () => {
+  it("adds, edits, and removes a directive by id through the tool", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const dir = reg(store, "myshow");
+    const claim = await callTool(client, "claim_direction", { member_id: dir.id, member_secret: dir.secret, takeover: true });
+    const epoch = (claim.data as { epoch: number }).epoch;
+
+    const added = await callTool(client, "update_rules", {
+      member_id: dir.id,
+      member_secret: dir.secret,
+      epoch,
+      add_directives: [{ text: "never push straight to main", severity: "must" }],
+    });
+    expect(added.isError).toBe(false);
+    const addedRules = (added.data as { rules: { directives: { id: string; text: string; severity: string }[] } }).rules;
+    const mine = addedRules.directives.find((d) => d.text === "never push straight to main")!;
+    expect(mine.severity).toBe("must");
+
+    const edited = await callTool(client, "update_rules", {
+      member_id: dir.id,
+      member_secret: dir.secret,
+      epoch,
+      edit_directives: [{ id: mine.id, severity: "should" }],
+    });
+    const editedRule = (edited.data as { rules: { directives: { id: string; severity: string }[] } }).rules.directives.find((d) => d.id === mine.id)!;
+    expect(editedRule.severity).toBe("should");
+
+    const removed = await callTool(client, "update_rules", {
+      member_id: dir.id,
+      member_secret: dir.secret,
+      epoch,
+      remove_directives: [mine.id],
+    });
+    expect((removed.data as { rules: { directives: { id: string }[] } }).rules.directives.some((d) => d.id === mine.id)).toBe(false);
+  });
+
+  it("errors when no switches, policy, or directive change is provided", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store);
+    const dir = reg(store, "myshow");
+    const claim = await callTool(client, "claim_direction", { member_id: dir.id, member_secret: dir.secret, takeover: true });
+    const epoch = (claim.data as { epoch: number }).epoch;
+    const res = await callTool(client, "update_rules", { member_id: dir.id, member_secret: dir.secret, epoch });
+    expect(res.isError).toBe(true);
+    expect((res.data as { message: string }).message).toMatch(/at least one of switches, policy, or a directive/);
+  });
+});
+
+describe("update_task validation gate through the tool", () => {
+  it("refuses a bare completion, accepts one with a validation claim", async () => {
+    const { store } = newStore();
+    const client = await connectClient(store, { ...FAST_CONFIG, authLevel: "worker" });
+    const registered = await callTool(client, "register", { show: "vshow", kind: "claude-local" });
+    const { member_id: workerId, member_secret: secret } = registered.data as { member_id: string; member_secret: string };
+    const { task } = store.createTask({ show: "vshow", title: "t", brief: "b", createdBy: "human", assignee: workerId });
+    store.claimNextTask(workerId);
+
+    const bare = await callTool(client, "update_task", { member_id: workerId, member_secret: secret, task_id: task.id, status: "completed" });
+    expect(bare.isError).toBe(true);
+    expect((bare.data as { message: string }).message).toMatch(/requireValidationOnComplete/);
+
+    const ok = await callTool(client, "update_task", {
+      member_id: workerId,
+      member_secret: secret,
+      task_id: task.id,
+      status: "completed",
+      validation: "ran the suite and drove the UI",
+    });
+    expect(ok.isError).toBe(false);
+    expect((ok.data as { task: { status: string } }).task.status).toBe("completed");
   });
 });

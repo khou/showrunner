@@ -21,6 +21,7 @@ const messageSchema = z.object({
   body: z.string().min(1),
 });
 
+const directiveSeverity = z.enum(["must", "should"]);
 const rulesPatchSchema = z
   .object({
     switches: z
@@ -29,15 +30,27 @@ const rulesPatchSchema = z
         requireHumanMergeApproval: z.boolean().optional(),
         workerNotePropagation: z.boolean().optional(),
         requireInvite: z.boolean().optional(),
+        requireValidationOnComplete: z.boolean().optional(),
         artifactTextMaxChars: z.number().int().positive().optional(),
         artifactDataMaxBytes: z.number().int().positive().optional(),
       })
       .optional(),
     policy: z.string().optional(),
+    addDirectives: z.array(z.object({ text: z.string().min(1), severity: directiveSeverity.optional() })).optional(),
+    editDirectives: z
+      .array(z.object({ id: z.string().min(1), text: z.string().min(1).optional(), severity: directiveSeverity.optional() }))
+      .optional(),
+    removeDirectives: z.array(z.string().min(1)).optional(),
   })
-  .refine((v) => v.switches !== undefined || v.policy !== undefined, {
-    message: "provide at least one of switches or policy",
-  });
+  .refine(
+    (v) =>
+      v.switches !== undefined ||
+      v.policy !== undefined ||
+      (v.addDirectives && v.addDirectives.length > 0) ||
+      (v.editDirectives && v.editDirectives.length > 0) ||
+      (v.removeDirectives && v.removeDirectives.length > 0),
+    { message: "provide at least one of switches, policy, or a directive change (add/edit/remove)" },
+  );
 
 /**
  * Store.showNames() returns names only; this read-only fallback also needs created_at for the
@@ -111,6 +124,17 @@ export function createApiRoutes(store: Store, dbPath: string): Hono {
       return c.json({ task });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 404);
+    }
+  });
+
+  // Human counterpart to the director's requeue: put a failed/rejected/in-flight task back on the
+  // queue (attempt+1). Director-token gated like every mutating /api route.
+  api.post("/shows/:show/tasks/:id/requeue", (c) => {
+    try {
+      const task = store.adminRequeueTask(c.req.param("id"), "human");
+      return c.json({ task });
+    } catch (err) {
+      return c.json({ error: (err as Error).message }, 400);
     }
   });
 

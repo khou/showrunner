@@ -117,7 +117,7 @@ describe("dependency gating", () => {
     expect(first!.title).toBe("base");
     expect(store.claimNextTask(worker2.id)).toBeUndefined();
 
-    store.updateTask(worker.id, first!.id, { status: "completed" });
+    store.updateTask(worker.id, first!.id, { status: "completed", validation: "verified" });
     const second = store.claimNextTask(worker2.id);
     expect(second!.title).toBe("dependent");
   });
@@ -148,7 +148,7 @@ describe("idempotent redelivery", () => {
     store.createTask({ show: "myshow", title: "t2", brief: "b", createdBy: director.id });
 
     const first = store.claimNextTask(worker.id)!;
-    store.updateTask(worker.id, first.id, { status: "completed" });
+    store.updateTask(worker.id, first.id, { status: "completed", validation: "verified" });
     const second = store.claimNextTask(worker.id);
     expect(second!.id).not.toBe(first.id);
     expect(second!.title).toBe("t2");
@@ -264,6 +264,7 @@ describe("idempotent completion after reaping", () => {
 
     const completed = store.updateTask(worker.id, claimed.id, {
       status: "completed",
+      validation: "verified",
       artifacts: [{ kind: "text", text: "done anyway" }],
     });
     expect(completed.status).toBe("completed");
@@ -307,7 +308,7 @@ describe("updateTask fencing", () => {
     const director = store.register("myshow", "claude-local");
     const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     store.claimNextTask(worker.id);
-    store.updateTask(worker.id, task.id, { status: "completed" });
+    store.updateTask(worker.id, task.id, { status: "completed", validation: "verified" });
 
     const again = store.updateTask(worker.id, task.id, { status: "completed", note: "retry" });
     expect(again.status).toBe("completed");
@@ -331,7 +332,7 @@ describe("directTask status validation", () => {
     store.claimDirection(director.id);
     const { task: done } = store.createTask({ show: "myshow", title: "done", brief: "b", createdBy: director.id });
     store.claimNextTask(worker.id);
-    store.updateTask(worker.id, done.id, { status: "completed" });
+    store.updateTask(worker.id, done.id, { status: "completed", validation: "verified" });
     expect(() => store.directTask(director.id, 1, done.id, { type: "cancel" })).toThrow(/already completed/);
 
     const { task: canceled } = store.createTask({ show: "myshow", title: "c", brief: "b", createdBy: director.id });
@@ -339,16 +340,26 @@ describe("directTask status validation", () => {
     expect(() => store.directTask(director.id, 1, canceled.id, { type: "cancel" })).not.toThrow();
   });
 
-  it("rejects 'requeue' on a terminal task", () => {
+  it("requeues a failed task (attempt+1) but rejects requeue on a completed task", () => {
     const { store } = newStore();
     const worker = store.register("myshow", "claude-local");
     const director = store.register("myshow", "claude-local");
     store.claimDirection(director.id);
+
+    // completed is final: requeue refused.
+    const { task: done } = store.createTask({ show: "myshow", title: "done", brief: "b", createdBy: director.id });
+    store.claimNextTask(worker.id);
+    store.updateTask(worker.id, done.id, { status: "completed", validation: "verified" });
+    expect(() => store.directTask(director.id, 1, done.id, { type: "requeue" })).toThrow(/final/);
+
+    // failed IS requeuable: a director reads the reason and puts it back for another attempt.
     const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
     store.claimNextTask(worker.id);
-    store.updateTask(worker.id, task.id, { status: "failed" });
-
-    expect(() => store.directTask(director.id, 1, task.id, { type: "requeue" })).toThrow(/already failed/);
+    store.updateTask(worker.id, task.id, { status: "failed", note: "build broke" });
+    const requeued = store.directTask(director.id, 1, task.id, { type: "requeue" });
+    expect(requeued.status).toBe("queued");
+    expect(requeued.assignee).toBeNull();
+    expect(requeued.attempt).toBe(1);
   });
 });
 
@@ -648,7 +659,7 @@ describe("overlap warnings", () => {
       filesHint: ["src/server/**"],
     });
     store.claimNextTask(worker.id);
-    store.updateTask(worker.id, done.id, { status: "completed" });
+    store.updateTask(worker.id, done.id, { status: "completed", validation: "verified" });
 
     const { overlaps } = store.createTask({
       show: "myshow",
@@ -1100,6 +1111,39 @@ describe("messages.kind migration", () => {
   });
 });
 
+describe("show_rules.directives_json migration", () => {
+  it("adds the column in place, backfilling '[]' on a rules row that predates directives", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "showrunner-store-test-"));
+    const dbPath = path.join(dir, "showrunner.db");
+    try {
+      const legacy = new Database(dbPath);
+      legacy.exec(`
+        CREATE TABLE shows (name TEXT PRIMARY KEY, created_at INTEGER NOT NULL, config_json TEXT NOT NULL DEFAULT '{}');
+        CREATE TABLE show_rules (
+          show TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 1, switches_json TEXT NOT NULL,
+          policy TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL, updated_by TEXT NOT NULL
+        );
+      `);
+      legacy.prepare("INSERT INTO shows (name, created_at, config_json) VALUES ('myshow', 1, '{}')").run();
+      legacy
+        .prepare("INSERT INTO show_rules (show, version, switches_json, policy, updated_at, updated_by) VALUES ('myshow', 3, ?, 'old policy', 1, 'human')")
+        .run(JSON.stringify({ requireTaskRelease: true }));
+      legacy.close();
+
+      const store = new Store(dbPath);
+      const rules = store.getShowRules("myshow");
+      expect(rules.version).toBe(3); // pre-existing row untouched
+      expect(rules.policy).toBe("old policy");
+      expect(rules.directives).toEqual([]); // backfilled, NOT retroactively seeded with defaults
+      // The migrated table is fully functional for new directives.
+      const added = store.updateShowRules("myshow", { addDirectives: [{ text: "post-migration rule" }] }, "human");
+      expect(added.directives.map((d) => d.text)).toContain("post-migration rule");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("members.session_url/resume_hint migration", () => {
   it("adds both columns in place to a DB file created before this migration", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "showrunner-store-test-"));
@@ -1364,6 +1408,179 @@ describe("show rules (server-held policy)", () => {
     store.register("myshow", "claude-local");
     expect(store.getShowRules("myshow").switches.requireInvite).toBe(false);
   });
+
+  it("seeds requireValidationOnComplete on by default", () => {
+    const { store } = newStore();
+    store.register("myshow", "claude-local");
+    expect(store.getShowRules("myshow").switches.requireValidationOnComplete).toBe(true);
+  });
+});
+
+describe("show rules: directives (named binding hard rules)", () => {
+  it("seeds the generic default directives on first touch, each with an id + severity", () => {
+    const { store } = newStore();
+    store.register("myshow", "claude-local");
+    const rules = store.getShowRules("myshow");
+    expect(rules.directives.length).toBeGreaterThan(0);
+    for (const d of rules.directives) {
+      expect(d.id).toMatch(/^dir-/);
+      expect(["must", "should"]).toContain(d.severity);
+      expect(d.text.length).toBeGreaterThan(0);
+    }
+    // One of them is the PR-hygiene / superseded-draft rule (the fix for orphan draft merges).
+    expect(rules.directives.some((d) => /superseded/i.test(d.text))).toBe(true);
+  });
+
+  it("add/edit/remove directives by id, bumping the version each time", () => {
+    const { store } = newStore();
+    store.register("myshow", "claude-local");
+    const seeded = store.getShowRules("myshow");
+
+    const added = store.updateShowRules("myshow", { addDirectives: [{ text: "run tsc before completing", severity: "must" }] }, "amber-fox");
+    expect(added.version).toBe(seeded.version + 1);
+    const mine = added.directives.find((d) => d.text === "run tsc before completing")!;
+    expect(mine).toBeDefined();
+    expect(mine.severity).toBe("must");
+
+    const edited = store.updateShowRules("myshow", { editDirectives: [{ id: mine.id, text: "run tsc AND vitest before completing", severity: "should" }] }, "amber-fox");
+    const editedRule = edited.directives.find((d) => d.id === mine.id)!;
+    expect(editedRule.text).toBe("run tsc AND vitest before completing");
+    expect(editedRule.severity).toBe("should");
+    expect(editedRule.updatedAt).toBeGreaterThanOrEqual(mine.createdAt);
+
+    const removed = store.updateShowRules("myshow", { removeDirectives: [mine.id] }, "amber-fox");
+    expect(removed.directives.some((d) => d.id === mine.id)).toBe(false);
+    expect(removed.version).toBe(edited.version + 1);
+  });
+
+  it("directive changes ride the same rules-delivery cursor as switches/policy", () => {
+    const { store } = newStore();
+    const m = store.register("myshow", "claude-local");
+    expect(store.consumeRulesDelivery(m.id)).toEqual({ version: 1 });
+    store.updateShowRules("myshow", { addDirectives: [{ text: "a new binding rule" }] }, "human");
+    const delivered = store.consumeRulesDelivery(m.id);
+    expect(delivered.version).toBe(2);
+    expect(delivered.rules?.directives.some((d) => d.text === "a new binding rule")).toBe(true);
+  });
+
+  it("a directive-only edit that changes nothing still requires an actual change to be requested", () => {
+    const { store } = newStore();
+    store.register("myshow", "claude-local");
+    // Editing an unknown id is a no-op (idempotent), but the call still bumps the version once.
+    const before = store.getShowRules("myshow").version;
+    const after = store.updateShowRules("myshow", { removeDirectives: ["dir-doesnotexist"] }, "human");
+    expect(after.version).toBe(before + 1);
+    expect(after.directives.length).toBe(store.getShowRules("myshow").directives.length);
+  });
+});
+
+describe("validation gate (requireValidationOnComplete)", () => {
+  it("refuses a bare completion when on, accepts one carrying a validation (or note)", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: worker.id });
+    store.claimNextTask(worker.id);
+
+    expect(() => store.updateTask(worker.id, task.id, { status: "completed" })).toThrow(/requireValidationOnComplete/);
+    // still working (the throw rolled back), so a validated completion goes through.
+    const done = store.updateTask(worker.id, task.id, { status: "completed", validation: "drove the real flow, tried bad input" });
+    expect(done.status).toBe("completed");
+    // The claim is journaled.
+    expect(store.getBoard("myshow", true).tasks.find((t) => t.id === task.id)!.notes!.some((n) => /^validated:/.test(n.body))).toBe(true);
+  });
+
+  it("a plain note also satisfies the gate", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: worker.id });
+    store.claimNextTask(worker.id);
+    const done = store.updateTask(worker.id, task.id, { status: "completed", note: "verified by hand" });
+    expect(done.status).toBe("completed");
+  });
+
+  it("turning the rule off lets a bare completion through", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    store.updateShowRules("myshow", { switches: { requireValidationOnComplete: false } }, "human");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: worker.id });
+    store.claimNextTask(worker.id);
+    const done = store.updateTask(worker.id, task.id, { status: "completed" });
+    expect(done.status).toBe("completed");
+  });
+
+  it("only gates a fresh transition into completed, not an idempotent re-report", () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id, assignee: worker.id });
+    store.claimNextTask(worker.id);
+    store.updateTask(worker.id, task.id, { status: "completed", validation: "ok" });
+    // A second completed re-report with no fresh claim is fine (already gated once).
+    const again = store.updateTask(worker.id, task.id, { status: "completed" });
+    expect(again.status).toBe("completed");
+  });
+});
+
+describe("requeue / reassign failed tasks + failure surfacing", () => {
+  function failedTask() {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    const worker = store.register("myshow", "claude-local");
+    store.claimDirection(director.id);
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
+    store.claimNextTask(worker.id);
+    store.updateTask(worker.id, task.id, { status: "failed", note: "compile error in foo.ts" });
+    return { store, director, worker, task };
+  }
+
+  it("direct_task requeue re-opens a failed task (attempt+1, journal preserved)", () => {
+    const { store, director, task } = failedTask();
+    const requeued = store.directTask(director.id, 1, task.id, { type: "requeue" });
+    expect(requeued.status).toBe("queued");
+    expect(requeued.assignee).toBeNull();
+    expect(requeued.attempt).toBe(1);
+    // The original failure note is still in the journal.
+    expect(store.getBoard("myshow", true).tasks.find((t) => t.id === task.id)!.notes!.some((n) => /compile error/.test(n.body))).toBe(true);
+  });
+
+  it("direct_task assign re-opens a failed task to the named worker (attempt+1)", () => {
+    const { store, director, task } = failedTask();
+    const other = store.register("myshow", "claude-local");
+    const assigned = store.directTask(director.id, 1, task.id, { type: "assign", assignee: other.id });
+    expect(assigned.status).toBe("queued");
+    expect(assigned.assignee).toBe(other.id);
+    expect(assigned.attempt).toBe(1);
+  });
+
+  it("a failed task's board view carries its failure reason as lastNote", () => {
+    const { store, task } = failedTask();
+    const view = store.getBoard("myshow").tasks.find((t) => t.id === task.id)!;
+    expect(view.status).toBe("failed");
+    expect(view.lastNote).toMatch(/compile error/);
+  });
+
+  it("pendingFailures lists failed/rejected tasks with reason + attempt for the director to-do", () => {
+    const { store, task } = failedTask();
+    const failures = store.pendingFailures("myshow");
+    expect(failures.length).toBe(1);
+    expect(failures[0]!.id).toBe(task.id);
+    expect(failures[0]!.status).toBe("failed");
+    expect(failures[0]!.reason).toMatch(/compile error/);
+    // Once requeued, it drops off the failures to-do.
+    store.adminRequeueTask(task.id, "human");
+    expect(store.pendingFailures("myshow").length).toBe(0);
+  });
+
+  it("adminRequeueTask requeues failed/rejected but refuses completed", () => {
+    const { store, director, worker } = failedTask();
+    const { task: done } = store.createTask({ show: "myshow", title: "done", brief: "b", createdBy: director.id });
+    store.claimNextTask(worker.id);
+    store.updateTask(worker.id, done.id, { status: "completed", validation: "ok" });
+    expect(() => store.adminRequeueTask(done.id, "human")).toThrow(/failed, rejected, or in-flight/);
+  });
 });
 
 describe("invites (director-minted, single-use, show-scoped)", () => {
@@ -1489,7 +1706,7 @@ describe("escalation parking (input-required)", () => {
     // Mid-task polls keep redelivering the current task; the answered one waits its turn.
     expect(store.claimNextTask(worker.id)!.id).toBe(b.id);
 
-    store.updateTask(worker.id, b.id, { status: "completed" });
+    store.updateTask(worker.id, b.id, { status: "completed", validation: "verified" });
     const resumed = store.claimNextTask(worker.id)!;
     expect(resumed.id).toBe(a.id);
     expect(resumed.status).toBe("working");
