@@ -398,8 +398,10 @@ auto-loaded into Claude Code context; also exposed as MCP prompt
 `/showrunner:join` for Cursor and manual use):
 
 > If the user tells you that you are a **worker** for show X: call
-> `register`, then loop `await_work` forever; execute each task in the
-> current repo on a fresh branch named `show/<task_id>-<slug>`; heartbeat
+> `register`, then loop `await_work` forever; for each claimed task, sketch a
+> short plan (approach, steps, files, risks) and record it as the task's
+> opening journal entry before executing; execute in the current repo on a
+> fresh branch named `show/<task_id>-<slug>`; heartbeat
 > with `update_task` at least every 10 minutes while working; report
 > `completed` with branch + summary artifacts; if blocked, set
 > `input-required`, message the director, and keep polling. Do not stop
@@ -412,6 +414,43 @@ auto-loaded into Claude Code context; also exposed as MCP prompt
 
 That is the entire integration: configure the MCP server once per machine or
 repo, and any future session understands "you're a showrunner worker".
+
+### Plan before execute
+
+A worker that starts editing the instant it claims a task underperforms one
+that first reasons about the whole task — and briefs here are deliberately
+*pointers*, not specs, so the reasoning has to happen somewhere. The worker
+protocol makes it explicit: with the brief, `files_hint`, and `relevant_notes`
+in hand, the worker sketches a short plan (approach, concrete steps, files it
+expects to touch, risks/unknowns) and records it as the task's **opening
+journal entry** — the same `update_task` call that flips the task
+`assigned → working`, giving that documented-but-otherwise-dead state edge its
+meaning: *has a plan and is executing*. No new tool, status, or schema; the
+plan rides the journal that already exists, and a note+`working` update writes
+it without disturbing the escalation clock or the current-task pointer.
+
+Recording the plan, rather than merely forming it, is what makes it fit the
+cattle model. A plan that lives only in the session dies with the session; a
+plan in the task journal is server state — it renders on the callboard, so the
+human and director see the intended approach *before* the work lands; it
+survives the session being killed, so a replacement worker resumes from the
+plan instead of re-deriving it; and it converts completion-time review into
+early course-correction (the director's review loop is told to skim opening
+plans and redirect an off-track approach cheaply). Planning also front-loads
+the reject/escalate decision: a task that turns out wrong-fit or
+under-specified is caught while the plan is being sketched, before work is
+wasted, not at the end.
+
+Crucially, planning is **not** a stop-and-wait approval gate. The worker
+records the plan and proceeds; it never blocks on the human (who is not
+watching its session), and a plan that surfaces a genuine decision goes to the
+*director* through the ordinary `input-required` escalation — the same path as
+any blocker — never to the user. That preserves showrunner's core rule that a
+worker's only interface to the human is the director, and keeps the long-poll
+loop moving instead of parking a session on local input that will never come.
+This is a protocol/prompt change, consistent with "the prompt is the entire
+integration surface" — the server enforces nothing here beyond delivering the
+journal it already delivers.
 
 ### Worker context depletion
 

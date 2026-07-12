@@ -129,6 +129,23 @@ describe("await_work resolution order (PLAN.md pinned order)", () => {
     expect(result.status).toBe("review");
     if (result.status === "review") expect(result.items.map((i) => i.id)).toEqual([task.id]);
   });
+
+  it("a worker's opening plan (assigned -> working) does NOT surface in the director's review feed", async () => {
+    const { store } = newStore();
+    const director = store.register("myshow", "claude-local");
+    store.claimDirection(director.id);
+    const worker = store.register("myshow", "claude-local");
+    const { task } = store.createTask({ show: "myshow", title: "t", brief: "b", createdBy: director.id });
+    store.claimNextTask(worker.id);
+    // The worker records its plan and starts executing. This is a working transition, not a
+    // terminal/escalation one, so it must NOT wake the director's review -- otherwise every
+    // worker plan would spam the review loop (the whole point of gating review on a status set
+    // that excludes "working").
+    store.updateTask(worker.id, task.id, { status: "working", note: "Plan: read docs, add X, wire in Y" });
+
+    const result = await resolveAwaitWork(store, director.id, undefined, 0.05);
+    expect(result.status).toBe("nothing");
+  });
 });
 
 describe("await_work attaches relevant_notes to a claimed task (DESIGN.md 'Recall at claim time')", () => {

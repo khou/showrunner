@@ -204,6 +204,16 @@ eviction-decision surface. Eviction is durable only with `requireInvite` on.
   walls with ~10s margin) and the worker re-polls immediately after.
 - Polls return unread-only messages and pointer-style task briefs, not
   inlined specs, to keep the coordination overhead in tokens small.
+- Workers plan before they execute. Because the brief is a pointer, the
+  protocol has a worker expand it into a short plan (approach, steps, files,
+  risks) and record it as the task's opening journal entry -- the same
+  `update_task` call flips the task `assigned -> working`. The plan is server
+  state, not session-local, so it renders on the callboard, survives the
+  session being killed (a replacement worker resumes from it rather than
+  re-deriving the approach), and gives the director an early course-correction
+  point instead of only a completion to review. A note-only/`working`
+  `update_task` writes the journal without disturbing the escalation clock or
+  the current-task pointer, so this needs no new tool, state, or schema.
 - A terminal `update_task` (completed/failed/rejected) returns
   `next: {action: "await_work", queued, hint}` -- the required next call plus
   live queue depth, aimed at clients that treat "task done, summarize" as
